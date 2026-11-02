@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 LAB = "/usr/local/sbin/rolypolyops-lab"
 LAB_CONFIG = "/etc/rolypolyops/lab.env"
 LAB_STATE = Path("/var/lib/rolypolyops")
@@ -164,7 +164,29 @@ def observe(state):
             "error": "snapshot_inventory_unavailable" if snapshot_error else None}
 
 
+def generic_action(action):
+    return isinstance(action, str) and action in {"storage-configure", "compose-register", "compose-backup", "compose-verify", "compose-restore", "compose-remove", "compose-schedule", "compose-stop", "compose-activate", "compose-resume"}
+
+
+def engine_module():
+    try:
+        from . import compose_engine
+    except ImportError:
+        import compose_engine
+    return compose_engine
+
+
+def public_compose(value):
+    try:
+        from .compose_control import sanitize_status
+    except ImportError:
+        from compose_control import sanitize_status
+    return sanitize_status(value)
+
+
 def validate_job(job):
+    if isinstance(job, dict) and generic_action(job.get("action")):
+        return engine_module().validate_job(job)
     if not isinstance(job, dict) or set(job) - {"id", "nonce", "action", "snapshotId", "parameters", "reconcile"}:
         raise ValueError("invalid_job")
     if str(uuid.UUID(job["id"])) != job["id"] or job.get("action") not in ACTIONS:
@@ -183,6 +205,7 @@ def validate_job(job):
 class Agent:
     def __init__(self, config, state, allow_http=False):
         self.config, self.state = config, Path(state)
+        self._engine = None
         parsed = urllib.parse.urlsplit(config["controller"])
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("Invalid controller URL")
@@ -204,6 +227,47 @@ class Agent:
             if receipt and receipt.get("status") == "running":
                 receipt.update(status="outcome_unknown", stage="reconciliation_required", error="agent_restarted")
                 atomic(p, receipt)
+
+    def engine(self):
+        if self._engine is None:
+            self._engine = engine_module().ManagedEngine(self.config, self.state / "managed")
+        return self._engine
+
+    @staticmethod
+    def safe_generic_result(job, value):
+        try:
+            from .compose_control import sanitize_result
+        except ImportError:
+            from compose_control import sanitize_result
+        return sanitize_result(job["action"], value, job.get("snapshotId"), job.get("parameters", {}), job["id"])
+
+    @staticmethod
+    def redact_generic_receipt(receipt):
+        # Keep request identity and the original fingerprint, never private
+        # engine config or a terminal credential envelope in receipts.
+        envelope = receipt.get("envelope")
+        if isinstance(envelope, dict) and generic_action(envelope.get("action")) and receipt.get("status") in {"succeeded", "failed"}:
+            params = envelope.get("parameters", {})
+            sealed = params.pop("envelope", None)
+            if isinstance(sealed, dict):
+                params.update(requestId=sealed.get("requestId"), bindingGeneration=sealed.get("bindingGeneration"), envelopeDigest=hashlib.sha256(json.dumps(sealed, sort_keys=True).encode()).hexdigest())
+
+    def generic_outcome(self, job, receipt, outcome):
+        if not isinstance(outcome, dict) or outcome.get("status") not in {"succeeded", "failed", "outcome_unknown"}:
+            receipt.update(status="outcome_unknown", stage="interrupted", error="reconciliation_required")
+            return
+        state = outcome["status"]
+        if state == "succeeded":
+            result = self.safe_generic_result(job, outcome.get("result"))
+            if result is None:
+                receipt.update(status="outcome_unknown", stage="interrupted", error="result_unverified")
+                return
+            receipt.update(status="succeeded", stage="completed", result=result)
+            receipt.pop("error", None)
+        else:
+            candidate = outcome.get("error", "operation_failed" if state == "failed" else "reconciliation_required")
+            code = candidate if isinstance(candidate, str) and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", candidate) else "operation_failed"
+            receipt.update(status=state, stage="completed" if state == "failed" else "interrupted", error=code)
 
     def ensure_identity(self):
         directory = self.state / "jobs"
@@ -260,6 +324,11 @@ class Agent:
         while True:
             try:
                 status = observe(self.state)
+                try:
+                    self.engine().recover()
+                    status["compose"] = public_compose(self.engine().observe())
+                except Exception:
+                    status["compose"] = public_compose({"ready": False, "error": "compose_observation_failed"})
                 with self.lock:
                     self.status = status
             except Exception:
@@ -365,6 +434,22 @@ class Agent:
         return {}
 
     def execute(self, job, path, receipt):
+        if generic_action(job["action"]):
+            try:
+                result = self.engine().execute(job)
+                self.generic_outcome(job, receipt, {"status": "succeeded", "result": result})
+            except Exception as error:
+                # Only stable EngineError codes are public. Never serialize an
+                # exception string from Docker, restic or credential parsing.
+                mod = engine_module()
+                known = isinstance(error, mod.EngineError)
+                code = getattr(error, "code", None) if known else None
+                code = code if isinstance(code, str) and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", code) else "operation_failed"
+                unknown = bool(getattr(error, "unknown", False)) if known else True
+                receipt.update(status="outcome_unknown" if unknown else "failed", stage="interrupted" if unknown else "completed", error=code)
+            self.redact_generic_receipt(receipt)
+            atomic(path, receipt)
+            return
         start = time.monotonic()
         try:
             action, env = job["action"], package_env()
@@ -448,6 +533,18 @@ class Agent:
         atomic(path, receipt)
 
     def reconcile(self, job, path, receipt):
+        if generic_action(job.get("action")):
+            if receipt["status"] in {"succeeded", "failed"}:
+                receipt.pop("acknowledged", None)
+            elif not (self.worker and self.worker.is_alive()):
+                try:
+                    self.generic_outcome(job, receipt, self.engine().reconcile(job))
+                except Exception:
+                    receipt.update(status="outcome_unknown", stage="interrupted", error="reconciliation_required")
+                receipt.pop("acknowledged", None)
+            self.redact_generic_receipt(receipt)
+            atomic(path, receipt)
+            return
         if receipt["status"] in {"succeeded", "failed"}:
             receipt.pop("acknowledged", None)
             atomic(path, receipt)
@@ -621,6 +718,37 @@ class Agent:
             receipt = read_json(path)
             if receipt and nonce and receipt.get("nonce") != nonce:
                 return False
+            is_generic = bool(receipt and generic_action(receipt.get("action", receipt.get("envelope", {}).get("action"))))
+            try:
+                generic_owned = self.engine().owns_operation(identity)
+            except ImportError:
+                generic_owned = False
+            except Exception:
+                return False
+            if is_generic or generic_owned:
+                try:
+                    outcome = self.engine().inspect_operation(identity)
+                except Exception:
+                    return False
+                if not isinstance(outcome, dict) or outcome.get("status") not in {"succeeded", "failed"}:
+                    return False
+                receipt = receipt or {"id": identity, "nonce": nonce or secrets.token_urlsafe(32), "action": "generic-inspection"}
+                # Inspection of a catalog job still uses exact scoped result
+                # validation. An autonomous operation only settles its hold.
+                job = receipt.get("envelope")
+                if isinstance(job, dict) and generic_action(job.get("action")):
+                    self.generic_outcome(job, receipt, outcome)
+                    if receipt["status"] not in {"succeeded", "failed"}:
+                        return False
+                else:
+                    receipt.update(status=outcome["status"], stage="completed")
+                    receipt.pop("result", None)
+                    receipt["error"] = "inspected_local_operation" if outcome["status"] == "failed" else ""
+                receipt.update(inspected=True)
+                receipt.pop("acknowledged", None)
+                self.redact_generic_receipt(receipt)
+                atomic(path, receipt)
+                return True
             if receipt and receipt.get("status") in {"succeeded", "failed"}:
                 receipt.update(inspected=True)
                 receipt.pop("acknowledged", None)

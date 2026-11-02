@@ -53,7 +53,10 @@ def copy_source():
     DEST.parent.chmod(0o755)
     DEST.mkdir(parents=True, exist_ok=True, mode=0o755)
     DEST.chmod(0o755)
-    for name in ("controller.py", "agent.py", "install.py"):
+    modules = ("controller.py", "agent.py", "install.py", "compose_control.py", "compose_engine.py", "compose_storage.py", "compose_seal.py", "compose_helper.py")
+    if not all((source / name).is_file() for name in modules):
+        raise ValueError("A complete trusted control release checkout is required")
+    for name in modules:
         if (source / name).is_file() and (source / name).resolve() != (DEST / name).resolve():
             shutil.copyfile(source / name, DEST / name)
             (DEST / name).chmod(0o644)
@@ -62,6 +65,138 @@ def copy_source():
         (DEST / "web").chmod(0o755)
         for file in (DEST / "web").rglob("*"):
             file.chmod(0o755 if file.is_dir() else 0o644)
+
+
+RUNTIME = Path("/opt/rolypolyops/agent-runtime")
+HELPER = "python:3.12-slim-bookworm@sha256:e697c81897302a4c4333bade000d98038fbb21eb064f8ee1fd42d02ebcd9d337"
+
+
+def output(args):
+    result = subprocess.run(args, check=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+    return result.stdout.strip()
+
+
+def version_tuple(value):
+    match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", value)
+    if not match:
+        raise ValueError("prerequisite_version_unavailable")
+    return tuple(int(x or 0) for x in match.groups())
+
+
+def supported_packages():
+    values = {}
+    try:
+        lines = Path("/etc/os-release").read_text().splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        if "=" in line:
+            k, v = line.split("=", 1)
+            values[k] = v.strip('"')
+    return values.get("ID") in {"ubuntu", "debian"} and shutil.which("apt-get") is not None
+
+
+def install_docker():
+    """Bootstrap official packages only when no Docker installation exists."""
+    values = {}
+    for line in Path("/etc/os-release").read_text().splitlines():
+        if "=" in line:
+            k,v=line.split("=",1)
+            values[k]=v.strip('"')
+    distribution=values.get("ID")
+    codename=values.get("UBUNTU_CODENAME") or values.get("VERSION_CODENAME", "")
+    architecture=output(["dpkg","--print-architecture"])
+    if distribution not in {"ubuntu","debian"} or not re.fullmatch(r"[a-z][a-z0-9-]{1,31}",codename) or architecture not in {"amd64","arm64","armhf","ppc64el","s390x"}:
+        prerequisite_error("supported Ubuntu/Debian Docker packages")
+    # Certificate-validated HTTPS to a fixed official origin. No shell, remote
+    # install script, redirected key download, or existing-daemon replacement.
+    with urllib.request.build_opener(NoRedirect()).open("https://download.docker.com/linux/"+distribution+"/gpg",timeout=30) as response:
+        signing_key=response.read(65537)
+    if len(signing_key)>65536 or not signing_key.startswith(b"-----BEGIN PGP PUBLIC KEY BLOCK-----"):
+        prerequisite_error("official Docker repository signing key")
+    key_directory=Path("/etc/apt/keyrings")
+    key_directory.mkdir(exist_ok=True,mode=0o755)
+    key_path=key_directory/"rolypolyops-docker.asc"
+    if key_directory.is_symlink() or key_path.is_symlink():
+        raise ValueError("Untrusted package signing-key path")
+    key_path.write_bytes(signing_key);key_path.chmod(0o644)
+    repo_path=Path("/etc/apt/sources.list.d/rolypolyops-docker.list")
+    if repo_path.is_symlink():
+        raise ValueError("Untrusted package repository path")
+    repo_path.write_text("deb [arch="+architecture+" signed-by="+str(key_path)+"] https://download.docker.com/linux/"+distribution+" "+codename+" stable\n")
+    repo_path.chmod(0o644)
+    command(["apt-get","update"])
+    command(["apt-get","install","-y","--no-upgrade","--no-install-recommends","docker-ce","docker-ce-cli","containerd.io","docker-buildx-plugin","docker-compose-plugin"])
+
+
+def prerequisite_error(name):
+    raise ValueError("Missing or unsupported prerequisite: " + name)
+
+
+def agent_prerequisites():
+    """Install only missing prerequisites; never replace a working Docker."""
+    if sys.version_info < (3, 11):
+        prerequisite_error("Python 3.11+")
+    missing_docker = shutil.which("docker") is None
+    missing_restic = shutil.which("restic") is None
+    packages = supported_packages() if (missing_docker or missing_restic) else False
+    if missing_docker and (Path("/var/run/docker.sock").exists() or shutil.which("dockerd")):
+        prerequisite_error("Docker CLI (existing daemon preserved)")
+    if missing_docker or missing_restic:
+        if not packages:
+            prerequisite_error("Docker 29+, Compose 2.24+, restic 0.16+")
+        command(["apt-get", "update"])
+        if missing_docker:
+            install_docker()
+        if missing_restic:
+            command(["apt-get", "install", "-y", "--no-upgrade", "--no-install-recommends", "restic"])
+    if version_tuple(output(["docker", "version", "--format", "{{.Server.Version}}"])) < (29, 0, 0):
+        prerequisite_error("rootful Docker 29+ (existing installation preserved)")
+    security = json.loads(output(["docker", "info", "--format", "{{json .SecurityOptions}}"]))
+    if any("rootless" in item for item in security):
+        prerequisite_error("rootful Docker")
+    try:
+        compose_version = output(["docker", "compose", "version", "--short"])
+    except (OSError, subprocess.CalledProcessError):
+        if not supported_packages():
+            prerequisite_error("Compose 2.24+")
+        command(["apt-get", "update"])
+        command(["apt-get", "install", "-y", "--no-upgrade", "--no-install-recommends", "docker-compose-plugin"])
+        compose_version = output(["docker", "compose", "version", "--short"])
+    if version_tuple(compose_version) < (2, 24, 0):
+        prerequisite_error("Compose 2.24+ (existing installation preserved)")
+    if version_tuple(output(["restic", "version"])) < (0, 16, 0):
+        prerequisite_error("restic 0.16+ (existing installation preserved)")
+    python = sys.executable
+    def libraries_ready(executable):
+        try:
+            versions = output([str(executable), "-c", "import cryptography, yaml; print(cryptography.__version__ + ' ' + yaml.__version__)"]).split()
+            return len(versions) == 2 and version_tuple(versions[0]) >= (41, 0, 0) and version_tuple(versions[1]) >= (6, 0, 0)
+        except (OSError, ValueError, subprocess.CalledProcessError):
+            return False
+    if not libraries_ready(python):
+        if libraries_ready(RUNTIME / "bin/python3"):
+            python = str(RUNTIME / "bin/python3")
+        else:
+            if not supported_packages():
+                prerequisite_error("cryptography 41+ and PyYAML 6+")
+            command(["apt-get", "update"])
+            command(["apt-get", "install", "-y", "--no-upgrade", "--no-install-recommends", "python3-cryptography", "python3-yaml", "python3-venv"])
+            if not libraries_ready(python):
+                if RUNTIME.is_symlink():
+                    raise ValueError("Untrusted agent runtime directory")
+                command([sys.executable, "-m", "venv", str(RUNTIME)])
+                python = str(RUNTIME / "bin/python3")
+                command([python, "-m", "pip", "install", "--only-binary=:all:", "cryptography==46.0.5", "PyYAML==6.0.3"])
+                if not libraries_ready(python):
+                    prerequisite_error("cryptography 41+ and PyYAML 6+")
+    # Pulling an immutable pinned helper is an installer-only action. Capture
+    # and restore never pull; an existing working daemon is not restarted.
+    try:
+        output(["docker", "image", "inspect", HELPER])
+    except subprocess.CalledProcessError:
+        command(["docker", "pull", HELPER])
+    return python
 
 
 def install_package_policy():
@@ -160,6 +295,7 @@ WantedBy=multi-user.target
 
 def agent(controller_url, enrollment, replace=False):
     parsed = checked_url(controller_url, {"/ops", "/ops/"})
+    runtime_python = agent_prerequisites()
     existing = read_json(AGENT_CONFIG)
     if existing and not replace:
         if existing.get("controller") != controller_url.rstrip("/"):
@@ -184,7 +320,7 @@ Description=RolyPolyOps outbound host service
 After=network-online.target docker.service
 Wants=network-online.target
 [Service]
-ExecStart={sys.executable} {DEST}/agent.py --config {AGENT_CONFIG}
+ExecStart={runtime_python} {DEST}/agent.py --config {AGENT_CONFIG}
 Restart=always
 RestartSec=5
 KillMode=control-group
@@ -222,7 +358,9 @@ def main():
     try:
         if args.command == "controller": controller(args.origin, args.configure_proxy)
         else: agent(args.controller, args.enrollment, args.replace_enrollment)
-    except Exception:
+    except Exception as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith("Missing or unsupported prerequisite:"):
+            print(str(exc), file=sys.stderr)
         print("Installation failed. Existing service data was preserved; check prerequisites and the enrollment code.", file=sys.stderr)
         raise SystemExit(1)
 

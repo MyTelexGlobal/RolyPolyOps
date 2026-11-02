@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 import uuid
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 PREFIX = "/ops"
 MAX_BODY = 262144
 COOKIE = "__Host-rpo_session"
@@ -218,7 +218,15 @@ def sanitize_status(value):
         result["preview"] = item
     if isinstance(value.get("error"), str) and SLUG.fullmatch(value["error"]):
         result["error"] = value["error"]
+    if "compose" in value:
+        result["compose"] = compose_control.sanitize_status(value["compose"])
     return result
+
+
+try:
+    from . import compose_control
+except ImportError:
+    import compose_control
 
 
 class ManagedConnection(sqlite3.Connection):
@@ -264,7 +272,9 @@ class Control:
         fd = os.open(self.database, os.O_CREAT | os.O_RDWR, 0o600)
         os.close(fd)
         self.database.chmod(0o600)
+        self.compose = compose_control.ComposeControl(self, APIError)
         with self.connect() as db:
+            self.compose.initialize(db)
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,csrf TEXT NOT NULL,expires REAL NOT NULL);
@@ -538,7 +548,7 @@ class Control:
         self.bump(db)
         return {"nodeId": node_id, "token": token, "role": row["role"]}
 
-    def public_job(self, row):
+    def public_job(self, row, db=None):
         result = {"id": row["id"], "nodeId": row["node_id"], "action": row["action"], "status": row["status"], "createdAt": stamp(row["created"])}
         for name, key in (("startedAt", "started"), ("endedAt", "ended")):
             if row[key] is not None:
@@ -550,16 +560,40 @@ class Control:
             result["reconcileRequested"] = True
         if row["result"]:
             result["result"] = json.loads(row["result"])
+        if row["action"] in compose_control.ACTIONS:
+            params = json.loads(row["parameters"])
+            for name in ("serviceId", "storageId", "restoreId"):
+                if is_uuid(params.get(name)):
+                    result[name] = params[name]
+            if db is None:
+                with self.connect() as scope_db:
+                    scope = scope_db.execute("SELECT group_id,parent_id FROM compose_jobs WHERE job_id=?", (row["id"],)).fetchone()
+            else:
+                scope = db.execute("SELECT group_id,parent_id FROM compose_jobs WHERE job_id=?", (row["id"],)).fetchone()
+            if scope:
+                for name,column in (("groupId","group_id"),("parentJobId","parent_id")):
+                    if is_uuid(scope[column]):
+                        result[name] = scope[column]
         return result
 
     def mark_lost(self, db):
         db.execute("UPDATE jobs SET status='outcome_unknown',stage='interrupted',error='agent_disconnected' WHERE status IN ('dispatched','running') AND node_id IN (SELECT id FROM nodes WHERE last_seen<?)", (time.time() - 90,))
 
     def expire_queued(self, db):
-        for row in db.execute("SELECT jobs.id,plans.expires,plans.revision FROM jobs JOIN plans ON plans.id=jobs.plan_id WHERE jobs.status='queued'").fetchall():
+        self.compose.settle(db)
+        for row in db.execute("SELECT jobs.id,jobs.action,jobs.parameters,plans.expires,plans.revision FROM jobs JOIN plans ON plans.id=jobs.plan_id WHERE jobs.status='queued' ORDER BY jobs.created,jobs.rowid").fetchall():
+            # A preceding parent may just have expired in this same pass.
+            self.compose.close_dependencies(db)
+            if db.execute("SELECT status FROM jobs WHERE id=?", (row["id"],)).fetchone()[0] != "queued":
+                continue
             error = "plan_expired" if row["expires"] < time.time() else "revision_conflict" if row["revision"] != self.revision(db) else None
+            if row["action"] == "storage-configure":
+                envelope = json.loads(row["parameters"]).get("envelope", {})
+                if compose_control.iso(envelope.get("expiresAt")) and compose_control.when(envelope["expiresAt"]) < time.time():
+                    error = "envelope_expired"
             if error:
                 db.execute("UPDATE jobs SET status='failed',stage='completed',ended=?,error=? WHERE id=?", (time.time(), error, row["id"]))
+        self.compose.settle(db)
 
     def reconcile_job(self, db, identity, body):
         fields(body)
@@ -585,6 +619,7 @@ class Control:
         if job["status"] != "queued":
             raise APIError(409, "job_not_cancellable")
         db.execute("UPDATE jobs SET status='failed',stage='completed',ended=?,error='cancelled_before_dispatch' WHERE id=?", (time.time(), identity))
+        self.compose.settle(db)
         return {"job": self.public_job(db.execute("SELECT * FROM jobs WHERE id=?", (identity,)).fetchone())}
 
     def overview(self, db):
@@ -606,7 +641,7 @@ class Control:
             disk = status.get("disk")
             if disk and disk["total"] > 0 and disk["free"] / disk["total"] < 0.1:
                 alerts.append({"severity": "warning", "code": "disk_low", "nodeId": row["id"]})
-        jobs = [self.public_job(row) for row in db.execute("SELECT * FROM jobs ORDER BY created DESC LIMIT 100")]
+        jobs = [self.public_job(row, db) for row in db.execute("SELECT * FROM jobs ORDER BY created DESC LIMIT 100")]
         if any(job["status"] == "outcome_unknown" for job in jobs):
             alerts.append({"severity": "error", "code": "operation_outcome_unknown"})
         orphans = [{"nodeId": row["node_id"], "id": row["job_id"], "status": row["status"], "inspectionRequested": bool(row["inspect_requested"]), "reason": row["reason"], "firstSeen": stamp(row["first_seen"]), "lastSeen": stamp(row["last_seen"])} for row in db.execute("SELECT * FROM orphan_reports ORDER BY CASE WHEN status IN ('succeeded','failed') THEN 1 ELSE 0 END,last_seen DESC LIMIT 512")]
@@ -615,7 +650,7 @@ class Control:
         for row in db.execute("SELECT id FROM nodes WHERE orphan_overflow=1"):
             alerts.append({"severity": "error", "code": "catalog_orphan_capacity", "nodeId": row["id"]})
         enrollments = [{"id": row["id"], "name": row["name"], "role": row["role"], "expiresAt": stamp(row["expires"]), "status": "used" if row["used"] == 1 else "cancelled" if row["used"] == 2 else "expired" if row["expires"] < time.time() else "pending"} for row in db.execute("SELECT * FROM enrollments ORDER BY expires DESC LIMIT 100")]
-        return {"version": VERSION, "revision": self.revision(db), "setup": self.setting(db, "setup"), "nodes": nodes, "enrollments": enrollments, "jobs": jobs, "orphanReports": orphans, "orphanReportLimit": ORPHAN_LIMIT, "capabilities": {"automaticFailover": False}, "alerts": alerts}
+        return {"version": VERSION, "revision": self.revision(db), "setup": self.setting(db, "setup"), "nodes": nodes, "enrollments": enrollments, "jobs": jobs, "orphanReports": orphans, "orphanReportLimit": ORPHAN_LIMIT, "capabilities": {"automaticFailover": False}, "alerts": alerts, **self.compose.overview(db)}
 
     def settings(self, db, body):
         fields(body, ("profile", "backupInterval", "expectedRevision"))
@@ -629,6 +664,8 @@ class Control:
         return {"revision": self.bump(db)}
 
     def plan(self, db, body):
+        if isinstance(body, dict) and isinstance(body.get("action"), str) and body["action"] in compose_control.ACTIONS:
+            return self.compose.plan(db, body)
         fields(body, ("nodeId", "action"), ("snapshotId", "parameters"))
         node = self.node(db, body["nodeId"])
         status = json.loads(node["status"])
@@ -673,11 +710,11 @@ class Control:
         if existing:
             if existing["plan_id"] != body["planId"]:
                 raise APIError(409, "idempotency_conflict")
-            return {"job": self.public_job(existing)}
+            return {"job": self.public_job(existing, db)}
         existing = db.execute("SELECT * FROM jobs WHERE plan_id=?", (body["planId"],)).fetchone()
         if existing:
             db.execute("INSERT INTO job_requests VALUES(?,?,?)", (body["idempotencyKey"], body["planId"], existing["id"]))
-            return {"job": self.public_job(existing)}
+            return {"job": self.public_job(existing, db)}
         plan = db.execute("SELECT * FROM plans WHERE id=?", (body["planId"],)).fetchone()
         if plan is None:
             raise APIError(404, "plan_not_found")
@@ -691,9 +728,14 @@ class Control:
         identity = str(uuid.uuid4())
         db.execute("INSERT INTO jobs(id,node_id,plan_id,action,snapshot,parameters,nonce,status,idempotency_key,created,stage) VALUES(?,?,?,?,?,?,?,'queued',?,?, 'queued')", (identity, plan["node_id"], plan["id"], plan["action"], plan["snapshot"], plan["parameters"], secrets.token_urlsafe(32), body["idempotencyKey"], time.time()))
         db.execute("INSERT INTO job_requests VALUES(?,?,?)", (body["idempotencyKey"], body["planId"], identity))
-        return {"job": self.public_job(db.execute("SELECT * FROM jobs WHERE id=?", (identity,)).fetchone())}
+        queued = db.execute("SELECT * FROM jobs WHERE id=?", (identity,)).fetchone()
+        if queued["action"] in compose_control.ACTIONS:
+            self.compose.track_enqueued(db, queued)
+        return {"job": self.public_job(queued, db)}
 
     def sanitize_result(self, action, value, snapshot_id, parameters, job_id):
+        if action in compose_control.ACTIONS:
+            return compose_control.sanitize_result(action, value, snapshot_id, parameters, job_id)
         if not isinstance(value, dict):
             # Reached only after node and nonce verification: a malformed result is
             # unverifiable proof, so the caller records failed/result_unverified.
@@ -793,9 +835,9 @@ class Control:
                 continue
             result, error = None, None
             if new_state == "succeeded":
-                result = self.sanitize_result(job["action"], report.get("result", {}), job["snapshot"], json.loads(job["parameters"]), job["id"])
+                result = self.compose.validate_result(db, job, report.get("result", {})) if job["action"] in compose_control.ACTIONS else self.sanitize_result(job["action"], report.get("result", {}), job["snapshot"], json.loads(job["parameters"]), job["id"])
                 if result is None:
-                    new_state, error = "failed", "result_unverified"
+                    new_state, error = ("outcome_unknown" if job["action"] in compose_control.ACTIONS else "failed"), "result_unverified"
             elif new_state in {"failed", "outcome_unknown"}:
                 candidate = report.get("error", "operation_failed" if new_state == "failed" else "interrupted")
                 error = candidate if isinstance(candidate, str) and SLUG.fullmatch(candidate) else "operation_failed"
@@ -809,6 +851,7 @@ class Control:
         if body.get("orphanInventoryComplete") is True and node["overflow_inspect_requested"]:
             db.execute("UPDATE nodes SET orphan_overflow=0,overflow_inspect_requested=0 WHERE id=?", (node["id"],))
         db.execute("UPDATE nodes SET last_seen=?,status=?,instance_id=? WHERE id=?", (time.time(), canonical(status), instance, node["id"]))
+        self.compose.observed(db, node["id"], status)
         self.mark_lost(db)
         self.expire_queued(db)
         active = db.execute("SELECT * FROM jobs WHERE status IN ('dispatched','running','outcome_unknown') ORDER BY created LIMIT 1").fetchone()
@@ -818,14 +861,16 @@ class Control:
         orphan_pending = db.execute("SELECT 1 FROM orphan_reports WHERE status IN ('running','outcome_unknown')").fetchone() is not None or db.execute("SELECT 1 FROM nodes WHERE orphan_overflow=1").fetchone() is not None
         if active is None and not orphan_pending:
             waiting = db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY created,id LIMIT 1").fetchone()
-            if waiting is not None and waiting["node_id"] == node["id"] and self.status_fresh(status) and status.get("supported"):
+            if waiting is not None and waiting["node_id"] == node["id"] and self.status_fresh(status) and (status.get("compose", {}).get("ready") is True if waiting["action"] in compose_control.ACTIONS else status.get("supported")):
                 if waiting["action"] == "backup" and status.get("serviceHealthy") is not True:
                     db.execute("UPDATE jobs SET status='failed',stage='completed',ended=?,error='primary_unavailable' WHERE id=?", (time.time(), waiting["id"]))
                     waiting = None
                 elif waiting["action"] in {"restore-check", "restore-preview"} and waiting["snapshot"] not in {item["id"] for item in status["snapshots"]}:
                     db.execute("UPDATE jobs SET status='failed',stage='completed',ended=?,error='snapshot_unavailable' WHERE id=?", (time.time(), waiting["id"]))
                     waiting = None
-            if waiting is not None and waiting["node_id"] == node["id"] and self.status_fresh(status) and status.get("supported"):
+            if waiting is not None and waiting["node_id"] == node["id"] and waiting["action"] in compose_control.ACTIONS:
+                waiting = self.compose.dispatch(db, waiting)
+            if waiting is not None and waiting["node_id"] == node["id"] and self.status_fresh(status) and (status.get("compose", {}).get("ready") is True if waiting["action"] in compose_control.ACTIONS else status.get("supported")):
                 db.execute("UPDATE jobs SET status='dispatched',stage='starting',dispatch_instance=? WHERE id=?", (instance, waiting["id"]))
                 active = db.execute("SELECT * FROM jobs WHERE id=?", (waiting["id"],)).fetchone()
         response = {"acknowledged": acknowledged}
@@ -995,6 +1040,18 @@ def handler_for(control):
                         return self.reply(200, value, cookie=token)
                     if control.setting(db, "needsPasswordChange"):
                         raise APIError(403, "password_change_required")
+                    if route == "/api/storages":
+                        return self.reply_after_commit(db, 200, control.compose.create_storage(db, body))
+                    if route == "/api/services":
+                        return self.reply_after_commit(db, 200, control.compose.import_service(db, body))
+                    storage_route = re.fullmatch(r"/api/storages/([a-f0-9-]{36})/(prepare|connect)", route)
+                    if storage_route:
+                        fn = control.compose.prepare if storage_route[2] == "prepare" else control.compose.connect_storage
+                        return self.reply_after_commit(db, 200, fn(db, storage_route[1], body))
+                    service_route = re.fullmatch(r"/api/services/([a-f0-9-]{36})/(complete|activate|resume-source)", route)
+                    if service_route:
+                        fn = {"complete": control.compose.complete, "activate": control.compose.activate, "resume-source": control.compose.resume}[service_route[2]]
+                        return self.reply_after_commit(db, 200, fn(db, service_route[1], body))
                     routes = {"/api/enrollments": control.enrollment, "/api/settings": control.settings, "/api/plans": control.plan, "/api/jobs": control.enqueue, "/api/setup/complete": control.complete_setup}
                     if route in routes:
                         result = routes[route](db, body)
@@ -1029,7 +1086,7 @@ def handler_for(control):
                         job = db.execute("SELECT * FROM jobs WHERE id=?", (job_match[1],)).fetchone()
                         if job is None:
                             raise APIError(404, "job_not_found")
-                        return self.reply(200, {"job": control.public_job(job)})
+                        return self.reply(200, {"job": control.public_job(job, db)})
                     raise APIError(404, "not_found")
                 raise APIError(405, "method_not_allowed")
 

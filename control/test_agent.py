@@ -262,5 +262,121 @@ class HostAuthorityTests(unittest.TestCase):
         self.assertEqual([r["id"] for r in self.agent.reports()], [identity])
 
 
+class GenericAdapterTests(unittest.TestCase):
+    def setUp(self):
+        from types import SimpleNamespace
+        self.temp = tempfile.TemporaryDirectory()
+        self.state = Path(self.temp.name)
+        self.config = {"controller": "https://control.example.test/ops", "nodeId": str(uuid.uuid4()), "token": "t" * 48, "role": "recovery"}
+        self.agent = agent.Agent(self.config, self.state)
+        self.service = str(uuid.uuid4())
+        self.storage = str(uuid.uuid4())
+        class EngineError(RuntimeError):
+            def __init__(self, code, unknown=False):
+                super().__init__(code)
+                self.code, self.unknown = code, unknown
+        self.EngineError = EngineError
+        self.fake = SimpleNamespace(EngineError=EngineError, validate_job=lambda value: None)
+        self.module_patch = patch.object(agent, "engine_module", return_value=self.fake)
+        self.module_patch.start()
+        from unittest.mock import Mock
+        self.engine = Mock()
+        self.agent._engine = self.engine
+        self.engine.owns_operation.return_value = False
+
+    def tearDown(self):
+        self.module_patch.stop()
+        self.temp.cleanup()
+
+    def request(self, action="compose-verify", **extra):
+        return job(action, parameters={"serviceId":self.service,"storageId":self.storage}, **extra)
+
+    def start(self, request):
+        self.agent.start(request)
+        self.agent.worker.join(2)
+        return agent.read_json(self.state / "jobs" / (request['id']+'.json'))
+
+    def verify_result(self):
+        return {"serviceId":self.service,"storageId":self.storage,"repositoryId":"b"*64,"verified":True,"checks":["repository-data"]}
+
+    def test_generic_executes_without_lab_or_primary_role_and_retries_once(self):
+        request = self.request()
+        self.engine.execute.return_value = dict(self.verify_result(),credentials="SECRET",config={"repoPassword":"SECRET"})
+        with patch.object(agent, "package_env", side_effect=AssertionError("legacy path used")):
+            receipt = self.start(request)
+            self.agent.start(request)
+        self.assertEqual(receipt['status'],'succeeded')
+        self.engine.execute.assert_called_once()
+        self.assertNotIn('SECRET',json.dumps(receipt))
+        changed = dict(request,nonce='different'*8)
+        with self.assertRaisesRegex(ValueError,'identity conflict'):
+            self.agent.start(changed)
+
+    def test_engine_unknown_busy_and_unexpected_errors_are_distinct(self):
+        for error,state,code in [(self.EngineError('operation_busy'),'failed','operation_busy'),(self.EngineError('capture_interrupted',True),'outcome_unknown','capture_interrupted'),(RuntimeError('RAW_SECRET'),'outcome_unknown','operation_failed')]:
+            with self.subTest(code=code):
+                request=self.request()
+                self.engine.execute.side_effect=error
+                # Each subcase uses a clean authority to avoid the intentional
+                # preceding unknown-outcome hold blocking later dispatch.
+                isolated=agent.Agent(self.config,self.state/request['id'])
+                isolated._engine=self.engine
+                isolated.start(request);isolated.worker.join(2)
+                receipt=isolated.reports()[0]
+                self.assertEqual((receipt['status'],receipt['error']),(state,code))
+                self.assertNotIn('RAW_SECRET',json.dumps(receipt))
+
+    def test_bad_generic_proof_remains_unknown_and_blocks_new_work(self):
+        self.engine.execute.return_value=dict(self.verify_result(),serviceId=str(uuid.uuid4()))
+        receipt=self.start(self.request())
+        self.assertEqual((receipt['status'],receipt['error']),('outcome_unknown','result_unverified'))
+        with self.assertRaisesRegex(ValueError,'Reconciliation required'):
+            self.agent.start(self.request())
+
+    def test_reconcile_uses_engine_inspection_and_never_executes_again(self):
+        request=self.request()
+        self.engine.execute.side_effect=self.EngineError('interrupted',True)
+        self.start(request)
+        self.engine.reconcile.return_value={'status':'succeeded','result':self.verify_result()}
+        with patch.object(agent, 'package_env', side_effect=AssertionError('legacy reconciliation used')):
+            self.agent.start(dict(request,reconcile=True))
+        self.engine.execute.assert_called_once()
+        self.engine.reconcile.assert_called_once()
+        self.assertEqual(self.agent.reports()[0]['status'],'succeeded')
+
+    def test_generic_orphan_journal_never_uses_demo_cleanup(self):
+        identity=str(uuid.uuid4())
+        self.engine.owns_operation.return_value=True
+        self.engine.inspect_operation.return_value={'status':'succeeded','result':{'private':'SECRET'}}
+        with patch.object(self.agent,'cleanup_temporary',side_effect=AssertionError('demo cleanup used')):
+            self.assertTrue(self.agent.inspect_orphan(identity))
+        self.engine.inspect_operation.assert_called_once_with(identity)
+        receipt=self.agent.reports()[0]
+        self.assertTrue(receipt['inspected'])
+        self.assertNotIn('SECRET',json.dumps(receipt))
+        self.engine.execute.assert_not_called()
+
+    def test_unknown_generic_orphan_stays_unsettled(self):
+        self.engine.owns_operation.return_value=True
+        self.engine.inspect_operation.return_value={'status':'outcome_unknown','error':'needs_inspection'}
+        with patch.object(self.agent,'cleanup_temporary',side_effect=AssertionError('demo cleanup used')):
+            self.assertFalse(self.agent.inspect_orphan(str(uuid.uuid4())))
+        self.assertEqual(self.agent.reports(),[])
+
+    def test_storage_receipt_purges_sealed_body_and_preserves_replay_fingerprint(self):
+        request=self.request('storage-configure')
+        rid=str(uuid.uuid4())
+        request['parameters']={'storageId':self.storage,'mode':'attach','metadata':{'id':self.storage},'envelope':{'requestId':rid,'bindingGeneration':2,'ciphertext':'CIPHERTEXT_MARKER'}}
+        self.engine.execute.return_value={'storageId':self.storage,'repositoryId':'b'*64,'connected':True,'bindingGeneration':2,'requestId':rid}
+        receipt=self.start(request)
+        encoded=(self.state/'jobs'/(request['id']+'.json')).read_text()
+        self.assertNotIn('CIPHERTEXT_MARKER',encoded)
+        self.assertIn('envelopeDigest',encoded)
+        # A network retry still carries the identical original sealed request.
+        original=dict(request,parameters={'storageId':self.storage,'mode':'attach','metadata':{'id':self.storage},'envelope':{'requestId':rid,'bindingGeneration':2,'ciphertext':'CIPHERTEXT_MARKER'}})
+        self.agent.start(original)
+        self.engine.execute.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
