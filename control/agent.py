@@ -549,11 +549,16 @@ class Agent:
         # A retained copy can become active through an operator action while its
         # preview receipt is lost. Current source and routing records override
         # temporary ownership markers for every cleanup path.
-        env = package_env() or {}
-        protected = [Path(env["RPO_ROOT"]).resolve()] if env.get("RPO_ROOT") else []
+        env = package_env()
+        if env is None:
+            raise RuntimeError("inspection_source_config_unavailable")
+        protected = [Path(env.get("RPO_ROOT", "/opt/rolypolyops-lab")).resolve()]
         for record in ("active.json", "standby.json"):
-            value = read_json(LAB_STATE / record) or {}
-            if value.get("root"):
+            path = LAB_STATE / record
+            value = read_json(path)
+            if path.exists() or path.is_symlink():
+                if not value or not isinstance(value.get("root"), str) or not Path(value["root"]).is_absolute():
+                    raise RuntimeError("inspection_source_record_invalid")
                 protected.append(Path(value["root"]).resolve())
         for directory in paths:
             resolved = directory.resolve()

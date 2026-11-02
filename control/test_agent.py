@@ -188,6 +188,21 @@ class HostAuthorityTests(unittest.TestCase):
                 run.assert_not_called()
             self.assertTrue((root / "service").is_dir())
 
+    def test_inspection_refuses_unknown_current_source_configuration(self):
+        lab = self.state / "lab"
+        identity = str(uuid.uuid4())
+        root = lab / "restore.guardtest"
+        root.mkdir(parents=True)
+        agent.atomic(root / ".operation.json", {"id": identity, "action": "restore-check"})
+        for env, record in [(None, None), ({}, "not-json"), ({}, "{}"), ({}, '{"root":"relative"}')]:
+            if record is not None:
+                (lab / "active.json").write_text(record)
+            with patch.object(agent, "LAB_STATE", lab), patch.object(agent, "PREVIEWS", self.state / "previews"), patch.object(agent, "package_env", return_value=env), patch.object(agent, "run") as run:
+                with self.assertRaisesRegex(RuntimeError, "inspection_source_"):
+                    self.agent.cleanup_temporary(identity)
+                run.assert_not_called()
+            self.assertTrue(root.is_dir())
+
     def test_receipt_loss_while_dispatched_cannot_repeat_mutation(self):
         request = job()
         with patch.object(self.agent, "execute") as execute:
@@ -221,7 +236,7 @@ class HostAuthorityTests(unittest.TestCase):
     def test_orphan_inspection_clears_idle_uncertainty_without_replay(self):
         identity = str(uuid.uuid4())
         self.saved_open = os.open
-        with patch.object(agent, "LAB_STATE", self.state / "lab"), patch.object(agent, "PREVIEWS", self.state / "previews"), patch.object(agent.os, "open", side_effect=self.redirected_open), patch.object(self.agent, "command") as execute, patch.object(agent, "run") as subprocess:
+        with patch.object(agent, "LAB_STATE", self.state / "lab"), patch.object(agent, "PREVIEWS", self.state / "previews"), patch.object(agent.os, "open", side_effect=self.redirected_open), patch.object(agent, "package_env", return_value={}), patch.object(self.agent, "command") as execute, patch.object(agent, "run") as subprocess:
             self.assertTrue(self.agent.inspect_orphan(identity, "n" * 40))
             execute.assert_not_called()
             subprocess.assert_not_called()
