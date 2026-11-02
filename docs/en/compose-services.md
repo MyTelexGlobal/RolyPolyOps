@@ -12,6 +12,8 @@ The baseline is rootful Linux Docker 29+, Compose 2.24+ with canonical JSON, Pyt
 
 ## 2 Select the existing service
 
+A fresh installation opens the own-service overview. The optional bundled demo does not produce a setup fault merely because it is absent. Existing selected demo installations retain their recovery and settings views.
+
 Open **Own services**, then **Connect your service**. Select the source, its discovered Compose project and a different recovery host. Review the support reasons, image and mount summary, estimated size and fingerprint. An offline or stale host is not ready. Compose readiness is independent of the bundled demo package.
 
 Confirm that only this project's containers write its data. The host detects overlapping running-container mounts, but cannot reliably discover native host writers. Capture briefly stops all project containers, stages their persistent data and exact local images, resumes the previously running set, then uploads the encrypted stage. This is a cold capture, without a zero-downtime guarantee.
@@ -19,6 +21,8 @@ Confirm that only this project's containers write its data. The host detects ove
 Ordinary named volumes, local data/configuration binds, file configs/secrets and resolved environment are included. Privileged containers, host namespaces, host control sockets, remote/external/shared resources, unsupported executable fields and unsafe archive metadata are refused. External routing and automation attached to application labels are not reproduced.
 
 ## 3 Connect storage securely
+
+When an existing repository has fresh matching connected bindings on both selected hosts, select it to reuse that connection. The wizard shows the repository identity and continues without passwords, a new challenge or binding rotation. Missing, changed or stale binding proof returns to the normal secure connection form. The Storage view still provides explicit reconnect.
 
 Choose a new or existing repository. Supported kinds are certificate-validated public HTTPS REST and S3-compatible storage. Supply the REST login/password or S3 access key/secret and optional session token. Enter a separate restic encryption password, or generate a random one. Attach requires the existing repository's exact endpoint, namespace and password.
 
@@ -43,6 +47,8 @@ Each card has its own repository points, restore copies, schedule and operation 
 After verified activation the destination becomes the same service's backup source, and the old source becomes its selected recovery host. The destination enables its timer and attempts a first backup. A running destination whose backup failed is **active_unprotected**, requiring attention. Retry backup from the new source; do not resume the old source. The old data is retained stopped and is not deleted automatically.
 
 Resume source is available only for a known failed activation with proven source stop and fresh proof that the target is still isolated/stopped without ports. Unknown or online target state blocks resume. The server enforces these guards even when a browser observation is stale.
+
+Discovered port candidates are internal TCP container ports. For example, a source published as host `18190` to container `8080` still has target `8080`; choose a free destination host port separately.
 
 Actual IP/port mappings are displayed after activation. DNS, upstream firewall, TLS termination, provider fencing, automatic failover and automatic failback are outside this operation. UDP/SCTP publication is unsupported.
 
