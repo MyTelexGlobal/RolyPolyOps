@@ -4,7 +4,7 @@
 
 ## 1 Available repository materials
 
-Available now: product specification in English and Russian, initial JSON Schema for service profiles, illustrative manifests, and [executable recovery lab tools](../../demo/README.md) for the bundled read-only PostgreSQL demo. The lab captures and restores that application only. General service enrollment, replication, automatic DNS changes, and provider shutdown are not implemented.
+Available now: product specification in English and Russian, initial JSON Schema for service profiles, illustrative manifests, and [executable recovery lab tools](../../demo/README.md) for the bundled read-only PostgreSQL demo. The lab captures and restores that application only. The [initial control panel](../../control/README.md) enrolls hosts and manages this package. General application enrollment, replication, automatic DNS changes, and provider shutdown are not implemented.
 
 ## 2 Target environment
 

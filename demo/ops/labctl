@@ -9,7 +9,7 @@ set -a
 source "$config"
 set +a
 root=${RPO_ROOT:-/opt/rolypolyops-lab}
-base=/var/lib/rolypolyops
+base=${RPO_STATE_DIR:-/var/lib/rolypolyops}
 mkdir -p "$base"
 exec 9>/run/lock/rolypolyops-lab.lock
 flock -n 9 || { echo 'Another lab operation is running.' >&2; exit 1; }
@@ -72,15 +72,23 @@ PY
     (cd "$stage"; find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
     restic backup --json --host rolypolyops-demo --tag rolypolyops-demo "$stage" > "$base/backup-result.tmp"
     python3 - "$base" <<'PY'
-import datetime,json,pathlib,sys
+import datetime,json,os,pathlib,sys
 p=pathlib.Path(sys.argv[1]); rows=[json.loads(x) for x in (p/'backup-result.tmp').read_text().splitlines()]
 s=next(x for x in rows if x.get('message_type')=='summary')
-r={'status':'backup-created','snapshot':s['snapshot_id'],'at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'restoreTest':'separate-operation'}
+r={'status':'backup-created','snapshot':s['snapshot_id'],'at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'restoreTest':'separate-operation','operationId':os.getenv('RPO_OPERATION_ID')}
 (p/'last-backup.json.tmp').write_text(json.dumps(r)+'\n');(p/'last-backup.json.tmp').replace(p/'last-backup.json')
 print(json.dumps(r))
 PY
     ;;
-  verify) restic check --read-data ;;
+  verify)
+    restic check --read-data
+    python3 - "$base" <<'PY'
+import datetime,json,os,pathlib,sys
+p=pathlib.Path(sys.argv[1]);r={'status':'repository-verified','at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'operationId':os.getenv('RPO_OPERATION_ID'),'checks':['repository-data']}
+(p/'last-verify.json.tmp').write_text(json.dumps(r)+'\n');(p/'last-verify.json.tmp').replace(p/'last-verify.json')
+print(json.dumps(r))
+PY
+    ;;
   restore-check|restore-standby)
     snapshot=${2:-latest}
     if [[ $snapshot == latest ]]; then
@@ -147,8 +155,8 @@ for service,key in [('web','webImage'),('db','dbImage')]:
 print('PASS: database values, attachment hash, app version, image IDs, fresh mounts and runtime restrictions')
 PY
     python3 - "$base" "$snapshot" "$work" "$project" "$command" "$port" <<'PY'
-import datetime,json,pathlib,sys
-p=pathlib.Path(sys.argv[1]); r={'status':'restore-check-passed','snapshot':sys.argv[2],'at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'checks':['database-values','file-sha256','application-http','app-version','image-ids','fresh-mounts','runtime-restrictions']}
+import datetime,json,os,pathlib,sys
+p=pathlib.Path(sys.argv[1]); r={'status':'restore-check-passed','snapshot':sys.argv[2],'at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'operationId':os.getenv('RPO_OPERATION_ID'),'checks':['database-values','file-sha256','application-http','app-version','image-ids','fresh-mounts','runtime-restrictions']}
 (p/'last-restore-check.json.tmp').write_text(json.dumps(r)+'\n');(p/'last-restore-check.json.tmp').replace(p/'last-restore-check.json')
 if sys.argv[5]=='restore-standby':
     r.update(root=sys.argv[3],project=sys.argv[4],port=int(sys.argv[6]),status='standby-ready-not-promoted')

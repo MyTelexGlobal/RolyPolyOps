@@ -4,12 +4,13 @@
 
 Service backups, verified recovery, and safe failover between independent hosting providers.
 
-**Status: initial specification, service-profile contracts, and a disposable PostgreSQL
-recovery lab. The general backup/failover service is not implemented. Do not use this
-prototype to protect live data.**
+**Status: 0.1.0, an early control release for the bundled PostgreSQL/Compose demo package.
+The bilingual panel supports host enrollment, setup, encrypted captures, verified restore
+exercises, retained isolated previews and schedules. General application support and
+automatic failover are not available.**
 
-The [recovery lab](demo/README.md) includes a bilingual demo, encrypted restic captures,
-and separate restore exercises. It applies only to the bundled test application.
+Start with the [control guide](control/README.md). The separately versioned
+[recovery lab](demo/README.md) supplies the tested service package and backup mechanism.
 
 ## Intended capabilities
 

@@ -10,3 +10,4 @@
 | Compatibility | [Compatibility](en/compatibility.md) | [Совместимость](ru/compatibility.md) |
 | References | [References](en/references.md) | [Источники](ru/references.md) |
 | Recovery lab | [Lab](../demo/README.md) | [Стенд](../demo/README.ru.md) |
+| Control panel | [Control](../control/README.md) | [Управление](../control/README.ru.md) |

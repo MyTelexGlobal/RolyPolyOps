@@ -141,7 +141,7 @@ Immutable storage, versioning, and append-only modes require tested compatibilit
 
 The panel presents service location, independent copy count, last complete point, replica lag, last restore drill, and violated policies. Users act on services and recovery points rather than low-level engine commands.
 
-The proposed API exposes service state, protection state, operation planning, execution, status, and cancellation. Mutations carry expected revisions and idempotency keys. A changed plan invalidates prior confirmation. These endpoints describe the target contract; no running API is currently provided.
+The proposed API exposes service state, protection state, operation planning, execution, status, and cancellation. Mutations carry expected revisions and idempotency keys. A changed plan invalidates prior confirmation. The [initial control API](../../control/API.md) implements a limited subset for the bundled demo package; the full service contract remains a target.
 
 ## 20 Observability and recovery objectives
 
@@ -151,6 +151,6 @@ RPO and RTO targets are policy inputs. Actual available-data age and measured re
 
 ## 21 Compatibility and current limits
 
-Current repository contents define the specification, schema, and example manifests only. No live backup, recovery, replication, provider control, or routing feature is implemented. A valid manifest is not evidence that a target can safely run it.
+Version 0.1.0 adds an authenticated bilingual control panel, outgoing host services, a persistent operation queue, connection/setup wizard, and backup/restore controls for the bundled demo package. The lab remains separately versioned. General service discovery, replication, provider fencing, automatic DNS changes and cluster operation are not implemented. A valid manifest is not evidence that a target can safely run it. See the [control guide](../../control/README.md).
 
 Actual application versions, volumes, provider APIs, network latency, disk behavior, key access, and failure domains must be established for each supported deployment. One-site failure is the baseline cluster scenario; arbitrary simultaneous failures are outside that claim. See [compatibility](compatibility.md) and [technical references](references.md).

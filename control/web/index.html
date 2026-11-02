@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <meta name="theme-color" content="#10291e" />
+    <title>RolyPolyOps</title>
+    <link rel="stylesheet" href="/ops/styles.css" />
+    <script type="module" src="/ops/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content / К содержимому</a>
+    <div id="app">
+      <main id="main" class="initial-loading" aria-busy="true">
+        <span class="spinner"></span>RolyPolyOps
+      </main>
+    </div>
+    <div id="announcements" class="sr-only" aria-live="polite"></div>
+    <div id="toast" role="status" hidden></div>
+    <dialog id="dialog" aria-labelledby="dialog-title"></dialog>
+    <noscript
+      >Для панели нужен JavaScript. / This panel requires JavaScript.</noscript
+    >
+  </body>
+</html>
