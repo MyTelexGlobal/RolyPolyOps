@@ -1,8 +1,10 @@
-# RolyPolyOps control API v1
+# RolyPolyOps control API
 
 [Русский](API.ru.md)
 
-Base path /ops. All requests/responses JSON except HTML/CSS/JS assets. Browser origin exact configured HTTPS origin. Times UTC ISO strings. This release manages the bundled demo service package. Automatic failover is unavailable.
+Base path /ops. All requests/responses JSON except HTML/CSS/JS assets. Browser origin exact configured HTTPS origin. Times UTC ISO strings. Shared authentication, enrollment and the operation queue also serve Compose applications. The original demo routes below remain supported. Automatic failover is unavailable.
+
+The [Compose service and storage contract](contracts/compose-v2.md) defines `/api/storages`, `/api/services` and scoped Compose operations, including encrypted credential envelopes and exact-snapshot recovery. See the [Compose guide](../docs/en/compose-services.md) for the owner workflow.
 
 GET /api/session -> {authenticated,setupRequired,version,csrf?,needsPasswordChange?}. Password-only admin login POST /api/login {password}; initial password private recovery kit. POST /api/password {currentPassword,newPassword}, POST /api/logout. Auth cookies HttpOnly/Secure/SameSite Strict; every authenticated mutation X-CSRF-Token. GET session can be unauthenticated; other data requires login.
 
