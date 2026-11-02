@@ -54,7 +54,7 @@ POST `/api/services` body `{id,name,sourceNodeId,recoveryNodeId,projectId,finger
 
 Use existing POST `/api/plans`, POST `/api/jobs` and GET `/api/jobs/{id}` for generic operations; parameters include serviceId and scope and never shell text. Generic actions:
 
-- `storage-configure`: internal binding jobs, `{storageId,metadata,envelope,mode,expectedRepositoryId?}`.
+- `storage-configure`: internal binding jobs, `{storageId,metadata,envelope,mode,expectedRepositoryId?,discoverRepositoryId?}`. For first-source attach with no catalog identity only, the controller sets discoverRepositoryId:true; the agent verifies the password and learns the existing identity without init. This internal flag is never accepted from a browser, dependent recipients or a known-identity binding. All recipients and known bindings require expectedRepositoryId.
 - `compose-register`: internal import job, `{serviceId,projectId,fingerprint,storageId,backupInterval,exclusiveWriters,healthCheck?}`.
 - `compose-backup`, `compose-verify`: source/connected eligible node respectively, `{serviceId,storageId}`. Verify runs a full `restic check --read-data` for that bound repository, without claiming application correctness or creating a snapshot.
 - `compose-restore`: chosen destination with connected binding, exact canonical top-level snapshotId and parameters `{serviceId,storageId,snapshotId}` (the two IDs must match). It retains an isolated new copy; restoreId equals jobId.

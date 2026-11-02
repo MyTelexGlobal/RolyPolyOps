@@ -54,7 +54,7 @@ POST `/api/services`: `{id,name,sourceNodeId,recoveryNodeId,projectId,fingerprin
 
 Общие операции используют существующие POST `/api/plans`, POST `/api/jobs`, GET `/api/jobs/{id}`. Параметры содержат serviceId и область, без текста команд оболочки:
 
-- `storage-configure`: внутренние задания подключения, `{storageId,metadata,envelope,mode,expectedRepositoryId?}`.
+- `storage-configure`: внутренние задания подключения, `{storageId,metadata,envelope,mode,expectedRepositoryId?,discoverRepositoryId?}`. Только при первом подключении источника к существующему репозиторию без известного ID панель задает discoverRepositoryId:true; агент проверяет пароль и узнает ID без init. Внутренний флаг не принимается от браузера, для зависимых получателей или подключения с известным ID. Получатели и известные подключения требуют expectedRepositoryId.
 - `compose-register`: внутренний импорт, `{serviceId,projectId,fingerprint,storageId,backupInterval,exclusiveWriters,healthCheck?}`.
 - `compose-backup`, `compose-verify`: источник либо допустимый подключенный сервер соответственно, `{serviceId,storageId}`. Verify выполняет полный `restic check --read-data` связанного репозитория, не заявляет правильность приложения и не создает снимок.
 - `compose-restore`: выбранный подключенный получатель, точный канонический snapshotId верхнего уровня и `{serviceId,storageId,snapshotId}` с равными идентификаторами снимка. Сохраняет отдельную изолированную копию, restoreId равен jobId.
