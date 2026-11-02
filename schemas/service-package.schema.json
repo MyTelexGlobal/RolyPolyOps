@@ -1,0 +1,414 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/MyTelexGlobal/RolyPolyOps/main/schemas/service-package.schema.json",
+  "title": "RolyPolyOps service profile",
+  "description": "Initial configuration contract. Structural validity does not establish operational readiness.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "format_version": {
+      "const": 1
+    },
+    "illustrative_only": {
+      "type": "boolean"
+    },
+    "service_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
+    },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "profile": {
+      "enum": [
+        "single",
+        "pair_assisted",
+        "pair_automatic",
+        "cluster"
+      ]
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
+          },
+          "host": {
+            "type": "string",
+            "minLength": 1
+          },
+          "failure_domain": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
+          },
+          "roles": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "enum": [
+                "application",
+                "postgresql",
+                "files",
+                "etcd"
+              ]
+            }
+          }
+        },
+        "required": [
+          "id",
+          "host",
+          "failure_domain",
+          "roles"
+        ]
+      }
+    },
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "engine": {
+          "const": "postgresql"
+        },
+        "replication": {
+          "enum": [
+            "none",
+            "asynchronous",
+            "synchronous"
+          ]
+        },
+        "synchronous_strict": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "engine",
+        "replication",
+        "synchronous_strict"
+      ]
+    },
+    "failover": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "automatic": {
+          "type": "boolean"
+        },
+        "authority": {
+          "enum": [
+            "operator",
+            "provider-fence",
+            "patroni-etcd"
+          ]
+        },
+        "require_source_fencing": {
+          "const": true
+        },
+        "fencing_policy_reference": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
+        }
+      },
+      "required": [
+        "automatic",
+        "authority",
+        "require_source_fencing"
+      ]
+    },
+    "backup": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repositories": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
+          }
+        },
+        "minimum_independent_repositories": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "service_checkpoint_interval_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "retention_days": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "repositories",
+        "minimum_independent_repositories",
+        "service_checkpoint_interval_seconds",
+        "retention_days"
+      ]
+    },
+    "targets": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rpo_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rto_seconds": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "rpo_seconds",
+        "rto_seconds"
+      ]
+    },
+    "restore": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default_target": {
+          "const": "isolated"
+        },
+        "require_application_check": {
+          "const": true
+        }
+      },
+      "required": [
+        "default_target",
+        "require_application_check"
+      ]
+    },
+    "secret_references": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
+      }
+    }
+  },
+  "required": [
+    "format_version",
+    "illustrative_only",
+    "service_id",
+    "package",
+    "profile",
+    "nodes",
+    "database",
+    "failover",
+    "backup",
+    "targets",
+    "restore",
+    "secret_references"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "profile": {
+            "const": "single"
+          }
+        },
+        "required": [
+          "profile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "nodes": {
+            "minItems": 1,
+            "maxItems": 1
+          },
+          "database": {
+            "properties": {
+              "replication": {
+                "enum": [
+                  "none"
+                ]
+              },
+              "synchronous_strict": {
+                "const": false
+              }
+            }
+          },
+          "failover": {
+            "properties": {
+              "automatic": {
+                "const": false
+              },
+              "authority": {
+                "const": "operator"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "profile": {
+            "const": "pair_assisted"
+          }
+        },
+        "required": [
+          "profile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "nodes": {
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "database": {
+            "properties": {
+              "replication": {
+                "enum": [
+                  "asynchronous",
+                  "synchronous"
+                ]
+              }
+            }
+          },
+          "failover": {
+            "properties": {
+              "automatic": {
+                "const": false
+              },
+              "authority": {
+                "const": "operator"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "profile": {
+            "const": "pair_automatic"
+          }
+        },
+        "required": [
+          "profile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "nodes": {
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "database": {
+            "properties": {
+              "replication": {
+                "enum": [
+                  "asynchronous",
+                  "synchronous"
+                ]
+              }
+            }
+          },
+          "failover": {
+            "properties": {
+              "automatic": {
+                "const": true
+              },
+              "authority": {
+                "const": "provider-fence"
+              }
+            },
+            "required": [
+              "fencing_policy_reference"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "profile": {
+            "const": "cluster"
+          }
+        },
+        "required": [
+          "profile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "nodes": {
+            "minItems": 3,
+            "items": {
+              "properties": {
+                "roles": {
+                  "contains": {
+                    "const": "postgresql"
+                  }
+                }
+              }
+            }
+          },
+          "database": {
+            "properties": {
+              "replication": {
+                "enum": [
+                  "synchronous"
+                ]
+              },
+              "synchronous_strict": {
+                "const": true
+              }
+            }
+          },
+          "failover": {
+            "properties": {
+              "automatic": {
+                "const": true
+              },
+              "authority": {
+                "const": "patroni-etcd"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

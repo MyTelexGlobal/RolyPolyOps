@@ -1,0 +1,62 @@
+{
+  "illustrative_only": true,
+  "format_version": 1,
+  "service_id": "example-portal",
+  "package": {
+    "name": "compose-postgresql-files",
+    "version": 1
+  },
+  "profile": "pair_assisted",
+  "nodes": [
+    {
+      "id": "node-1",
+      "host": "node-1.example.invalid",
+      "failure_domain": "provider-1",
+      "roles": [
+        "application",
+        "postgresql",
+        "files"
+      ]
+    },
+    {
+      "id": "node-2",
+      "host": "node-2.example.invalid",
+      "failure_domain": "provider-2",
+      "roles": [
+        "application",
+        "postgresql",
+        "files"
+      ]
+    }
+  ],
+  "database": {
+    "engine": "postgresql",
+    "replication": "asynchronous",
+    "synchronous_strict": false
+  },
+  "failover": {
+    "automatic": false,
+    "authority": "operator",
+    "require_source_fencing": true
+  },
+  "backup": {
+    "repositories": [
+      "external-primary"
+    ],
+    "minimum_independent_repositories": 1,
+    "service_checkpoint_interval_seconds": 3600,
+    "retention_days": 30
+  },
+  "targets": {
+    "rpo_seconds": 3600,
+    "rto_seconds": 3600
+  },
+  "restore": {
+    "default_target": "isolated",
+    "require_application_check": true
+  },
+  "secret_references": [
+    "portal-db-password",
+    "backup-repository-key"
+  ]
+}
