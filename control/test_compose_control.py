@@ -131,6 +131,94 @@ class ComposeCatalogTests(unittest.TestCase):
         self.sync(self.target)
         return sid,storage,wire['id'],proof
 
+    def test_historical_preview_does_not_rewrite_protection_progress(self):
+        sid,storage,rid,proof=self.backup_restore()
+        with self.c.connect() as db:
+            # A move has changed source identity; the retained historical point
+            # is still a valid service preview, not the required new backup.
+            row,config=self.c.compose.service(db,sid)
+            config.update(sourceNodeId=self.target['nodeId'],recoveryNodeId=self.source['nodeId'],fingerprint='e'*64)
+            db.execute("UPDATE compose_services SET config=?,state='active_unprotected' WHERE id=?",(json.dumps(config),sid))
+        for outcome in ('succeeded','failed','outcome_unknown'):
+            with self.subTest(outcome=outcome):
+                plan=self.call(self.c.plan,{'nodeId':self.source['nodeId'],'action':'compose-restore','snapshotId':SNAP,'parameters':{'serviceId':sid,'storageId':storage,'snapshotId':SNAP}})
+                self.call(self.c.enqueue,{'planId':plan['id'],'idempotencyKey':uid()})
+                wire=self.sync(self.source)['job']
+                report={'id':wire['id'],'nonce':wire['nonce'],'status':outcome}
+                if outcome=='succeeded':
+                    report['result']=dict(proof,restoreId=wire['id'])
+                else:
+                    report['error']='operation_failed'
+                self.sync(self.source,[report])
+                self.assertEqual(self.call(self.c.overview)['services'][0]['setupState'],'active_unprotected')
+                if outcome=='outcome_unknown':
+                    self.sync(self.source,[dict(report,status='failed')])
+
+    def test_demo_install_evidence_survives_later_missing_demo_status(self):
+        status={'supported':True,'serviceHealthy':True,'observedAt':stamp(),'compose':self.source['compose']}
+        self.call(self.c.sync,{'nodeId':self.source['nodeId'],'instanceId':self.source['instanceId'],'status':status,'reports':[]},'Bearer '+self.source['token'])
+        self.sync(self.source)
+        self.c=Control(self.temp.name,'https://control.example.test')
+        self.assertTrue(self.call(self.c.overview)['setup']['demoSelected'])
+        self.assertIn('package_unsupported',[a['code'] for a in self.call(self.c.overview)['alerts']])
+
+    def test_prepare_preserves_working_binding_and_connect_rechecks_work(self):
+        sid,storage=self.service()
+        before=self.call(self.c.compose.binding,storage,self.source['nodeId'])
+        body=self.mutate(sourceNodeId=self.source['nodeId'],nodeIds=[self.source['nodeId']],mode='attach')
+        challenge=self.call(self.c.compose.prepare,storage,body)
+        after=self.call(self.c.compose.binding,storage,self.source['nodeId'])
+        self.assertEqual(dict(before),dict(after))
+        self.assertGreater(challenge['bindings'][0]['bindingGeneration'],before['generation'])
+        with self.c.connect() as db:
+            db.execute('UPDATE compose_challenges SET expires=0 WHERE id=?',(challenge['requestId'],))
+        self.error('challenge_stale',self.c.compose.connect_storage,storage,self.mutate(requestId=challenge['requestId'],bindings=self.envelopes(challenge)))
+        self.assertEqual(dict(self.call(self.c.compose.binding,storage,self.source['nodeId'])),dict(before))
+        self.c=Control(self.temp.name,'https://control.example.test')
+        newer=self.call(self.c.compose.prepare,storage,self.mutate(sourceNodeId=self.source['nodeId'],nodeIds=[self.source['nodeId']],mode='attach'))
+        self.assertGreater(newer['bindings'][0]['bindingGeneration'],challenge['bindings'][0]['bindingGeneration'])
+        plan=self.call(self.c.plan,{'nodeId':self.source['nodeId'],'action':'compose-verify','parameters':{'serviceId':sid,'storageId':storage}})
+        self.call(self.c.enqueue,{'planId':plan['id'],'idempotencyKey':uid()})
+        self.error('binding_busy',self.c.compose.connect_storage,storage,self.mutate(requestId=newer['requestId'],bindings=self.envelopes(newer)))
+        self.assertEqual(dict(self.call(self.c.compose.binding,storage,self.source['nodeId'])),dict(before))
+
+    def test_snapshot_metadata_and_observed_origin_are_immutable(self):
+        sid,_,_,_=self.backup_restore()
+        with self.c.connect() as db:
+            before=dict(db.execute('SELECT * FROM compose_points WHERE service_id=?',(sid,)).fetchone())
+            original=json.loads(before['point'])
+            self.c.compose.point(db,sid,REPO,dict(original,time='2020-01-01T00:00:00+00:00',manifestDigest='0'*64),self.target['nodeId'])
+            self.c.compose.point(db,sid,REPO,original,self.target['nodeId'])
+            after=dict(db.execute('SELECT * FROM compose_points WHERE service_id=?',(sid,)).fetchone())
+        self.assertEqual(before,after)
+
+    def test_import_scope_type_errors_are_controlled_and_do_not_mutate(self):
+        sid,storage=self.service()
+        _,config=self.call(self.c.compose.service,sid)
+        for field,bad in [('storageId',[]),('storageId',{}),('sourceNodeId',[]),('recoveryNodeId',{}),('id',False),('healthCheck',{'service':['web'],'port':8080,'path':'/','expectedStatus':200})]:
+            with self.subTest(field=field,bad=bad):
+                body=self.mutate(**config);body[field]=bad
+                self.error('invalid_health_check' if field=='healthCheck' else 'invalid_service',self.c.compose.import_service,body)
+        self.assertEqual(self.call(self.c.compose.service,sid)[1],config)
+
+    def test_optional_demo_selection_and_real_faults_remain_distinct(self):
+        overview=self.call(self.c.overview)
+        self.assertFalse(overview['setup']['demoSelected'])
+        self.assertNotIn('package_unsupported',[a['code'] for a in overview['alerts']])
+        storage=self.connected()
+        self.assertNotIn('package_unsupported',[a['code'] for a in self.call(self.c.overview)['alerts']])
+        self.source['compose']['ready']=False
+        self.source['compose']['error']='docker_unavailable'
+        self.sync(self.source)
+        self.assertIn('docker_unavailable',[a['code'] for a in self.call(self.c.overview)['alerts']])
+        self.call(self.c.settings,{'profile':'pair_assisted','backupInterval':'hourly','expectedRevision':self.rev()})
+        self.assertTrue(self.call(self.c.overview)['setup']['demoSelected'])
+        self.assertIn('package_unsupported',[a['code'] for a in self.call(self.c.overview)['alerts']])
+        # Legacy agents without generic capability retain the old warning.
+        status={'supported':False,'observedAt':stamp()}
+        self.call(self.c.sync,{'nodeId':self.source['nodeId'],'instanceId':self.source['instanceId'],'status':status,'reports':[]},'Bearer '+self.source['token'])
+        self.assertIn('package_unsupported',[a['code'] for a in self.call(self.c.overview)['alerts']])
+
     def test_metadata_idempotency_and_plaintext_rejection(self):
         sid,body=self.metadata()
         self.assertEqual(self.call(self.c.compose.create_storage,body)['storage']['id'],sid)
@@ -377,6 +465,26 @@ class ComposeCatalogTests(unittest.TestCase):
         self.assertEqual((wire['id'],wire['action']),(result['job']['id'],'compose-resume'))
         self.success(self.source,wire,{'serviceId':sid,'fingerprint':FINGER,'resumed':True,'interval':'hourly','enabled':True})
 
+    def test_resume_refuses_missing_and_malformed_port_inventory(self):
+        sid,_,rid,_=self.backup_restore()
+        group=self.call(self.c.compose.activate,sid,self.mutate(restoreId=rid,ports=[],allowEgress=True,acceptSnapshotLoss=True))
+        stop=self.sync(self.source)['job']
+        self.success(self.source,stop,{'serviceId':sid,'fingerprint':FINGER,'fenced':True,'stopOperationId':stop['id']})
+        self.source['compose']['services'][0]['state']='fenced'
+        self.sync(self.source)
+        target=self.sync(self.target)['job']
+        self.sync(self.target,[{'id':target['id'],'nonce':target['nonce'],'status':'failed','error':'operation_busy'}])
+        original=copy.deepcopy(self.target['compose']['restores'][0])
+        invalid=[None,{},'8080',[{'service':'web','target':80,'published':8080,'hostIp':True,'protocol':'tcp'}]]
+        for bad in invalid:
+            self.target['compose']['restores'][0]=dict(original,ports=bad)
+            self.sync(self.target)
+            self.error('restore_state_unverified',self.c.compose.resume,sid,self.mutate(activationGroupId=group['activationGroupId']))
+        self.target['compose']['restores'][0]=dict(original)
+        self.target['compose']['restores'][0].pop('ports')
+        self.sync(self.target)
+        self.error('restore_state_unverified',self.c.compose.resume,sid,self.mutate(activationGroupId=group['activationGroupId']))
+
     def test_unverified_repository_success_keeps_global_unknown_hold(self):
         sid,challenge,_,pipeline=self.connection()
         wire=self.sync(self.source)['job']
@@ -476,6 +584,14 @@ class MetadataBoundaryTests(unittest.TestCase):
         self.assertNotIn('SECRET',json.dumps(cc.sanitize_result('compose-verify',value,None,{'serviceId':sid,'storageId':storage},rid)))
         value['serviceId']=uid()
         self.assertIsNone(cc.sanitize_result('compose-verify',value,None,{'serviceId':sid,'storageId':storage},rid))
+
+    def test_ip_values_are_strings_and_bind_slots_use_canonical_ipv6(self):
+        base={'service':'web','target':80,'published':8080,'hostIp':'0:0:0:0:0:0:0:1','protocol':'tcp'}
+        self.assertEqual(cc.ports([base])[0]['hostIp'],'::1')
+        self.assertIsNone(cc.ports([base,dict(base,hostIp='::1')]))
+        for bad in (True,False,1,3325256711):
+            self.assertIsNone(cc.ports([dict(base,hostIp=bad)]))
+        self.assertEqual(cc.sanitize_status(compose(addresses=[True,5,'198.51.100.7']))['addresses'],['198.51.100.7'])
 
     def test_udp_duplicate_ports_and_shell_fields_refused(self):
         base={'service':'web','target':80,'published':8080,'hostIp':'0.0.0.0','protocol':'tcp'}

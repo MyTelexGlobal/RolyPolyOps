@@ -104,15 +104,17 @@ def ports(value):
     for p in value:
         if not isinstance(p, dict) or set(p) != {'service', 'target', 'published', 'hostIp', 'protocol'} or not isinstance(p.get('service'), str) or not NAME.fullmatch(p['service']) or not integer(p.get('target'), 1, 65535) or not integer(p.get('published'), 1, 65535) or p.get('protocol') != 'tcp':
             return None
+        if not isinstance(p.get('hostIp'),str) or '%' in p['hostIp']:
+            return None
         try:
-            ipaddress.ip_address(p.get('hostIp'))
+            host_ip=str(ipaddress.ip_address(p['hostIp']))
         except (ValueError, TypeError):
             return None
-        slot = (p['hostIp'], p['published'])
+        slot = (host_ip, p['published'])
         if slot in used:
             return None
         used.add(slot)
-        result.append({k: p[k] for k in ('service', 'target', 'published', 'hostIp', 'protocol')})
+        result.append(dict(p,hostIp=host_ip))
     return result
 
 
@@ -201,13 +203,17 @@ def sanitize_status(value):
         for name in ('snapshotId', 'repositoryId', 'manifestDigest', 'sourceFingerprint'):
             if isinstance(r.get(name, r.get('snapshot') if name == 'snapshotId' else None), str) and HEX.fullmatch(r.get(name, r.get('snapshot') if name == 'snapshotId' else None)):
                 item[name] = r.get(name, r.get('snapshot') if name == 'snapshotId' else None)
-        item['ports'] = ports(r.get('ports', [])) or []
+        published = ports(r.get('ports'))
+        if published is not None:
+            item['ports'] = published
         item['checks'] = safe_checks(r.get('checks'))
         if r.get('healthScope') in ('http', 'docker', 'running-only'):
             item['healthScope'] = r['healthScope']
         item['applicationHealthVerified'] = r.get('applicationHealthVerified') is True
         result['restores'].append(item)
     for address in value.get('addresses', [])[:32] if isinstance(value.get('addresses'), list) else []:
+        if not isinstance(address,str) or '%' in address:
+            continue
         try:
             ip = ipaddress.ip_address(address)
             if not (ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified):
@@ -314,6 +320,7 @@ class ComposeControl:
         db.executescript('''
             CREATE TABLE IF NOT EXISTS compose_storages(id TEXT PRIMARY KEY,metadata TEXT NOT NULL,repository_id TEXT);
             CREATE TABLE IF NOT EXISTS compose_bindings(storage_id TEXT NOT NULL,node_id TEXT NOT NULL,generation INTEGER NOT NULL,request_id TEXT,state TEXT NOT NULL,repository_id TEXT,error TEXT,PRIMARY KEY(storage_id,node_id));
+            CREATE TABLE IF NOT EXISTS compose_binding_reservations(storage_id TEXT NOT NULL,node_id TEXT NOT NULL,generation INTEGER NOT NULL,request_id TEXT,PRIMARY KEY(storage_id,node_id));
             CREATE TABLE IF NOT EXISTS compose_challenges(id TEXT PRIMARY KEY,storage_id TEXT NOT NULL,metadata TEXT NOT NULL,bindings TEXT NOT NULL,expires REAL NOT NULL,consumed INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS compose_services(id TEXT PRIMARY KEY,config TEXT NOT NULL,state TEXT NOT NULL,registered INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS compose_restores(id TEXT PRIMARY KEY,service_id TEXT NOT NULL,node_id TEXT NOT NULL,snapshot_id TEXT NOT NULL,repository_id TEXT NOT NULL,state TEXT NOT NULL,proof TEXT NOT NULL,observed REAL NOT NULL);
@@ -322,6 +329,7 @@ class ComposeControl:
             CREATE TABLE IF NOT EXISTS compose_jobs(job_id TEXT PRIMARY KEY,parent_id TEXT,group_id TEXT,service_id TEXT,storage_id TEXT,intent TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS compose_activations(id TEXT PRIMARY KEY,service_id TEXT NOT NULL,source_node TEXT NOT NULL,target_node TEXT NOT NULL,stop_job TEXT NOT NULL,activate_job TEXT NOT NULL,acceptance TEXT NOT NULL);
         ''')
+        db.execute('INSERT INTO compose_binding_reservations SELECT storage_id,node_id,generation,request_id FROM compose_bindings WHERE 1 ON CONFLICT(storage_id,node_id) DO NOTHING')
 
     def revision(self, db, body):
         if not integer(body.get('expectedRevision'), 1):
@@ -381,8 +389,10 @@ class ComposeControl:
         return row, json.loads(row['config'])
 
     def binding(self, db, storage_id, node_id, *, fresh=True):
-        row = db.execute('SELECT * FROM compose_bindings WHERE storage_id=? AND node_id=?', (storage_id, node_id)).fetchone()
         storage = self.storage(db, storage_id)
+        if not identity(node_id):
+            self.fail('invalid_node',400)
+        row = db.execute('SELECT * FROM compose_bindings WHERE storage_id=? AND node_id=?', (storage_id, node_id)).fetchone()
         if not row or row['state'] != 'connected' or not storage['repository_id'] or row['repository_id'] != storage['repository_id']:
             self.fail('storage_not_connected')
         if fresh:
@@ -427,21 +437,27 @@ class ComposeControl:
         self.fields(body, ('id','name','kind','endpoint','expectedRevision','idempotencyKey'), ('bucket','prefix','region'))
         if not identity(body['id']) or not text(body['name'], 80) or body['kind'] not in ('rest','s3') or not text(body['endpoint'], 1024) or not body['endpoint'].isascii() or any(ord(c)<=32 for c in body['endpoint']):
             self.fail('invalid_storage', 400)
-        p = urlsplit(body['endpoint'])
         try:
-            valid_port = p.port is None or 1 <= p.port <= 65535
-            addr = ipaddress.ip_address(p.hostname)
-            public = addr.is_global
-        except ValueError:
+            p = urlsplit(body['endpoint'])
+            host=p.hostname
+            valid_port=p.port is None or 1 <= p.port <= 65535
+        except (ValueError,TypeError):
+            self.fail('invalid_endpoint',400)
+        public=False
+        if isinstance(host,str):
             try:
-                valid_port = p.port is None or 1 <= p.port <= 65535
+                addr=ipaddress.ip_address(host)
             except ValueError:
-                self.fail('invalid_endpoint',400)
-            public = bool(p.hostname and len(p.hostname) <= 253 and all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', x) for x in p.hostname.rstrip('.').split('.')) and p.hostname.lower() not in ('localhost',) and not p.hostname.lower().endswith('.localhost'))
-        except TypeError:
-            public, valid_port = False, False
-        if p.scheme != 'https' or not p.netloc or p.username or p.password or p.query or p.fragment or not valid_port or not public or '%' in p.netloc or p.hostname.endswith('.') or any(x in ('..','.') for x in unquote(p.path).split('/')) or '\\' in body['endpoint']:
-            self.fail('invalid_endpoint', 400)
+                # Numeric shorthand is interpreted as a host address by some
+                # resolvers. It is not a DNS name approved by this API.
+                numeric=all(re.fullmatch(r'(?:[0-9]+|0[xX][0-9a-fA-F]+)',label) for label in host.split('.'))
+                public=bool(not numeric and len(host)<=253 and all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?',label) for label in host.split('.')) and host.lower()!='localhost' and not host.lower().endswith('.localhost'))
+            else:
+                public=addr.is_global and not (addr.is_multicast or addr.is_reserved or addr.is_loopback or addr.is_link_local or addr.is_unspecified or getattr(addr,'is_site_local',False))
+                if isinstance(addr,ipaddress.IPv6Address) and addr in ipaddress.ip_network('64:ff9b::/96'):
+                    public=False
+        if p.scheme != 'https' or not p.netloc or p.username is not None or p.password is not None or p.query or p.fragment or not valid_port or not public or '%' in p.netloc or any(x in ('..','.') for x in unquote(p.path).split('/')) or '\\' in body['endpoint']:
+            self.fail('invalid_endpoint',400)
         result = {k: body[k] for k in ('id','name','kind','endpoint')}
         if body['kind'] == 's3':
             if p.path not in ('','/') or not isinstance(body.get('bucket'), str) or not re.fullmatch(r'[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]', body['bucket']):
@@ -498,12 +514,13 @@ class ComposeControl:
             _, status = self.live(db, node_id)
             if db.execute("SELECT 1 FROM compose_jobs c JOIN jobs j ON c.job_id=j.id LEFT JOIN compose_services s ON s.id=c.service_id WHERE (c.storage_id=? OR json_extract(s.config,'$.storageId')=?) AND j.node_id=? AND j.status IN ('queued','dispatched','running','outcome_unknown')", (sid,sid,node_id)).fetchone():
                 self.fail('binding_busy')
-            current = db.execute('SELECT * FROM compose_bindings WHERE storage_id=? AND node_id=?', (sid,node_id)).fetchone()
-            if not current and db.execute('SELECT COUNT(*) FROM compose_bindings WHERE node_id=?',(node_id,)).fetchone()[0] >= 8:
+            current = db.execute('SELECT * FROM compose_bindings WHERE storage_id=? AND node_id=?',(sid,node_id)).fetchone()
+            reserved=db.execute('SELECT * FROM compose_binding_reservations WHERE storage_id=? AND node_id=?',(sid,node_id)).fetchone()
+            if not reserved and db.execute('SELECT COUNT(*) FROM compose_binding_reservations WHERE node_id=?',(node_id,)).fetchone()[0] >= 8:
                 self.fail('storage_limit')
-            generation = current['generation']+1 if current else 1
+            generation=max(current['generation'] if current else 0,reserved['generation'] if reserved else 0)+1
             mode = body['mode'] if node_id == body['sourceNodeId'] else 'attach'
-            db.execute('INSERT INTO compose_bindings VALUES(?,?,?,?,\'prepared\',NULL,NULL) ON CONFLICT(storage_id,node_id) DO UPDATE SET generation=excluded.generation,request_id=excluded.request_id,state=\'prepared\',error=NULL', (sid,node_id,generation,request_id))
+            db.execute('INSERT INTO compose_binding_reservations VALUES(?,?,?,?) ON CONFLICT(storage_id,node_id) DO UPDATE SET generation=excluded.generation,request_id=excluded.request_id',(sid,node_id,generation,request_id))
             bindings.append({'nodeId': node_id,'key': status['key'],'mode': mode,'bindingGeneration': generation})
         db.execute('INSERT INTO compose_challenges VALUES(?,?,?,?,?,0)', (request_id,sid,canonical(metadata),canonical(bindings),expiry))
         result = {'requestId': request_id,'expiresAt': datetime.fromtimestamp(expiry,timezone.utc).isoformat(),'metadata': metadata,'bindings': bindings,'revision': self.c.bump(db)}
@@ -545,10 +562,12 @@ class ComposeControl:
             self.fail('invalid_binding',400)
         supplied = {x['nodeId']: x['envelope'] for x in body['bindings']}
         for b in bindings:
-            row = db.execute('SELECT * FROM compose_bindings WHERE storage_id=? AND node_id=?',(sid,b['nodeId'])).fetchone()
+            row = db.execute('SELECT * FROM compose_binding_reservations WHERE storage_id=? AND node_id=?',(sid,b['nodeId'])).fetchone()
             _, seen = self.live(db,b['nodeId'])
-            if not row or row['request_id'] != challenge['id'] or row['generation'] != b['bindingGeneration'] or row['state'] != 'prepared' or seen['key']['id'] != b['key']['id'] or b['nodeId'] not in supplied:
+            if not row or row['request_id'] != challenge['id'] or row['generation'] != b['bindingGeneration'] or seen['key']['id'] != b['key']['id'] or b['nodeId'] not in supplied:
                 self.fail('challenge_stale')
+            if db.execute("SELECT 1 FROM compose_jobs c JOIN jobs j ON c.job_id=j.id LEFT JOIN compose_services s ON s.id=c.service_id WHERE (c.storage_id=? OR json_extract(s.config,'$.storageId')=?) AND j.node_id=? AND j.status IN ('queued','dispatched','running','outcome_unknown')",(sid,sid,b['nodeId'])).fetchone():
+                self.fail('binding_busy')
             self.envelope(supplied[b['nodeId']],challenge,b)
         self.c.bump(db)
         jobs, parent = [], None
@@ -560,7 +579,7 @@ class ComposeControl:
             # All recipients depend on the creator, rather than each other.
             parent = parent or job['id']
             jobs.append(self.c.public_job(job,db))
-            db.execute('UPDATE compose_bindings SET state=\'connecting\' WHERE storage_id=? AND node_id=?',(sid,b['nodeId']))
+            db.execute("INSERT INTO compose_bindings VALUES(?,?,?,?,'connecting',NULL,NULL) ON CONFLICT(storage_id,node_id) DO UPDATE SET generation=excluded.generation,request_id=excluded.request_id,state='connecting',repository_id=NULL,error=NULL",(sid,b['nodeId'],b['bindingGeneration'],challenge['id']))
         db.execute('UPDATE compose_challenges SET consumed=1 WHERE id=?',(challenge['id'],))
         result = {'jobs':jobs,'storage':self.public_storage(db,self.storage(db,sid)),'revision':self.c.revision(db)}
         return self.remember(db,'connect/'+sid,body,result)
@@ -571,7 +590,7 @@ class ComposeControl:
             return old
         self.revision(db,body)
         self.idle(db)
-        if not identity(body['id']) or not text(body['name'],80) or not isinstance(body['projectId'],str) or not NAME.fullmatch(body['projectId']) or not isinstance(body['fingerprint'],str) or not HEX.fullmatch(body['fingerprint']) or (not isinstance(body['backupInterval'],str) or body['backupInterval'] not in INTERVALS) or body['exclusiveWriters'] is not True or body['sourceNodeId'] == body['recoveryNodeId']:
+        if any(not identity(body[field]) for field in ('id','sourceNodeId','recoveryNodeId','storageId')) or not text(body['name'],80) or not isinstance(body['projectId'],str) or not NAME.fullmatch(body['projectId']) or not isinstance(body['fingerprint'],str) or not HEX.fullmatch(body['fingerprint']) or (not isinstance(body['backupInterval'],str) or body['backupInterval'] not in INTERVALS) or body['exclusiveWriters'] is not True or body['sourceNodeId'] == body['recoveryNodeId']:
             self.fail('invalid_service',400)
         _, seen = self.live(db,body['sourceNodeId'])
         self.live(db,body['recoveryNodeId'])
@@ -583,7 +602,7 @@ class ComposeControl:
         if 'healthCheck' in body:
             h = body['healthCheck']
             self.fields(h,('service','port','path','expectedStatus'))
-            if h['service'] not in {s['name'] for s in project['services']} or not integer(h['port'],1,65535) or not text(h['path'],1024) or not h['path'].startswith('/') or h['path'].startswith('//') or any(ord(c)<=32 for c in h['path']) or not integer(h['expectedStatus'],100,599):
+            if not isinstance(h['service'],str) or not NAME.fullmatch(h['service']) or h['service'] not in {s['name'] for s in project['services']} or not integer(h['port'],1,65535) or not text(h['path'],1024) or not h['path'].startswith('/') or h['path'].startswith('//') or any(ord(c)<=32 for c in h['path']) or not integer(h['expectedStatus'],100,599):
                 self.fail('invalid_health_check',400)
         existing = db.execute('SELECT * FROM compose_services WHERE id=?',(body['id'],)).fetchone()
         if not existing and db.execute("SELECT COUNT(*) FROM compose_services WHERE json_extract(config,'$.sourceNodeId')=?",(body['sourceNodeId'],)).fetchone()[0] >= 20:
@@ -701,7 +720,7 @@ class ComposeControl:
         selected = points([dict(value,serviceId=sid,repositoryId=repository)])
         if selected:
             p = selected[0]
-            db.execute('INSERT INTO compose_points VALUES(?,?,?,?,?) ON CONFLICT(service_id,repository_id,snapshot_id) DO UPDATE SET point=excluded.point,node_id=excluded.node_id',(sid,repository,p['id'],canonical(p),node_id))
+            db.execute('INSERT INTO compose_points VALUES(?,?,?,?,?) ON CONFLICT(service_id,repository_id,snapshot_id) DO NOTHING',(sid,repository,p['id'],canonical(p),node_id))
 
     def observed(self, db, node_id, status):
         compose = status.get('compose',{})
@@ -746,6 +765,11 @@ class ComposeControl:
             db.execute('UPDATE jobs SET parameters=? WHERE id=?',(encoded,job['id']))
             db.execute('UPDATE plans SET parameters=? WHERE id=?',(encoded,job['plan_id']))
 
+    def restore_matches_protection(self, db, job, params, result=None):
+        row,service=self.service(db,params['serviceId'])
+        current=self.public_service(db,row).get('latestBackup')
+        return bool(current and row['state'] != 'active_unprotected' and job['node_id'] == service['recoveryNodeId'] and current['snapshot'] == job['snapshot'] and (result is None or (current['repositoryId'] == result['repositoryId'] and current['manifestDigest'] == result['manifestDigest'])))
+
     def settle(self, db):
         """Observe terminal jobs once; dependency closure never reopens children."""
         for job in db.execute('SELECT j.*,c.intent FROM jobs j JOIN compose_jobs c ON c.job_id=j.id WHERE j.status IN (\'succeeded\',\'failed\')').fetchall():
@@ -764,15 +788,17 @@ class ComposeControl:
                 db.execute('UPDATE compose_services SET registered=?,state=? WHERE id=?',(int(success),'backup_required' if success else 'attention_required',params['serviceId']))
             elif action == 'compose-backup' and success:
                 self.point(db,params['serviceId'],result['repositoryId'],{'id':result['snapshot'],'time':result['at'],'manifestDigest':result['manifestDigest'],'sourceFingerprint':result['sourceFingerprint']},job['node_id'])
-                db.execute('UPDATE compose_services SET state=CASE WHEN state=\'active_unprotected\' THEN \'restore_required\' WHEN state IN (\'backup_required\',\'registered\') THEN \'restore_required\' ELSE state END WHERE id=?',(params['serviceId'],))
+                db.execute("UPDATE compose_services SET state='restore_required' WHERE id=?",(params['serviceId'],))
             elif action == 'compose-restore':
                 if success:
                     db.execute('INSERT OR REPLACE INTO compose_restores VALUES(?,?,?,?,?,?,?,?)',(job['id'],params['serviceId'],job['node_id'],job['snapshot'],result['repositoryId'],'isolated_ready',canonical(result),time.time()))
-                    db.execute('UPDATE compose_services SET state=? WHERE id=?',('schedule_required' if result.get('applicationHealthVerified') else 'unverified',params['serviceId']))
+                    if self.restore_matches_protection(db,job,params,result):
+                        db.execute('UPDATE compose_services SET state=? WHERE id=?',('schedule_required' if result.get('applicationHealthVerified') else 'unverified',params['serviceId']))
                 else:
                     repository=self.storage(db,params['storageId'])['repository_id']
                     db.execute('INSERT OR REPLACE INTO compose_restores VALUES(?,?,?,?,?,?,?,?)',(job['id'],params['serviceId'],job['node_id'],job['snapshot'],repository,'failed',canonical({'checks':[],'applicationHealthVerified':False}),time.time()))
-                    db.execute('UPDATE compose_services SET state=\'attention_required\' WHERE id=?',(params['serviceId'],))
+                    if self.restore_matches_protection(db,job,params):
+                        db.execute('UPDATE compose_services SET state=\'attention_required\' WHERE id=?',(params['serviceId'],))
             elif action == 'compose-remove' and success:
                 db.execute('DELETE FROM compose_restores WHERE id=? AND state=\'isolated_ready\'',(params['restoreId'],))
             elif action == 'compose-activate':
@@ -802,7 +828,8 @@ class ComposeControl:
                 env=params.get('envelope',{})
                 db.execute("UPDATE compose_bindings SET state='outcome_unknown',error=? WHERE storage_id=? AND node_id=? AND request_id=?",(job['error'],params['storageId'],job['node_id'],env.get('requestId',params.get('requestId'))))
             elif 'serviceId' in params:
-                db.execute('UPDATE compose_services SET state=\'attention_required\' WHERE id=?',(params['serviceId'],))
+                if job['action'] != 'compose-restore' or self.restore_matches_protection(db,job,params):
+                    db.execute('UPDATE compose_services SET state=\'attention_required\' WHERE id=?',(params['serviceId'],))
                 if job['action'] == 'compose-restore':
                     repository=self.storage(db,params['storageId'])['repository_id']
                     db.execute('INSERT OR REPLACE INTO compose_restores VALUES(?,?,?,?,?,?,?,?)',(job['id'],params['serviceId'],job['node_id'],job['snapshot'],repository,'outcome_unknown',canonical({'checks':[],'applicationHealthVerified':False}),time.time()))
@@ -858,7 +885,7 @@ class ComposeControl:
             self.fail('recovery_restore_required')
         _, status = self.live(db,restore['node_id'])
         seen = next((r for r in status['restores'] if r['id'] == rid and r['serviceId'] == service['id']),{})
-        if seen.get('state') != 'isolated_ready' or seen.get('ports') or seen.get('repositoryId') != restore['repository_id'] or seen.get('snapshotId') != restore['snapshot_id'] or not RESTORE_CHECKS <= set(seen.get('checks',[])):
+        if seen.get('state') != 'isolated_ready' or 'ports' not in seen or seen['ports'] != [] or seen.get('repositoryId') != restore['repository_id'] or seen.get('snapshotId') != restore['snapshot_id'] or not RESTORE_CHECKS <= set(seen.get('checks',[])):
             self.fail('restore_state_unverified')
         return restore
 
@@ -913,6 +940,7 @@ class ComposeControl:
         row, service = self.service(db,sid)
         if not row['registered'] or body['allowEgress'] is not True or body['acceptSnapshotLoss'] is not True or ports(body['ports']) is None:
             self.fail('activation_confirmation_required',400)
+        selected_ports=ports(body['ports'])
         source_node, source = self.live(db,service['sourceNodeId'])
         current = next((s for s in source['services'] if s['serviceId']==sid),{})
         if current.get('state') != 'running' or current.get('fingerprint') != service['fingerprint']:
@@ -926,17 +954,17 @@ class ComposeControl:
         if proof.get('applicationHealthVerified') is not True:
             self.fail('application_health_unverified')
         project = next((p for p in source['projects'] if p['id']==service['projectId']),{})
-        if any(p['service'] not in {s['name'] for s in project.get('services',[])} for p in body['ports']):
+        if any(p['service'] not in {s['name'] for s in project.get('services',[])} for p in selected_ports):
             self.fail('invalid_ports',400)
         point = db.execute('SELECT point FROM compose_points WHERE service_id=? AND repository_id=? AND snapshot_id=?',(sid,restore['repository_id'],restore['snapshot_id'])).fetchone()
         if not point:
             self.fail('snapshot_unavailable')
         snapshot_time=json.loads(point['point'])['time']
-        acceptance={'snapshotId':restore['snapshot_id'],'snapshotTime':snapshot_time,'acceptedAt':datetime.now(timezone.utc).isoformat(),'ageSeconds':max(0,int(time.time()-when(snapshot_time))),'acceptSnapshotLoss':True,'ports':body['ports'],'allowEgress':True,'sourceFingerprint':service['fingerprint'],'sourceInstance':source_node['instance_id']}
+        acceptance={'snapshotId':restore['snapshot_id'],'snapshotTime':snapshot_time,'acceptedAt':datetime.now(timezone.utc).isoformat(),'ageSeconds':max(0,int(time.time()-when(snapshot_time))),'acceptSnapshotLoss':True,'ports':selected_ports,'allowEgress':True,'sourceFingerprint':service['fingerprint'],'sourceInstance':source_node['instance_id']}
         group=str(uuid.uuid4())
         self.c.bump(db)
         stop=self.queue(db,service['sourceNodeId'],'compose-stop',{'serviceId':sid,'fingerprint':service['fingerprint']},group=group,intent={'acceptance':acceptance})
-        target=self.queue(db,restore['node_id'],'compose-activate',{'serviceId':sid,'restoreId':restore['id'],'sourceStopJobId':stop['id'],'interval':service['backupInterval'],'ports':body['ports'],'allowEgress':True},parent=stop['id'],group=group,intent={'acceptance':acceptance})
+        target=self.queue(db,restore['node_id'],'compose-activate',{'serviceId':sid,'restoreId':restore['id'],'sourceStopJobId':stop['id'],'interval':service['backupInterval'],'ports':selected_ports,'allowEgress':True},parent=stop['id'],group=group,intent={'acceptance':acceptance})
         db.execute('INSERT INTO compose_activations VALUES(?,?,?,?,?,?,?)',(group,sid,service['sourceNodeId'],restore['node_id'],stop['id'],target['id'],canonical(acceptance)))
         db.execute('UPDATE compose_services SET state=\'moving\' WHERE id=?',(sid,))
         result={'activationGroupId':group,'jobs':[self.c.public_job(stop,db),self.c.public_job(target,db)],'plan':acceptance,'revision':self.c.revision(db)}

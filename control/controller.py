@@ -356,8 +356,24 @@ class Control:
             return None
         return db.execute("SELECT * FROM sessions WHERE token_hash=? AND expires>?", (digest(token), time.time())).fetchone()
 
+    def demo_selected(self, db):
+        setup=self.setting(db,"setup") or {}
+        if setup.get("demoSelected") is True or setup.get("completed") is True or self.setting(db,"demoInstalledObserved") is True:
+            return True
+        # Older catalogs have no selection marker. A nondefault saved setting
+        # proves a choice; the initial pair/hourly defaults alone do not.
+        if setup.get("profile") not in (None,"pair_assisted") or setup.get("backupInterval") not in (None,"hourly"):
+            return True
+        placeholders=",".join("?" for _ in ACTIONS)
+        if db.execute("SELECT 1 FROM jobs WHERE action IN ("+placeholders+") LIMIT 1",tuple(sorted(ACTIONS))).fetchone() or db.execute("SELECT 1 FROM plans WHERE action IN ("+placeholders+") LIMIT 1",tuple(sorted(ACTIONS))).fetchone():
+            return True
+        installed=any(json.loads(row["status"]).get("supported") is True for row in db.execute("SELECT status FROM nodes"))
+        if installed:
+            self.set_setting(db,"demoInstalledObserved",True)
+        return installed
+
     def session_info(self, db, session):
-        result = {"authenticated": session is not None, "setupRequired": not self.setting(db, "setup")["completed"], "version": VERSION}
+        result = {"authenticated": session is not None, "setupRequired": self.demo_selected(db) and not self.setting(db, "setup")["completed"], "version": VERSION}
         if session is not None:
             result.update(csrf=session["csrf"], needsPasswordChange=self.setting(db, "needsPasswordChange"))
         return result
@@ -626,6 +642,7 @@ class Control:
         self.mark_lost(db)
         self.expire_queued(db)
         nodes, alerts = [], []
+        demo_selected=self.demo_selected(db)
         for row in db.execute("SELECT * FROM nodes ORDER BY name,id"):
             status = json.loads(row["status"])
             current = self.connected(row)
@@ -634,10 +651,14 @@ class Control:
                 alerts.append({"severity": "warning", "code": "node_offline", "nodeId": row["id"]})
             elif not self.status_fresh(status):
                 alerts.append({"severity": "warning", "code": "service_status_stale", "nodeId": row["id"]})
-            elif not status.get("supported"):
-                alerts.append({"severity": "warning", "code": "package_unsupported", "nodeId": row["id"]})
-            elif status.get("serviceHealthy") is not True:
-                alerts.append({"severity": "warning", "code": "service_unhealthy", "nodeId": row["id"]})
+            else:
+                compose=status.get("compose")
+                if not status.get("supported") and (demo_selected or not isinstance(compose,dict)):
+                    alerts.append({"severity": "warning", "code": "package_unsupported", "nodeId": row["id"]})
+                elif status.get("supported") and status.get("serviceHealthy") is not True:
+                    alerts.append({"severity": "warning", "code": "service_unhealthy", "nodeId": row["id"]})
+                if isinstance(compose,dict) and compose.get("ready") is not True:
+                    alerts.append({"severity":"warning","code":compose.get("error","compose_not_ready"),"nodeId":row["id"]})
             disk = status.get("disk")
             if disk and disk["total"] > 0 and disk["free"] / disk["total"] < 0.1:
                 alerts.append({"severity": "warning", "code": "disk_low", "nodeId": row["id"]})
@@ -650,7 +671,7 @@ class Control:
         for row in db.execute("SELECT id FROM nodes WHERE orphan_overflow=1"):
             alerts.append({"severity": "error", "code": "catalog_orphan_capacity", "nodeId": row["id"]})
         enrollments = [{"id": row["id"], "name": row["name"], "role": row["role"], "expiresAt": stamp(row["expires"]), "status": "used" if row["used"] == 1 else "cancelled" if row["used"] == 2 else "expired" if row["expires"] < time.time() else "pending"} for row in db.execute("SELECT * FROM enrollments ORDER BY expires DESC LIMIT 100")]
-        return {"version": VERSION, "revision": self.revision(db), "setup": self.setting(db, "setup"), "nodes": nodes, "enrollments": enrollments, "jobs": jobs, "orphanReports": orphans, "orphanReportLimit": ORPHAN_LIMIT, "capabilities": {"automaticFailover": False}, "alerts": alerts, **self.compose.overview(db)}
+        return {"version": VERSION, "revision": self.revision(db), "setup": dict(self.setting(db, "setup"),demoSelected=demo_selected), "nodes": nodes, "enrollments": enrollments, "jobs": jobs, "orphanReports": orphans, "orphanReportLimit": ORPHAN_LIMIT, "capabilities": {"automaticFailover": False}, "alerts": alerts, **self.compose.overview(db)}
 
     def settings(self, db, body):
         fields(body, ("profile", "backupInterval", "expectedRevision"))
@@ -660,7 +681,7 @@ class Control:
             raise APIError(409, "revision_conflict")
         if db.execute("SELECT COUNT(*) FROM nodes").fetchone()[0] < (1 if body["profile"] == "single" else 2):
             raise APIError(409, "nodes_required")
-        self.set_setting(db, "setup", {"completed": False, "profile": body["profile"], "backupInterval": body["backupInterval"]})
+        self.set_setting(db, "setup", {"completed": False, "profile": body["profile"], "backupInterval": body["backupInterval"], "demoSelected": True})
         return {"revision": self.bump(db)}
 
     def plan(self, db, body):
@@ -780,6 +801,8 @@ class Control:
             raise APIError(401, "agent_unauthorized")
         instance = body["instanceId"]
         status = sanitize_status(body["status"])
+        if status.get("supported") is True:
+            self.set_setting(db,"demoInstalledObserved",True)
         reports = body["reports"]
         if not isinstance(reports, list) or len(reports) > 100:
             raise APIError(400, "invalid_reports")
