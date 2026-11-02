@@ -456,6 +456,16 @@ class Control:
         db.execute("UPDATE nodes SET overflow_inspect_requested=1 WHERE id=? AND orphan_overflow=1", (node_id,))
         return {"inspectionRequested": True, "id": job_id}
 
+    def inspect_orphan_inventory(self, db, node_id, body):
+        fields(body)
+        node = self.node(db, node_id)
+        if not self.connected(node) or not self.status_fresh(json.loads(node["status"])):
+            raise APIError(409, "node_stale")
+        pending = bool(node["orphan_overflow"])
+        if pending:
+            db.execute("UPDATE nodes SET overflow_inspect_requested=1 WHERE id=?", (node_id,))
+        return {"inspectionRequested": pending, "scope": "inventory"}
+
     def enrollment(self, db, body, node_id=None):
         if node_id is None:
             fields(body, ("name", "role"))
@@ -996,6 +1006,9 @@ def handler_for(control):
                     cancelled = re.fullmatch(r"/api/enrollments/([a-f0-9-]{36})/cancel", route)
                     if cancelled:
                         return self.reply_after_commit(db, 200, control.cancel_enrollment(db, cancelled[1], body))
+                    inventory_inspection = re.fullmatch(r"/api/nodes/([a-f0-9-]{36})/orphans/reconcile", route)
+                    if inventory_inspection:
+                        return self.reply_after_commit(db, 200, control.inspect_orphan_inventory(db, inventory_inspection[1], body))
                     orphan_inspection = re.fullmatch(r"/api/nodes/([a-f0-9-]{36})/orphans/([a-f0-9-]{36})/reconcile", route)
                     if orphan_inspection:
                         return self.reply_after_commit(db, 200, control.inspect_orphan(db, orphan_inspection[1], orphan_inspection[2], body))

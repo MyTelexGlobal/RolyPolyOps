@@ -581,6 +581,40 @@ class DomainCase(unittest.TestCase):
         self.job(node)
         self.assertIn('job', self.sync(node))
 
+    def test_inventory_request_recovers_overflow_with_only_terminal_rows(self):
+        node = self.add()
+        receipts = [{'id': str(uuid.uuid4()), 'nonce': 'n' * 43, 'status': 'outcome_unknown'} for _ in range(200)]
+        for start in range(0, 200, 100):
+            self.sync(node, receipts[start:start + 100])
+        retained = self.call('overview')['orphanReports']
+        for start in range(0, len(retained), 100):
+            self.sync(node, [{'id': item['id'], 'nonce': 'n' * 43, 'status': 'failed'} for item in retained[start:start + 100]])
+        overview = self.call('overview')
+        self.assertTrue(overview['nodes'][0]['orphanOverflow'])
+        self.assertTrue(all(item['status'] == 'failed' for item in overview['orphanReports']))
+        queued, _ = self.job(node)
+        self.assertNotIn('job', self.sync(node))
+        expected = {'inspectionRequested': True, 'scope': 'inventory'}
+        self.assertEqual(self.call('inspect_orphan_inventory', node['nodeId'], {}), expected)
+        self.assertEqual(self.call('inspect_orphan_inventory', node['nodeId'], {}), expected)
+        self.control = Control(self.temp.name, 'https://control.example.test')
+        pending = self.sync(node)
+        self.assertTrue(pending['inspectOverflow'])
+        self.assertNotIn('job', pending)
+        completed = self.sync(node, orphanInventoryComplete=True)
+        self.assertEqual(completed['job']['id'], queued['id'])
+        self.assertFalse(self.call('overview')['nodes'][0]['orphanOverflow'])
+        self.assertEqual(self.call('inspect_orphan_inventory', node['nodeId'], {}), {'inspectionRequested': False, 'scope': 'inventory'})
+
+    def test_inventory_request_requires_fresh_node(self):
+        node = self.add()
+        self.sync(node, status=observation(observedAt=stamp(time.time() - 1000)))
+        self.error('node_stale', 'inspect_orphan_inventory', node['nodeId'], {})
+        self.sync(node)
+        with self.control.connect() as db:
+            db.execute('UPDATE nodes SET last_seen=? WHERE id=?', (time.time() - 100, node['nodeId']))
+        self.error('node_stale', 'inspect_orphan_inventory', node['nodeId'], {})
+
 
 class HTTPCase(unittest.TestCase):
     def setUp(self):
@@ -707,6 +741,22 @@ class HTTPCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(result['inspectOrphans'], [receipt['id']])
         self.assertNotIn('job', result)
+
+    def test_inventory_inspection_http_path_requires_owner_csrf(self):
+        self.login()
+        _, _, enrollment = self.request('POST', '/ops/api/enrollments', {'name': 'A', 'role': 'primary'})
+        _, _, node = self.request('POST', '/ops/agent/enroll', {'code': enrollment['code'], 'hostname': 'test', 'version': '0.1.0'})
+        body = {'nodeId': node['nodeId'], 'instanceId': str(uuid.uuid4()), 'status': observation(), 'reports': []}
+        self.request('POST', '/ops/agent/sync', body, {'Authorization': 'Bearer ' + node['token']})
+        with self.control.connect() as db:
+            db.execute('UPDATE nodes SET orphan_overflow=1 WHERE id=?', (node['nodeId'],))
+        path = '/ops/api/nodes/' + node['nodeId'] + '/orphans/reconcile'
+        self.assertEqual(self.request('POST', path, {}, {'Cookie': ''})[0], 401)
+        self.assertEqual(self.request('POST', path, {}, {'X-CSRF-Token': ''})[0], 403)
+        self.assertEqual(self.request('POST', path, {})[2], {'inspectionRequested': True, 'scope': 'inventory'})
+        _, _, response = self.request('POST', '/ops/agent/sync', body, {'Authorization': 'Bearer ' + node['token']})
+        self.assertTrue(response['inspectOverflow'])
+        self.assertNotIn('job', response)
 
     def test_login_origin_and_rate_limit(self):
         self.assertEqual(self.request('POST', '/ops/api/login', {'password': 'wrong'}, {'Origin': 'https://evil.example'})[0], 403)
