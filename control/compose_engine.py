@@ -422,6 +422,7 @@ class ManagedEngine:
                     raise EngineError("compose_secret_unsupported")
                 inputs[path] = digest(path)
         safe_services = []
+        host_platform = self._platform()
         for container in selected:
             config, host = container.get("Config", {}), container.get("HostConfig", {})
             cl = config.get("Labels", {})
@@ -459,11 +460,11 @@ class ManagedEngine:
                 if field in desired and desired[field] not in (None, actual):
                     raise EngineError("compose_container_drift")
             docker_image = container.get("Image", "")
-            image = self._image_info(docker_image)
+            image = self._container_image_info(container, host_platform)
             actual_image = image["id"]
             image_info[actual_image] = image
             desired_image = desired.get("image")
-            if desired_image and self._image_info(desired_image)["id"] != actual_image:
+            if desired_image and self._image_info(desired_image, host_platform)["id"] != actual_image:
                 raise EngineError("compose_image_drift")
             desired["environment"] = runtime_env
             runtime_mounts = []
@@ -544,10 +545,11 @@ class ManagedEngine:
         return isinstance(actual, dict) and all(actual.get(k) == v for k, v in expected.items())
 
     def _helper(self, image, service_id, arguments, *, source=None, stage=None, destination_volume=None, network=None, purpose="capture-helper"):
+        expected_image = self._image_info(image)
         op = self.current["id"]
         name = "rpo-helper-" + op.replace("-", "")[:24] + "-" + uuid.uuid4().hex[:8]
         labels = self._owned_labels(op, service_id, purpose)
-        helpers = self.current.get("helpers", []) + [{"name": name, "labels": labels}]
+        helpers = self.current.get("helpers", []) + [{"name": name, "labels": labels, "imageId": expected_image["id"]}]
         self._journal(helpers=helpers)
         args = ["create", "--name", name, "--network", network or "none", "--read-only", "--pids-limit", "64", "--memory", "512m", "--cpus", "1", "--cap-drop", "ALL", "--cap-add", "DAC_READ_SEARCH", "--cap-add", "DAC_OVERRIDE", "--cap-add", "CHOWN", "--cap-add", "FOWNER", "--security-opt", "no-new-privileges"]
         for key, value in labels.items():
@@ -568,7 +570,7 @@ class ManagedEngine:
         try:
             raw = self.docker("start", "--attach", identity, timeout=3600, error="helper_failed", allow_error=True)
             actual = self._inspect([identity])[0]
-            if not self._labels_match(actual.get("Config", {}).get("Labels", {}), labels) or actual.get("State", {}).get("Running"):
+            if not self._labels_match(actual.get("Config", {}).get("Labels", {}), labels) or actual.get("State", {}).get("Running") or actual.get("Image") != expected_image["id"]:
                 raise EngineError("helper_ownership_unverified", unknown=True)
             value = json.loads(raw)
             if isinstance(value, dict) and re.fullmatch(r"[a-z_]{1,64}", value.get("error", "")):
@@ -600,7 +602,7 @@ class ManagedEngine:
                 if item.get("id") and any(c["Id"] == item["id"] for c in actuals):
                     raise EngineError("helper_ownership_unverified", unknown=True)
                 continue
-            if (item.get("id") and container["Id"] != item["id"]) or not self._labels_match(container.get("Config", {}).get("Labels", {}), item["labels"]):
+            if (item.get("id") and container["Id"] != item["id"]) or (item.get("imageId") and container.get("Image") != item["imageId"]) or not self._labels_match(container.get("Config", {}).get("Labels", {}), item["labels"]):
                 raise EngineError("helper_ownership_unverified", unknown=True)
             identity = container["Id"]
             if container.get("State", {}).get("Running"):
@@ -623,13 +625,21 @@ class ManagedEngine:
 
     def _image_info(self, reference, platform=None):
         platform = platform or self._platform()
+        if not isinstance(reference, str) or not 1 <= len(reference) <= 2048 or reference.startswith("-") or any(ord(c) < 33 or ord(c) == 127 for c in reference):
+            raise EngineError("image_reference_invalid")
         selected = "/".join(x for x in platform if x)
         actual = self._json("image", "inspect", "--platform", selected, reference)[0]
+        if not isinstance(actual, dict) or not re.fullmatch(r"sha256:[a-f0-9]{64}", actual.get("Id", "")):
+            raise EngineError("image_identity_unverified")
         key = hashlib.sha256(canonical([actual["Id"], platform])).hexdigest()
         proofs = self.state / "image-proofs"
         proofs.mkdir(mode=0o700, exist_ok=True)
         cached = read(proofs / (key + ".json"))
         if cached:
+            if (not isinstance(cached, dict) or not re.fullmatch(r"sha256:[a-f0-9]{64}", cached.get("id", ""))
+                    or [cached.get("os"), cached.get("architecture"), cached.get("variant", "")] != platform
+                    or cached.get("dockerRef") != actual["Id"]):
+                raise EngineError("image_proof_corrupt")
             return cached | {"dockerRef": actual["Id"]}
         size = actual.get("Size", 0)
         if type(size) is not int or size < 0 or shutil.disk_usage(self.state).free < size * 2 + 512 * 1024 ** 2:
@@ -659,6 +669,82 @@ class ManagedEngine:
             raise EngineError("image_identity_unverified") from None
         finally:
             path.unlink(missing_ok=True)
+
+    def _container_image_info(self, container, platform=None):
+        """Bind a locally resolvable descriptor's exported config to inspect.Container.Image.
+
+        Container.Image is a config digest, which the containerd store need not accept
+        as an image lookup reference. Config.Image is only a candidate, never proof.
+        """
+        platform = platform or self._platform()
+        expected = container.get("Image")
+        if not isinstance(expected, str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", expected):
+            raise EngineError("image_identity_unverified")
+        tag = container.get("Config", {}).get("Image")
+        if tag is not None and not isinstance(tag, str):
+            raise EngineError("image_identity_unverified")
+        descriptor = container.get("ImageManifestDescriptor") or {}
+        if not isinstance(descriptor, dict):
+            raise EngineError("image_identity_unverified")
+        native = descriptor.get("digest") if isinstance(descriptor, dict) else None
+        if native is not None and (not isinstance(native, str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", native)):
+            raise EngineError("image_identity_unverified")
+        bound = self.state / "container-image-proofs"
+        bound.mkdir(mode=0o700, exist_ok=True)
+        key = hashlib.sha256(canonical([expected, platform])).hexdigest()
+        cached = read(bound / (key + ".json"), {})
+        if not isinstance(cached, dict):
+            raise EngineError("image_proof_corrupt")
+        candidates = [value for value in (native, cached.get("dockerRef"), expected, tag) if isinstance(value, str) and value]
+        match, checked = None, set()
+        for candidate in candidates:
+            if candidate in checked or (candidate == expected and match is not None):
+                continue
+            checked.add(candidate)
+            try:
+                identity = self._image_info(candidate, platform)
+            except EngineError as error:
+                if error.code not in {"docker_operation_failed", "image_identity_unverified"}:
+                    raise
+                if candidate == tag:
+                    try:
+                        self._json("image", "inspect", tag)
+                    except EngineError:
+                        pass
+                    else:
+                        # An existing tag that cannot prove the selected platform is not a missing harmless alias.
+                        raise EngineError("image_identity_unverified") from None
+                continue
+            if identity["id"] != expected:
+                if candidate in {native, tag}:
+                    raise EngineError("image_identity_mismatch")
+                continue
+            if match and identity["id"] != match["id"]:
+                raise EngineError("image_identity_ambiguous")
+            match = identity
+        if match is None:
+            # A deleted source tag may leave an available native image descriptor. Enumerate only local immutable IDs.
+            ids = self.docker("image", "ls", "--all", "--quiet", "--no-trunc").decode().split()
+            ids = sorted(set(ids))
+            if len(ids) > 1000 or any(not re.fullmatch(r"sha256:[a-f0-9]{64}", value) for value in ids):
+                raise EngineError("image_inventory_limit")
+            for candidate in ids:
+                if candidate in checked:
+                    continue
+                try:
+                    identity = self._image_info(candidate, platform)
+                except EngineError as error:
+                    if error.code in {"docker_operation_failed", "image_identity_unverified"}:
+                        continue
+                    raise
+                if identity["id"] == expected:
+                    match = identity
+                    break
+        if match is None:
+            raise EngineError("image_identity_unverified")
+        # This cache records only a completed byte-level config match, never a guessed tag association.
+        atomic(bound / (key + ".json"), {"id": expected, "platform": platform, "dockerRef": match["dockerRef"]})
+        return match
 
     def _helper_image(self, platform=None, known_id=None):
         return self._image_info(known_id or HELPER_IMAGE, platform)
@@ -1117,8 +1203,11 @@ class ManagedEngine:
             raise EngineError("restore_service_set_unverified", unknown=True)
         for name, container in by_service.items():
             original = next(c for c in manifest["containers"] if c["service"] == name)
-            if self._image_info(container.get("Image"), manifest["platform"])["id"] != original["imageId"] or not container.get("State", {}).get("Running"):
+            if self._container_image_info(container, manifest["platform"])["id"] != original["imageId"] or not container.get("State", {}).get("Running"):
                 raise EngineError("restore_runtime_unverified")
+            desired_alias = manifest["images"][original["imageId"]]["alias"]
+            if self._image_info(desired_alias, manifest["platform"])["id"] != original["imageId"]:
+                raise EngineError("image_identity_mismatch")
             expected_mounts = {(m["target"], record["mappings"][m["key"]]["source"], not m["readOnly"]) for m in original["mounts"]}
             actual_mounts = {(m["Destination"], m.get("Name") if m["Type"] == "volume" else m["Source"], m.get("RW", False)) for m in container.get("Mounts", [])}
             if expected_mounts != actual_mounts:
@@ -1851,10 +1940,25 @@ class ManagedEngine:
         identity = job.get("id") if isinstance(job, dict) else None
         return self.inspect_operation(identity) or {"status": "outcome_unknown", "error": "operation_not_found"}
 
+    def _observe_addresses(self):
+        values = json.loads(self._run(["ip", "--json", "address", "show", "scope", "global"], timeout=3))
+        addresses = set()
+        for interface in values:
+            for item in interface.get("addr_info", []):
+                value = item.get("local")
+                address = ipaddress.ip_address(value)
+                if not (address.is_loopback or address.is_link_local or address.is_multicast or address.is_unspecified):
+                    addresses.add(str(address))
+        return sorted(addresses)[:20]
+
     def observe(self):
         self._local.observation_deadline = time.monotonic() + 25
         output = {"ready": False, "projects": [], "storages": [], "services": [], "restores": [], "addresses": [], "operations": []}
         try:
+            try:
+                output["addresses"] = self._observe_addresses()
+            except (EngineError, ValueError, KeyError, TypeError):
+                output["addressesError"] = "address_inventory_unavailable"
             output["key"] = self.sealer.public()
             containers = self._containers()
             names = sorted({c.get("Config", {}).get("Labels", {}).get("com.docker.compose.project") for c in containers})
@@ -1908,11 +2012,6 @@ class ManagedEngine:
                 if value.get("status") == "running" and active_lock:
                     safe["status"] = "running"
                 output["operations"].append({"id": value["id"], "action": value["action"], "origin": value.get("origin", "controller"), **safe})
-            try:
-                values = json.loads(self._run(["ip", "--json", "address", "show", "scope", "global"]))
-                output["addresses"] = sorted({a["local"] for interface in values for a in interface.get("addr_info", []) if not ipaddress.ip_address(a["local"]).is_loopback})[:20]
-            except (EngineError, ValueError, KeyError):
-                pass
             output["ready"] = True
         except (EngineError, StorageError, SealError, ArchiveError) as error:
             output["error"] = error.code
