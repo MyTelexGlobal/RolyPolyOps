@@ -403,6 +403,9 @@ class StorageManager:
 
     def configure(self, operation_id, params):
         storage_id, mode, envelope = params["storageId"], params["mode"], params["envelope"]
+        discover = params.get("discoverRepositoryId") is True
+        if "discoverRepositoryId" in params and (not discover or mode != "attach" or "expectedRepositoryId" in params):
+            raise StorageError("invalid_repository_discovery")
         if "metadata" not in params:
             raise StorageError("approved_metadata_required")
         validate_metadata(params["metadata"])
@@ -426,12 +429,20 @@ class StorageManager:
             if namespace != storage_id:
                 raise StorageError("storage_namespace_mismatch")
         expected = params.get("expectedRepositoryId")
-        if mode == "attach" and not re.fullmatch(r"[a-f0-9]{64}", expected or ""):
-            raise StorageError("expected_repository_required")
+        authoritative = previous.get("repositoryId") or previous.get("expectedRepositoryId") or previous.get("authoritativeRepositoryId")
+        if mode == "attach":
+            if discover:
+                if authoritative:
+                    raise StorageError("expected_repository_required")
+            elif not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}", expected):
+                raise StorageError("expected_repository_required")
+            if authoritative and expected != authoritative:
+                raise StorageError("repository_identity_mismatch")
         self._password(storage_id, inner["repoPassword"])
         salt = os.urandom(32)
         binding = {"metadata": metadata, "credentials": credentials, "bindingGeneration": generation, "requestId": request_id,
                    "operationId": operation_id, "mode": mode, "status": "accepted", "expectedRepositoryId": expected,
+                   "authoritativeRepositoryId": authoritative, "discoverRepositoryId": discover,
                    "consumedRequests": (previous.get("consumedRequests", []) + [request_id]),
                    "passwordSalt": salt.hex(), "passwordVerifier": hashlib.scrypt(inner["repoPassword"].encode(), salt=salt, n=16384, r=8, p=1).hex()}
         # Acceptance and generation are durable even if the following probe fails.

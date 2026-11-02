@@ -70,6 +70,30 @@ class EngineTests(unittest.TestCase):
         with self.assertRaises(engine.EngineError):
             engine.validate_job(self.job("compose-activate", {"serviceId": self.sid, "restoreId": uid(), "sourceStopJobId": uid(), "interval": "hourly", "ports": [], "allowEgress": False}))
 
+    def test_activation_host_ip_is_string_and_equivalent_ipv6_slots_do_not_mutate_job(self):
+        port = {"service": "app", "target": 8080, "published": 18190, "hostIp": "127.0.0.1", "protocol": "tcp"}
+        params = {"serviceId": self.sid, "restoreId": uid(), "sourceStopJobId": uid(), "interval": "hourly", "ports": [port], "allowEgress": True}
+        for value in (3325256711, True, 0, False, None, "fe80::1%eth0"):
+            with self.subTest(value=value), self.assertRaisesRegex(engine.EngineError, "invalid_ports"):
+                engine.validate_job(self.job("compose-activate", params | {"ports": [port | {"hostIp": value}]}))
+        duplicate = params | {"ports": [port | {"hostIp": "::1"}, port | {"hostIp": "0:0:0:0:0:0:0:1"}]}
+        job = self.job("compose-activate", duplicate)
+        before = copy.deepcopy(job)
+        with self.assertRaisesRegex(engine.EngineError, "invalid_ports"):
+            engine.validate_job(job)
+        self.assertEqual(job, before)
+        valid = self.job("compose-activate", params | {"ports": [port, port | {"hostIp": "0:0:0:0:0:0:0:1"}]})
+        before = copy.deepcopy(valid)
+        engine.validate_job(valid)
+        self.assertEqual(valid, before)
+
+    def test_controller_only_repository_discovery_flag_has_exact_schema(self):
+        params = {"storageId": self.storage, "metadata": {"id": self.storage}, "mode": "attach", "envelope": {}, "discoverRepositoryId": True}
+        engine.validate_job(self.job("storage-configure", params))
+        for change in ({"discoverRepositoryId": False}, {"discoverRepositoryId": 1}, {"mode": "create"}, {"expectedRepositoryId": None}, {"expectedRepositoryId": "a" * 64}):
+            with self.subTest(change=change), self.assertRaisesRegex(engine.EngineError, "invalid_repository_discovery"):
+                engine.validate_job(self.job("storage-configure", params | change))
+
     def test_archive_preserves_numeric_safe_metadata_and_internal_links(self):
         archive = self.archive([{"name": "payload", "kind": tarfile.DIRTYPE, "mode": 0o750}, {"name": "payload/file", "content": b"independent data"}, {"name": "payload/link", "kind": tarfile.SYMTYPE, "link": "file"}, {"name": "payload/hard", "kind": tarfile.LNKTYPE, "link": "payload/file"}])
         value = helper.inspect_archive(archive)
@@ -373,164 +397,193 @@ class EngineTests(unittest.TestCase):
         identities = {image_id: {"id": image_id, "os": "linux", "architecture": "amd64", "variant": "", "alias": alias}}
         return path, identities
 
-    def test_platform_export_proves_config_identity_when_display_id_differs(self):
+    def test_legacy_config_root_is_proven_without_native_descriptor(self):
         path, identities = self.image_archive()
-        expected = next(iter(identities))
-        display = "sha256:" + "f" * 64
-        def docker(*args, **kwargs):
+        config_id = next(iter(identities))
+        def command(*args, **kwargs):
             if args[:2] == ("image", "save"):
-                target = Path(args[args.index("--output") + 1])
-                target.write_bytes(path.read_bytes())
+                self.assertEqual(args[-1], config_id)
+                Path(args[args.index("--output") + 1]).write_bytes(path.read_bytes())
             return b""
-        with mock.patch.object(self.engine, "_json", return_value=[{"Id": display, "Size": 1}]), mock.patch.object(self.engine, "docker", side_effect=docker) as command:
-            first = self.engine._image_info("local-built:application", ["linux", "amd64", ""])
-            second = self.engine._image_info("other-alias:same-content", ["linux", "amd64", ""])
-        self.assertEqual(first["id"], expected)
-        self.assertNotEqual(first["id"], display)
-        self.assertEqual(first["dockerRef"], display)
-        self.assertEqual(first, second)
-        self.assertEqual(command.call_count, 1)
-        self.assertIn("--platform", command.call_args.args)
+        with mock.patch.object(self.engine, "_json", return_value=[{"Id": config_id, "Size": 1}]), mock.patch.object(self.engine, "docker", side_effect=command):
+            result = self.engine._container_image_info({"Image": config_id, "Config": {"Image": "legacy:built"}}, ["linux", "amd64", ""])
+        self.assertEqual(result["id"], config_id)
+        self.assertEqual(result["proofKind"], "legacy-config")
 
-    def docker29_images(self, *, changed_tag=False, foreign=False):
-        path, identities = self.image_archive()
-        expected = next(iter(identities))
-        native, other = "sha256:" + "f" * 64, "sha256:" + "e" * 64
-        if foreign:
+    def docker29_images(self, *, changed_tag=False, foreign=False, omit_root=False):
+        def native_archive(marker, architecture):
+            path, _ = self.image_archive()
             with tarfile.open(path) as archive:
                 files = {m.name: archive.extractfile(m).read() for m in archive if m.isfile()}
-            manifest = json.loads(files["manifest.json"])
-            config_path = manifest[0]["Config"]
-            parsed = json.loads(files[config_path])
-            parsed["architecture"] = "arm64"
+            item = json.loads(files["manifest.json"])[0]
+            parsed = json.loads(files.pop(item["Config"]))
+            parsed.update(architecture=architecture, created=marker)
             config = json.dumps(parsed).encode()
-            expected = "sha256:" + hashlib.sha256(config).hexdigest()
-            manifest[0]["Config"] = "blobs/sha256/" + expected[7:]
-            files.pop(config_path)
-            files[manifest[0]["Config"]] = config
-            files["manifest.json"] = json.dumps(manifest).encode()
+            cfg = "sha256:" + hashlib.sha256(config).hexdigest()
+            config_name = "blobs/sha256/" + cfg[7:]
+            files[config_name] = config
+            alias = "rolypolyops-reserved/sha256-" + cfg[7:] + ":bundle"
+            layers = [{"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": "sha256:" + name.rsplit("/", 1)[-1], "size": len(files[name])} for name in item["Layers"]]
+            native = json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json", "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": cfg, "size": len(config)}, "layers": layers}).encode()
+            child = "sha256:" + hashlib.sha256(native).hexdigest()
+            descriptor = {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": child, "size": len(native), "platform": {"os": "linux", "architecture": architecture}}
+            index = json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": [descriptor]}).encode()
+            root = "sha256:" + hashlib.sha256(index).hexdigest()
+            root_descriptor = {"mediaType": "application/vnd.oci.image.index.v1+json", "digest": root, "size": len(index)}
+            files["manifest.json"] = json.dumps([{"Config": config_name, "RepoTags": [alias], "Layers": item["Layers"]}]).encode()
+            files["blobs/sha256/" + child[7:]] = native
+            if not omit_root:
+                files["blobs/sha256/" + root[7:]] = index
+            files["index.json"] = json.dumps({"schemaVersion": 2, "manifests": [root_descriptor | {"annotations": {"io.containerd.image.name": alias, "org.opencontainers.image.ref.name": "bundle"}}]}).encode()
             path = self.archive([{"name": name, "content": content} for name, content in files.items()])
+            return {"root": root, "child": child, "config": cfg, "descriptor": descriptor, "rootDescriptor": root_descriptor, "archive": path, "alias": alias}
+        primary = native_archive("original", "arm64" if foreign else "amd64")
+        changed = native_archive("retargeted", "amd64") if changed_tag else primary
+        entries = {primary["root"]: primary, changed["root"]: changed}
         def inspect(*args):
             if args[:2] == ("network", "inspect"):
                 return [{"Driver": "bridge", "Labels": {"com.docker.compose.project": "ordinary"}}]
             if args[:2] != ("image", "inspect"):
                 raise AssertionError(args)
             reference = args[-1]
-            if reference == expected:
+            entry = changed if reference == "fixture:built" else primary if reference in {primary["root"], "reserved:bundle", primary["alias"]} else None
+            if entry is None:
                 raise engine.EngineError("docker_operation_failed")
-            if reference in {native, "fixture:built", "reserved:bundle"}:
-                return [{"Id": other if changed_tag and reference == "fixture:built" else native, "Size": 1}]
-            raise engine.EngineError("docker_operation_failed")
+            if "--platform" in args:
+                return [{"Id": entry["child"], "Descriptor": entry["descriptor"], "Size": 1}]
+            return [{"Id": entry["root"], "Descriptor": entry["rootDescriptor"], "Size": 1}]
         def command(*args, **kwargs):
             if args[:2] == ("image", "save"):
-                target = Path(args[args.index("--output") + 1])
-                if args[-1] == other:
-                    # A new valid export with another config identity must never be associated with the old container.
-                    with tarfile.open(path) as archive:
-                        files = {m.name: archive.extractfile(m).read() for m in archive if m.isfile()}
-                    manifest = json.loads(files["manifest.json"])
-                    old_config = manifest[0]["Config"]
-                    config = json.loads(files[old_config])
-                    config["created"] = "different-tag-content"
-                    raw = json.dumps(config).encode()
-                    new_config = "blobs/sha256/" + hashlib.sha256(raw).hexdigest()
-                    files.pop(old_config)
-                    files[new_config] = raw
-                    manifest[0]["Config"] = new_config
-                    files["manifest.json"] = json.dumps(manifest).encode()
-                    with tarfile.open(target, "w") as archive:
-                        for name, content in files.items():
-                            tar_entry(archive, name, content)
-                else:
-                    target.write_bytes(path.read_bytes())
-            elif args[:2] == ("image", "ls"):
-                return (native + "\n").encode()
+                self.assertIn(args[-1], entries, "only unfiltered immutable lookup roots are exportable")
+                Path(args[args.index("--output") + 1]).write_bytes(entries[args[-1]]["archive"].read_bytes())
             return b""
-        return expected, native, inspect, command
+        primary.update(inspect=inspect, command=command)
+        return primary
 
-    def test_docker29_config_digest_uninspectable_binds_native_descriptor_and_current_tag(self):
-        expected, native, inspect, command = self.docker29_images()
-        container = {"Image": expected, "ImageManifestDescriptor": {"digest": native}, "Config": {"Image": "fixture:built"}}
-        with mock.patch.object(self.engine, "_json", side_effect=inspect) as lookups, mock.patch.object(self.engine, "docker", side_effect=command):
+    def test_docker29_distinct_index_manifest_config_chain_and_cached_root_export(self):
+        data = self.docker29_images()
+        self.assertEqual(len({data["root"], data["child"], data["config"]}), 3)
+        container = {"Image": data["root"], "ImageManifestDescriptor": data["descriptor"], "Config": {"Image": "fixture:built"}}
+        with mock.patch.object(self.engine, "_json", side_effect=data["inspect"]), mock.patch.object(self.engine, "docker", side_effect=data["command"]) as commands:
             result = self.engine._container_image_info(container, ["linux", "amd64", ""])
             again = self.engine._container_image_info(container, ["linux", "amd64", ""])
-        self.assertEqual(result["id"], expected)
-        self.assertEqual(result["dockerRef"], native)
+        self.assertEqual(result["id"], data["config"])
+        self.assertEqual(result["dockerRef"], data["root"])
+        self.assertEqual(result["manifestDigest"], data["child"])
+        self.assertTrue(result["rootIndexBytesVerified"])
         self.assertEqual(result, again)
-        self.assertTrue(any(call.args[-1] == native for call in lookups.call_args_list))
-        self.assertTrue(list((self.engine.state / "container-image-proofs").glob("*.json")))
+        self.assertEqual(sum(call.args[:2] == ("image", "save") for call in commands.call_args_list), 1)
+        self.engine._image_archive(data["archive"], {data["config"]: result | {"alias": data["alias"]}})
 
-    def test_docker29_tag_candidate_requires_exact_config_and_foreign_platform_fails(self):
-        for changed, foreign in ((True, False), (False, True)):
-            expected, native, inspect, command = self.docker29_images(changed_tag=changed, foreign=foreign)
-            container = {"Image": expected, "ImageManifestDescriptor": {"digest": native}, "Config": {"Image": "fixture:built"}}
-            with self.subTest(changed=changed, foreign=foreign), mock.patch.object(self.engine, "_json", side_effect=inspect), mock.patch.object(self.engine, "docker", side_effect=command):
+    def test_native_chain_rejects_config_tamper_and_cached_config_claim_tamper(self):
+        data = self.docker29_images()
+        with mock.patch.object(self.engine, "_json", side_effect=data["inspect"]), mock.patch.object(self.engine, "docker", side_effect=data["command"]):
+            self.engine._image_info(data["root"], ["linux", "amd64", ""])
+            cache = next((self.engine.state / "image-proofs").glob("*.json"))
+            proof = read(cache)
+            proof["id"] = "sha256:" + "0" * 64
+            atomic(cache, proof)
+            with self.assertRaisesRegex(engine.EngineError, "image_proof_corrupt"):
+                self.engine._image_info(data["root"], ["linux", "amd64", ""])
+            cache.unlink()
+            with tarfile.open(data["archive"]) as archive:
+                files = {m.name: archive.extractfile(m).read() for m in archive if m.isfile()}
+            config_name = "blobs/sha256/" + data["config"][7:]
+            parsed = json.loads(files[config_name])
+            parsed["created"] = "tampered without changing authenticated manifest"
+            files[config_name] = json.dumps(parsed).encode()
+            data["archive"] = self.archive([{"name": name, "content": value} for name, value in files.items()])
+            with self.assertRaisesRegex(engine.EngineError, "image_identity_unverified"):
+                self.engine._image_info(data["root"], ["linux", "amd64", ""])
+
+    def test_docker29_tag_retarget_foreign_platform_and_wrong_container_descriptor_refused(self):
+        for changed, foreign, wrong_child, false_config_field in ((True, False, False, False), (False, True, False, False), (False, False, True, False), (False, False, False, True)):
+            data = self.docker29_images(changed_tag=changed, foreign=foreign)
+            descriptor = data["descriptor"] | ({"digest": "sha256:" + "0" * 64} if wrong_child else {})
+            container = {"Image": data["config"] if false_config_field else data["root"], "ImageManifestDescriptor": descriptor, "Config": {"Image": "fixture:built"}}
+            with self.subTest(changed=changed, foreign=foreign, wrong_child=wrong_child, false_config_field=false_config_field), mock.patch.object(self.engine, "_json", side_effect=data["inspect"]), mock.patch.object(self.engine, "docker", side_effect=data["command"]):
                 with self.assertRaisesRegex(engine.EngineError, "image_identity_(mismatch|unverified)"):
                     self.engine._container_image_info(container, ["linux", "amd64", ""])
 
-    def test_docker29_catalog_lookup_is_local_bounded_and_byte_proven(self):
-        expected, native, inspect, command = self.docker29_images()
-        container = {"Image": expected, "Config": {}}
-        with mock.patch.object(self.engine, "_json", side_effect=inspect), mock.patch.object(self.engine, "docker", side_effect=command):
-            result = self.engine._container_image_info(container, ["linux", "amd64", ""])
-        self.assertEqual(result["id"], expected)
-        self.assertEqual(result["dockerRef"], native)
+    def test_docker29_filtered_export_can_omit_index_but_not_actual_child_config_chain(self):
+        data = self.docker29_images(omit_root=True)
+        container = {"Image": data["root"], "ImageManifestDescriptor": data["descriptor"], "Config": {"Image": "fixture:built"}}
+        with mock.patch.object(self.engine, "_json", side_effect=data["inspect"]), mock.patch.object(self.engine, "docker", side_effect=data["command"]):
+            proof = self.engine._container_image_info(container, ["linux", "amd64", ""])
+        self.assertEqual(proof["id"], data["config"])
+        self.assertFalse(proof["rootIndexBytesVerified"])
+        self.assertEqual(proof["manifestDigest"], data["descriptor"]["digest"])
 
-    def test_docker29_full_source_discovery_with_config_only_container_image(self):
-        expected, native, inspect, command = self.docker29_images()
+    def test_docker29_full_discovery_reports_internal_tcp_targets(self):
+        data = self.docker29_images()
         path = self.root / "ordinary.json"
         path.write_text("{}")
         labels = {"com.docker.compose.project": "ordinary", "com.docker.compose.service": "app", "com.docker.compose.project.config_files": str(path), "com.docker.compose.project.working_dir": str(self.root)}
-        container = {"Id": "a" * 64, "Image": expected, "ImageManifestDescriptor": {"digest": native}, "Config": {"Image": "fixture:built", "Labels": labels, "Env": ["MARKER=private"]}, "HostConfig": {}, "State": {"Running": True}, "Mounts": [], "NetworkSettings": {"Networks": {"ordinary_default": {"NetworkID": "network"}}}}
-        model = {"services": {"app": {"image": "fixture:built", "environment": {"MARKER": "private"}, "networks": {"default": None}}}, "networks": {"default": {"name": "ordinary_default"}}}
-        with mock.patch.object(self.engine, "_platform", return_value=["linux", "amd64", ""]), mock.patch.object(self.engine, "_json", side_effect=inspect), mock.patch.object(self.engine, "docker", side_effect=command), mock.patch.object(self.engine, "_precheck_compose"), mock.patch.object(self.engine, "_compose", return_value=json.dumps(model).encode()):
+        container = {"Id": "a" * 64, "Image": data["root"], "ImageManifestDescriptor": data["descriptor"], "Config": {"Image": "fixture:built", "Labels": labels, "Env": ["MARKER=private"]}, "HostConfig": {}, "State": {"Running": True}, "Mounts": [], "NetworkSettings": {"Networks": {"ordinary_default": {"NetworkID": "network"}}}}
+        ports = [{"target": 8080, "published": "18190", "protocol": "tcp"}, {"target": 8080, "published": "18191", "protocol": "tcp"}, {"target": 9000, "published": "18999"}, {"target": 8053, "published": "53", "protocol": "udp"}, {"target": 9001, "published": "18200", "protocol": "sctp"}]
+        model = {"services": {"app": {"image": "fixture:built", "environment": {"MARKER": "private"}, "ports": ports, "networks": {"default": None}}}, "networks": {"default": {"name": "ordinary_default"}}}
+        with mock.patch.object(self.engine, "_platform", return_value=["linux", "amd64", ""]), mock.patch.object(self.engine, "_json", side_effect=data["inspect"]), mock.patch.object(self.engine, "docker", side_effect=data["command"]), mock.patch.object(self.engine, "_precheck_compose"), mock.patch.object(self.engine, "_compose", return_value=json.dumps(model).encode()):
             project = self.engine._project("ordinary", [container])
-        self.assertEqual(project["containers"][0]["imageId"], expected)
-        self.assertEqual(project["images"][expected]["dockerRef"], native)
-        self.assertEqual(len(project["fingerprint"]), 64)
+        self.assertEqual(project["containers"][0]["imageId"], data["config"])
+        self.assertEqual(project["images"][data["config"]]["dockerRef"], data["root"])
+        self.assertEqual(project["services"][0]["ports"], [8080, 9000])
         self.assertNotIn("private", json.dumps(self.engine._safe_project(project)))
 
-    def test_docker29_restored_runtime_proves_container_and_reserved_alias(self):
-        expected, native, inspect, command = self.docker29_images()
+    def test_internal_tcp_exposure_ranges_are_unique_bounded_and_host_ports_are_not_targets(self):
+        desired = {"ports": [{"target": 8080, "published": "18190", "protocol": "tcp"}, {"target": 8080, "published": "18191"}, {"target": 53, "published": "5353", "protocol": "udp"}], "expose": ["9000/tcp", "9001-9002/tcp", "8053/udp"]}
+        config = {"ExposedPorts": {"8080/tcp": {}, "9003/tcp": {}, "9004/udp": {}}}
+        self.assertEqual(self.engine._target_ports(desired, config), [8080, 9000, 9001, 9002, 9003])
+        for invalid in ("0", "65536", "1-100", "nonsense", True):
+            with self.subTest(invalid=invalid), self.assertRaises(engine.EngineError):
+                self.engine._target_ports({"expose": [invalid]}, {})
+
+    def test_docker29_restored_runtime_proves_actual_native_child_and_reserved_alias(self):
+        data = self.docker29_images()
         rid = uid()
         record = {"id": rid, "serviceId": self.sid, "projectId": "owned-runtime", "mappings": {}, "ports": []}
         labels = self.engine._owned_labels(rid, self.sid, "restore") | {helper.OWNER + ".restore": rid, "com.docker.compose.project": record["projectId"], "com.docker.compose.service": "app"}
-        container = {"Id": "a" * 64, "Image": expected, "ImageManifestDescriptor": {"digest": native}, "State": {"Running": True}, "Config": {"Image": "reserved:bundle", "Labels": labels, "Env": []}, "HostConfig": {}, "Mounts": [], "NetworkSettings": {"Networks": {"own-network": {"NetworkID": "network"}}, "Ports": {}}}
-        manifest = {"platform": ["linux", "amd64", ""], "runtime": {"services": {"app": {"environment": {}}}}, "containers": [{"service": "app", "imageId": expected, "mounts": []}], "images": {expected: {"alias": "reserved:bundle"}}}
-        def local_inspect(*args):
+        container = {"Id": "a" * 64, "Image": data["root"], "ImageManifestDescriptor": data["descriptor"], "State": {"Running": True}, "Config": {"Image": "reserved:bundle", "Labels": labels, "Env": []}, "HostConfig": {}, "Mounts": [], "NetworkSettings": {"Networks": {"own-network": {"NetworkID": "network"}}, "Ports": {}}}
+        manifest = {"platform": ["linux", "amd64", ""], "runtime": {"services": {"app": {"environment": {}}}}, "containers": [{"service": "app", "imageId": data["config"], "mounts": []}], "images": {data["config"]: {"alias": "reserved:bundle"}}}
+        def inspect(*args):
             if args[:2] == ("network", "inspect"):
                 return [{"Driver": "bridge", "Internal": True, "Labels": labels, "Options": {"com.docker.network.bridge.gateway_mode_ipv4": "isolated", "com.docker.network.bridge.gateway_mode_ipv6": "isolated"}}]
-            return inspect(*args)
-        with mock.patch.object(self.engine, "_restore_containers", return_value=[container]), mock.patch.object(self.engine, "_json", side_effect=local_inspect), mock.patch.object(self.engine, "docker", side_effect=command):
-            result = self.engine._runtime_checks(record, manifest)
-        self.assertEqual(result["app"]["Image"], expected)
+            return data["inspect"](*args)
+        with mock.patch.object(self.engine, "_restore_containers", return_value=[container]), mock.patch.object(self.engine, "_json", side_effect=inspect), mock.patch.object(self.engine, "docker", side_effect=data["command"]):
+            self.assertEqual(self.engine._runtime_checks(record, manifest)["app"]["Image"], data["root"])
 
-    def test_helper_uses_native_reference_but_checks_actual_config_digest(self):
-        cfg, native, cid = "sha256:" + "a" * 64, "sha256:" + "b" * 64, "c" * 64
+    def test_helper_runs_exportable_root_and_verifies_actual_manifest_config_chain(self):
+        data = self.docker29_images()
         for wrong in (False, True):
             self.engine.current = {"id": uid(), "action": "compose-backup", "status": "running"}
+            cid = "c" * 64
             def command(*args, **kwargs):
                 if args[0] == "create":
-                    self.assertIn(native, args)
-                    self.assertNotIn(cfg, args)
+                    self.assertIn(data["root"], args)
+                    self.assertNotIn(data["child"], args)
+                    self.assertNotIn(data["config"], args)
                     return cid.encode()
-                return b'{"files":1,"bytes":3}'
+                if args[0] == "start":
+                    return b'{"files":1,"bytes":3}'
+                return data["command"](*args, **kwargs)
             def inspect(ids):
                 labels = self.engine.current["helpers"][-1]["labels"]
-                return [{"Id": cid, "Image": "sha256:" + "d" * 64 if wrong else cfg, "Config": {"Labels": labels}, "State": {"Running": False, "ExitCode": 0}}]
-            with mock.patch.object(self.engine, "_image_info", return_value={"id": cfg, "dockerRef": native}), mock.patch.object(self.engine, "docker", side_effect=command), mock.patch.object(self.engine, "_inspect", side_effect=inspect), mock.patch.object(self.engine, "_terminate_helpers") as terminate:
+                descriptor = data["descriptor"] | ({"digest": "sha256:" + "0" * 64} if wrong else {})
+                return [{"Id": cid, "Image": data["root"], "ImageManifestDescriptor": descriptor, "Config": {"Labels": labels}, "State": {"Running": False, "ExitCode": 0}}]
+            with mock.patch.object(self.engine, "_platform", return_value=["linux", "amd64", ""]), mock.patch.object(self.engine, "_json", side_effect=data["inspect"]), mock.patch.object(self.engine, "docker", side_effect=command), mock.patch.object(self.engine, "_inspect", side_effect=inspect), mock.patch.object(self.engine, "_terminate_helpers") as terminate:
                 if wrong:
                     with self.assertRaisesRegex(engine.EngineError, "helper_ownership_unverified"):
-                        self.engine._helper(native, self.sid, ["inspect", "/data/payload"])
+                        self.engine._helper(data["root"], self.sid, ["inspect", "/data/payload"])
                 else:
-                    self.assertEqual(self.engine._helper(native, self.sid, ["inspect", "/data/payload"])["files"], 1)
+                    self.assertEqual(self.engine._helper(data["root"], self.sid, ["inspect", "/data/payload"])["files"], 1)
                 terminate.assert_called_once()
 
-    def test_addresses_observed_before_a_discovery_deadline_failure(self):
-        addresses = [{"addr_info": [{"local": "192.0.2.10"}, {"local": "127.0.0.1"}]}]
-        with mock.patch.object(self.engine, "_run", return_value=json.dumps(addresses).encode()), mock.patch.object(self.engine.sealer, "public", return_value={"id": "key"}), mock.patch.object(self.engine, "_containers", side_effect=engine.EngineError("observation_deadline")):
+    def test_addresses_keep_public_entries_and_report_empty_or_invalid_entries_partial(self):
+        values = [{"ifname": "eth0", "addr_info": [{"family": "inet", "scope": "global", "local": "8.8.8.8"}, {}, {"family": "inet6", "scope": "global", "local": "2001:4860:4860::8888"}, {"family": "inet", "scope": "global", "local": "10.1.2.3"}, {"family": "inet", "scope": "global", "local": "not-an-ip"}]}, {"ifname": "br-abc", "addr_info": [{"family": "inet", "scope": "global", "local": "1.1.1.1"}, {}]}]
+        with mock.patch.object(self.engine, "_run", return_value=json.dumps(values).encode()), mock.patch.object(self.engine.sealer, "public", return_value={"id": "key"}), mock.patch.object(self.engine, "_containers", side_effect=engine.EngineError("observation_deadline")):
             result = self.engine.observe()
-        self.assertEqual(result["addresses"], ["192.0.2.10"])
+        self.assertEqual(result["addresses"], ["2001:4860:4860::8888", "8.8.8.8"])
+        self.assertTrue(result["addressesPartial"])
+        self.assertEqual(result["addressesError"], "address_inventory_partial")
         self.assertEqual(result["error"], "observation_deadline")
 
     def test_oci_or_legacy_secondary_tags_cannot_overwrite_other_images(self):

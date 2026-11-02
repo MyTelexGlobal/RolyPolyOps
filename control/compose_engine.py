@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Managed Compose capture, exact isolated restore and durable source authority."""
 import argparse
+import base64
 import contextlib
 import copy
 import datetime as dt
@@ -73,7 +74,7 @@ def validate_job(job):
         "compose-activate": {"serviceId", "restoreId", "sourceStopJobId", "interval", "ports", "allowEgress"},
         "compose-resume": {"serviceId"},
     }[action]
-    optional = {"storage-configure": {"expectedRepositoryId", "metadata"}, "compose-register": {"healthCheck"},
+    optional = {"storage-configure": {"expectedRepositoryId", "metadata", "discoverRepositoryId"}, "compose-register": {"healthCheck"},
                 "compose-activate": {"sourceStopProof"}, "compose-resume": {"fingerprint", "interval", "activationGroupId", "targetAbsenceProof"}}.get(action, set())
     if not required <= set(p) or set(p) - required - optional:
         raise EngineError("invalid_parameters")
@@ -86,6 +87,11 @@ def validate_job(job):
         raise EngineError("invalid_schedule")
     if action == "storage-configure" and ((not isinstance(p["mode"], str) or p["mode"] not in {"create", "attach"}) or not isinstance(p["envelope"], dict)):
         raise EngineError("invalid_parameters")
+    if action == "storage-configure" and "discoverRepositoryId" in p:
+        if p["discoverRepositoryId"] is not True or p["mode"] != "attach" or "expectedRepositoryId" in p:
+            raise EngineError("invalid_repository_discovery")
+    if action == "storage-configure" and "expectedRepositoryId" in p and (not isinstance(p["expectedRepositoryId"], str) or not HEX.fullmatch(p["expectedRepositoryId"])):
+        raise EngineError("invalid_repository_identity")
     if action == "compose-register":
         if not NAME.fullmatch(p["projectId"] if isinstance(p["projectId"], str) else "") or p["exclusiveWriters"] is not True:
             raise EngineError("exclusive_writers_required")
@@ -107,10 +113,12 @@ def validate_job(job):
                     or any(type(port[k]) is not int or not 1 <= port[k] <= 65535 for k in ("target", "published"))):
                 raise EngineError("invalid_ports")
             try:
-                ipaddress.ip_address(port["hostIp"])
+                if not isinstance(port["hostIp"], str) or "%" in port["hostIp"]:
+                    raise ValueError()
+                address = ipaddress.ip_address(port["hostIp"])
             except (ValueError, TypeError):
                 raise EngineError("invalid_ports") from None
-            key = (port["hostIp"], port["published"])
+            key = (str(address), port["published"])
             if key in used:
                 raise EngineError("invalid_ports")
             used.add(key)
@@ -387,6 +395,38 @@ class ManagedEngine:
                     if {"extends", "provider"} & set(merged(service)):
                         raise EngineError("compose_remote_input_unsupported")
 
+    @staticmethod
+    def _target_ports(service, config):
+        targets = set()
+        def add(value, protocol="tcp"):
+            if protocol != "tcp":
+                return
+            if isinstance(value, bool) or not isinstance(value, (str, int)):
+                raise EngineError("compose_port_unsupported")
+            text = str(value)
+            if "/" in text:
+                text, protocol = text.rsplit("/", 1)
+                if protocol != "tcp":
+                    return
+            if not re.fullmatch(r"[0-9]+(?:-[0-9]+)?", text):
+                raise EngineError("compose_port_unsupported")
+            first, _, last = text.partition("-")
+            first, last = int(first), int(last or first)
+            if not 1 <= first <= last <= 65535 or last - first >= 40:
+                raise EngineError("compose_port_unsupported")
+            targets.update(range(first, last + 1))
+            if len(targets) > 40:
+                raise EngineError("compose_port_limit")
+        for port in service.get("ports", []):
+            if not isinstance(port, dict) or "target" not in port:
+                raise EngineError("compose_port_unsupported")
+            add(port["target"], port.get("protocol", "tcp"))
+        for value in service.get("expose", []):
+            add(value)
+        for value in config.get("ExposedPorts") or {}:
+            add(value)
+        return sorted(targets)
+
     def _project(self, project, containers=None, *, owned_service=None):
         containers = self._containers() if containers is None else containers
         selected = [c for c in containers if c.get("Config", {}).get("Labels", {}).get("com.docker.compose.project") == project]
@@ -502,7 +542,7 @@ class ManagedEngine:
                 raise EngineError("compose_mount_drift")
             identities.append({"id": container["Id"], "service": service, "imageId": actual_image, "dockerImageRef": docker_image, "mounts": sorted(runtime_mounts, key=lambda m: m["target"]),
                                "restart": host.get("RestartPolicy", {"Name": "no", "MaximumRetryCount": 0})})
-            ports = sorted({int(p.get("published")) for p in desired.get("ports", []) if p.get("published")})
+            ports = self._target_ports(desired, config)
             safe_services.append({"name": service, "imageId": actual_image, "healthcheck": bool(config.get("Healthcheck", {}).get("Test")) and config.get("Healthcheck", {}).get("Test", [""])[0] != "NONE", "ports": ports})
         if seen != set(model["services"]):
             raise EngineError("compose_service_set_drift")
@@ -549,7 +589,7 @@ class ManagedEngine:
         op = self.current["id"]
         name = "rpo-helper-" + op.replace("-", "")[:24] + "-" + uuid.uuid4().hex[:8]
         labels = self._owned_labels(op, service_id, purpose)
-        helpers = self.current.get("helpers", []) + [{"name": name, "labels": labels, "imageId": expected_image["id"]}]
+        helpers = self.current.get("helpers", []) + [{"name": name, "labels": labels, "imageId": expected_image["id"], "imageProof": expected_image}]
         self._journal(helpers=helpers)
         args = ["create", "--name", name, "--network", network or "none", "--read-only", "--pids-limit", "64", "--memory", "512m", "--cpus", "1", "--cap-drop", "ALL", "--cap-add", "DAC_READ_SEARCH", "--cap-add", "DAC_OVERRIDE", "--cap-add", "CHOWN", "--cap-add", "FOWNER", "--security-opt", "no-new-privileges"]
         for key, value in labels.items():
@@ -570,7 +610,7 @@ class ManagedEngine:
         try:
             raw = self.docker("start", "--attach", identity, timeout=3600, error="helper_failed", allow_error=True)
             actual = self._inspect([identity])[0]
-            if not self._labels_match(actual.get("Config", {}).get("Labels", {}), labels) or actual.get("State", {}).get("Running") or actual.get("Image") != expected_image["id"]:
+            if not self._labels_match(actual.get("Config", {}).get("Labels", {}), labels) or actual.get("State", {}).get("Running") or not self._container_matches_image(actual, expected_image):
                 raise EngineError("helper_ownership_unverified", unknown=True)
             value = json.loads(raw)
             if isinstance(value, dict) and re.fullmatch(r"[a-z_]{1,64}", value.get("error", "")):
@@ -602,7 +642,7 @@ class ManagedEngine:
                 if item.get("id") and any(c["Id"] == item["id"] for c in actuals):
                     raise EngineError("helper_ownership_unverified", unknown=True)
                 continue
-            if (item.get("id") and container["Id"] != item["id"]) or (item.get("imageId") and container.get("Image") != item["imageId"]) or not self._labels_match(container.get("Config", {}).get("Labels", {}), item["labels"]):
+            if (item.get("id") and container["Id"] != item["id"]) or (item.get("imageProof") and not self._container_matches_image(container, item["imageProof"])) or (not item.get("imageProof") and item.get("imageId") and container.get("Image") != item["imageId"]) or not self._labels_match(container.get("Config", {}).get("Labels", {}), item["labels"]):
                 raise EngineError("helper_ownership_unverified", unknown=True)
             identity = container["Id"]
             if container.get("State", {}).get("Running"):
@@ -623,31 +663,183 @@ class ManagedEngine:
             raise EngineError("insufficient_staging_space")
         return {"logicalBytes": logical_bytes, "imageBytes": image_bytes, "requiredBytes": budget, "freeBytes": disk.free, "freeInodes": fs.f_favail, "fileCount": file_count}
 
+    @staticmethod
+    def _descriptor(value):
+        if not isinstance(value, dict) or not re.fullmatch(r"sha256:[a-f0-9]{64}", value.get("digest", "")) or type(value.get("size")) is not int or not 0 < value["size"] <= MAX_BYTES:
+            raise EngineError("image_identity_unverified")
+        result = {k: value[k] for k in ("digest", "size", "mediaType") if k in value}
+        if "platform" in value:
+            p = value["platform"]
+            if not isinstance(p, dict):
+                raise EngineError("image_identity_unverified")
+            result["platform"] = {k: p[k] for k in ("os", "architecture", "variant") if p.get(k)}
+        return result
+
+    def _native_chain(self, archive, item, platform, selected_descriptor=None, root_descriptor=None):
+        def raw_member(name, maximum=4 * 1024 * 1024):
+            member = archive.getmember(name)
+            if not member.isfile() or not 0 <= member.size <= maximum:
+                raise ValueError()
+            return archive.extractfile(member).read()
+        raw = raw_member(item["Config"])
+        config = json.loads(raw)
+        config_id = "sha256:" + hashlib.sha256(raw).hexdigest()
+        actual_platform = [config["os"], config["architecture"], config.get("variant") or ""]
+        if actual_platform != platform:
+            raise ValueError()
+        proof = {"id": config_id, "os": actual_platform[0], "architecture": actual_platform[1], "variant": actual_platform[2], "proofKind": "legacy-config", "manifestDigest": None, "configEvidence": base64.b64encode(raw).decode()}
+        if selected_descriptor is None:
+            return proof
+        selected_descriptor = self._descriptor(selected_descriptor)
+        manifest_types = {"application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"}
+        index_types = {"application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"}
+        if selected_descriptor.get("mediaType") not in manifest_types:
+            raise ValueError()
+        selected_platform = selected_descriptor.get("platform")
+        if selected_platform and [selected_platform.get("os"), selected_platform.get("architecture"), selected_platform.get("variant") or ""] != platform:
+            raise ValueError()
+        def blob(descriptor, maximum=4 * 1024 * 1024):
+            descriptor = self._descriptor(descriptor)
+            value = raw_member("blobs/sha256/" + descriptor["digest"][7:], maximum)
+            if len(value) != descriptor["size"] or "sha256:" + hashlib.sha256(value).hexdigest() != descriptor["digest"]:
+                raise ValueError()
+            return value
+        native_raw = blob(selected_descriptor)
+        native = json.loads(native_raw)
+        if native.get("schemaVersion") != 2 or native.get("mediaType", selected_descriptor["mediaType"]) not in manifest_types:
+            raise ValueError()
+        cfg = self._descriptor(native["config"])
+        if cfg["digest"] != config_id or cfg["size"] != len(raw):
+            raise ValueError()
+        if blob(cfg) != raw:
+            raise ValueError()
+        layers = native.get("layers")
+        if not isinstance(layers, list) or len(layers) > 1000 or len(layers) != len(item.get("Layers", [])):
+            raise ValueError()
+        for layer, name in zip(layers, item["Layers"]):
+            layer = self._descriptor(layer)
+            if name != "blobs/sha256/" + layer["digest"][7:]:
+                raise ValueError()
+            member = archive.getmember(name)
+            if not member.isfile() or member.size != layer["size"]:
+                raise ValueError()
+            h = hashlib.sha256()
+            stream = archive.extractfile(member)
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                h.update(block)
+            if "sha256:" + h.hexdigest() != layer["digest"]:
+                raise ValueError()
+        root_verified, index_evidence = False, {}
+        if root_descriptor and root_descriptor.get("mediaType") in index_types:
+            root_name = "blobs/sha256/" + root_descriptor["digest"][7:]
+            if root_name in archive.getnames():
+                visited = set()
+                def contains(descriptor, depth=0):
+                    if depth > 16 or len(visited) > 1000 or descriptor["digest"] in visited:
+                        raise ValueError()
+                    visited.add(descriptor["digest"])
+                    index_raw = blob(descriptor)
+                    index_evidence[descriptor["digest"]] = base64.b64encode(index_raw).decode()
+                    if sum(len(value) for value in index_evidence.values()) > 24 * 1024 * 1024:
+                        raise ValueError()
+                    node = json.loads(index_raw)
+                    if node.get("schemaVersion") != 2 or not isinstance(node.get("manifests"), list):
+                        raise ValueError()
+                    for child in node["manifests"]:
+                        child = self._descriptor(child)
+                        if child["digest"] == selected_descriptor["digest"]:
+                            if child["size"] != selected_descriptor["size"] or child.get("mediaType") != selected_descriptor.get("mediaType"):
+                                raise ValueError()
+                            return True
+                        if child.get("mediaType") in index_types and "blobs/sha256/" + child["digest"][7:] in archive.getnames() and contains(child, depth + 1):
+                            return True
+                    return False
+                if not contains(root_descriptor):
+                    raise ValueError()
+                root_verified = True
+        proof.update(proofKind="native-manifest", manifestDigest=selected_descriptor["digest"], selectedDescriptor=selected_descriptor, rootIndexBytesVerified=root_verified, manifestEvidence=base64.b64encode(native_raw).decode(), indexEvidence=index_evidence)
+        return proof
+
+    def _check_image_evidence(self, identity, platform):
+        def decoded(value):
+            if not isinstance(value, str) or len(value) > 6 * 1024 * 1024:
+                raise ValueError()
+            return base64.b64decode(value, validate=True)
+        raw = decoded(identity["configEvidence"])
+        config = json.loads(raw)
+        if "sha256:" + hashlib.sha256(raw).hexdigest() != identity["id"] or [config["os"], config["architecture"], config.get("variant") or ""] != platform:
+            raise ValueError()
+        if identity["proofKind"] == "legacy-config":
+            if identity["dockerRef"] != identity["id"]:
+                raise ValueError()
+            return
+        selected = identity["selectedDescriptor"]
+        raw_manifest = decoded(identity["manifestEvidence"])
+        if "sha256:" + hashlib.sha256(raw_manifest).hexdigest() != selected["digest"] or len(raw_manifest) != selected["size"] or identity["manifestDigest"] != selected["digest"]:
+            raise ValueError()
+        native = json.loads(raw_manifest)
+        if native["config"]["digest"] != identity["id"] or native["config"]["size"] != len(raw):
+            raise ValueError()
+        if identity.get("rootIndexBytesVerified"):
+            indexes = identity["indexEvidence"]
+            if not isinstance(indexes, dict) or len(indexes) > 1000 or sum(len(v) for v in indexes.values()) > 24 * 1024 * 1024:
+                raise ValueError()
+            visited = set()
+            def contains(descriptor, depth=0):
+                if depth > 16 or descriptor["digest"] in visited:
+                    raise ValueError()
+                visited.add(descriptor["digest"])
+                value = decoded(indexes[descriptor["digest"]])
+                if "sha256:" + hashlib.sha256(value).hexdigest() != descriptor["digest"] or len(value) != descriptor["size"]:
+                    raise ValueError()
+                for child in json.loads(value)["manifests"]:
+                    if child["digest"] == selected["digest"] and child["size"] == selected["size"] and child.get("mediaType") == selected.get("mediaType"):
+                        return True
+                    if child["digest"] in indexes and contains(child, depth + 1):
+                        return True
+                return False
+            if not contains(identity["rootDescriptor"]):
+                raise ValueError()
+
     def _image_info(self, reference, platform=None):
         platform = platform or self._platform()
         if not isinstance(reference, str) or not 1 <= len(reference) <= 2048 or reference.startswith("-") or any(ord(c) < 33 or ord(c) == 127 for c in reference):
             raise EngineError("image_reference_invalid")
         selected = "/".join(x for x in platform if x)
+        # The unfiltered lookup root is exportable. A platform-filtered inspect.Id may be only a non-addressable child.
+        root = self._json("image", "inspect", reference)[0]
         actual = self._json("image", "inspect", "--platform", selected, reference)[0]
-        if not isinstance(actual, dict) or not re.fullmatch(r"sha256:[a-f0-9]{64}", actual.get("Id", "")):
+        root_id = root.get("Id")
+        if not isinstance(root_id, str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", root_id):
             raise EngineError("image_identity_unverified")
-        key = hashlib.sha256(canonical([actual["Id"], platform])).hexdigest()
+        root_descriptor = self._descriptor(root["Descriptor"]) if root.get("Descriptor") else None
+        if root_descriptor and root_descriptor["digest"] != root_id:
+            raise EngineError("image_identity_unverified")
+        selected_descriptor = self._descriptor(actual["Descriptor"]) if actual.get("Descriptor") else None
+        if selected_descriptor and selected_descriptor["digest"] != actual.get("Id"):
+            raise EngineError("image_identity_unverified")
+        key = hashlib.sha256(canonical([3, root_id, root_descriptor, selected_descriptor, platform])).hexdigest()
         proofs = self.state / "image-proofs"
         proofs.mkdir(mode=0o700, exist_ok=True)
         cached = read(proofs / (key + ".json"))
         if cached:
-            if (not isinstance(cached, dict) or not re.fullmatch(r"sha256:[a-f0-9]{64}", cached.get("id", ""))
+            if (not isinstance(cached, dict) or cached.get("v") != 3 or not re.fullmatch(r"sha256:[a-f0-9]{64}", cached.get("id", ""))
                     or [cached.get("os"), cached.get("architecture"), cached.get("variant", "")] != platform
-                    or cached.get("dockerRef") != actual["Id"]):
+                    or cached.get("dockerRef") != root_id or cached.get("rootDescriptor") != root_descriptor
+                    or cached.get("selectedDescriptor") != selected_descriptor):
                 raise EngineError("image_proof_corrupt")
-            return cached | {"dockerRef": actual["Id"]}
-        size = actual.get("Size", 0)
+            try:
+                self._check_image_evidence(cached, platform)
+            except (ValueError, TypeError, KeyError, RecursionError):
+                raise EngineError("image_proof_corrupt") from None
+            return cached
+        size = actual.get("Size", root.get("Size", 0))
         if type(size) is not int or size < 0 or shutil.disk_usage(self.state).free < size * 2 + 512 * 1024 ** 2:
             raise EngineError("insufficient_staging_space")
         path = proofs / ("." + uuid.uuid4().hex + ".tar")
         try:
-            # Config bytes from a platform-explicit native export establish identity even when inspect.Id is an index/manifest.
-            self.docker("image", "save", "--platform", selected, "--output", str(path), actual["Id"], timeout=3600)
+            self.docker("image", "save", "--platform", selected, "--output", str(path), root_id, timeout=3600)
+            inspect_archive(path, data=False)
             with tarfile.open(path) as archive:
                 member = archive.getmember("manifest.json")
                 if not member.isfile() or member.size > 1024 * 1024:
@@ -655,95 +847,57 @@ class ManagedEngine:
                 values = json.load(archive.extractfile(member))
                 if not isinstance(values, list) or len(values) != 1:
                     raise ValueError()
-                config = archive.getmember(values[0]["Config"])
-                if not config.isfile() or config.size > 4 * 1024 * 1024:
+                identity = self._native_chain(archive, values[0], platform, selected_descriptor, root_descriptor)
+                if selected_descriptor is None and (root_id != identity["id"] or actual.get("Id") != identity["id"] or root_descriptor):
                     raise ValueError()
-                raw = archive.extractfile(config).read()
-                parsed = json.loads(raw)
-                identity = {"id": "sha256:" + hashlib.sha256(raw).hexdigest(), "os": parsed["os"], "architecture": parsed["architecture"], "variant": parsed.get("variant", ""), "size": size, "dockerRef": actual["Id"]}
-                if [identity["os"], identity["architecture"], identity["variant"]] != platform:
-                    raise ValueError()
+                identity.update(v=3, size=size, dockerRef=root_id, rootDescriptor=root_descriptor, selectedDescriptor=selected_descriptor)
                 atomic(proofs / (key + ".json"), identity)
                 return identity
-        except (ValueError, KeyError, TypeError, tarfile.TarError, OSError):
+        except (ValueError, KeyError, TypeError, tarfile.TarError, OSError, RecursionError):
             raise EngineError("image_identity_unverified") from None
         finally:
             path.unlink(missing_ok=True)
 
-    def _container_image_info(self, container, platform=None):
-        """Bind a locally resolvable descriptor's exported config to inspect.Container.Image.
+    def _container_matches_image(self, container, identity):
+        if container.get("Image") != identity.get("dockerRef"):
+            return False
+        if identity.get("proofKind") == "legacy-config":
+            return identity["id"] == container.get("Image") and not container.get("ImageManifestDescriptor")
+        descriptor = container.get("ImageManifestDescriptor")
+        try:
+            descriptor = self._descriptor(descriptor)
+        except EngineError:
+            return False
+        selected = identity.get("selectedDescriptor", {})
+        if any(descriptor.get(key) != selected.get(key) for key in ("digest", "size", "mediaType")):
+            return False
+        p = descriptor.get("platform")
+        return not p or [p.get("os"), p.get("architecture"), p.get("variant") or ""] == [identity["os"], identity["architecture"], identity.get("variant") or ""]
 
-        Container.Image is a config digest, which the containerd store need not accept
-        as an image lookup reference. Config.Image is only a candidate, never proof.
-        """
+    def _container_image_info(self, container, platform=None):
+        """Prove the actual native root + platform manifest -> config chain, or a verified legacy config root."""
         platform = platform or self._platform()
-        expected = container.get("Image")
-        if not isinstance(expected, str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", expected):
+        expected_root = container.get("Image")
+        if not isinstance(expected_root, str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", expected_root):
             raise EngineError("image_identity_unverified")
         tag = container.get("Config", {}).get("Image")
         if tag is not None and not isinstance(tag, str):
             raise EngineError("image_identity_unverified")
-        descriptor = container.get("ImageManifestDescriptor") or {}
-        if not isinstance(descriptor, dict):
-            raise EngineError("image_identity_unverified")
-        native = descriptor.get("digest") if isinstance(descriptor, dict) else None
-        if native is not None and (not isinstance(native, str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", native)):
-            raise EngineError("image_identity_unverified")
-        bound = self.state / "container-image-proofs"
-        bound.mkdir(mode=0o700, exist_ok=True)
-        key = hashlib.sha256(canonical([expected, platform])).hexdigest()
-        cached = read(bound / (key + ".json"), {})
-        if not isinstance(cached, dict):
-            raise EngineError("image_proof_corrupt")
-        candidates = [value for value in (native, cached.get("dockerRef"), expected, tag) if isinstance(value, str) and value]
-        match, checked = None, set()
-        for candidate in candidates:
-            if candidate in checked or (candidate == expected and match is not None):
-                continue
-            checked.add(candidate)
+        match = None
+        for candidate in dict.fromkeys([expected_root, tag] if tag else [expected_root]):
             try:
                 identity = self._image_info(candidate, platform)
             except EngineError as error:
-                if error.code not in {"docker_operation_failed", "image_identity_unverified"}:
+                if error.code != "docker_operation_failed":
                     raise
-                if candidate == tag:
-                    try:
-                        self._json("image", "inspect", tag)
-                    except EngineError:
-                        pass
-                    else:
-                        # An existing tag that cannot prove the selected platform is not a missing harmless alias.
-                        raise EngineError("image_identity_unverified") from None
                 continue
-            if identity["id"] != expected:
-                if candidate in {native, tag}:
-                    raise EngineError("image_identity_mismatch")
-                continue
-            if match and identity["id"] != match["id"]:
+            if not self._container_matches_image(container, identity):
+                raise EngineError("image_identity_mismatch")
+            if match and (match["id"] != identity["id"] or match.get("manifestDigest") != identity.get("manifestDigest")):
                 raise EngineError("image_identity_ambiguous")
             match = identity
         if match is None:
-            # A deleted source tag may leave an available native image descriptor. Enumerate only local immutable IDs.
-            ids = self.docker("image", "ls", "--all", "--quiet", "--no-trunc").decode().split()
-            ids = sorted(set(ids))
-            if len(ids) > 1000 or any(not re.fullmatch(r"sha256:[a-f0-9]{64}", value) for value in ids):
-                raise EngineError("image_inventory_limit")
-            for candidate in ids:
-                if candidate in checked:
-                    continue
-                try:
-                    identity = self._image_info(candidate, platform)
-                except EngineError as error:
-                    if error.code in {"docker_operation_failed", "image_identity_unverified"}:
-                        continue
-                    raise
-                if identity["id"] == expected:
-                    match = identity
-                    break
-        if match is None:
             raise EngineError("image_identity_unverified")
-        # This cache records only a completed byte-level config match, never a guessed tag association.
-        atomic(bound / (key + ".json"), {"id": expected, "platform": platform, "dockerRef": match["dockerRef"]})
         return match
 
     def _helper_image(self, platform=None, known_id=None):
@@ -827,7 +981,11 @@ class ManagedEngine:
                         raise ValueError()
                     config = json.loads(raw)
                     expected = identities[identity]
-                    if (config.get("os"), config.get("architecture"), config.get("variant", "")) != (expected["os"], expected["architecture"], expected.get("variant", "")):
+                    if expected.get("proofKind") == "native-manifest":
+                        proven = self._native_chain(archive, item, [expected["os"], expected["architecture"], expected.get("variant") or ""], expected.get("selectedDescriptor"), expected.get("rootDescriptor"))
+                        if proven["id"] != identity or proven.get("manifestDigest") != expected.get("manifestDigest"):
+                            raise ValueError()
+                    if (config.get("os"), config.get("architecture"), config.get("variant") or "") != (expected["os"], expected["architecture"], expected.get("variant") or ""):
                         raise ValueError()
                     aliases = item.get("RepoTags", [])
                     if aliases != [expected["alias"]]:
@@ -1092,7 +1250,7 @@ class ManagedEngine:
     def _platform(self):
         try:
             server = json.loads(self.docker("version", "--format", "{{json .Server}}"))
-            return [server["Os"], server["Arch"], server.get("Variant", "")]
+            return [server["Os"], server["Arch"], server.get("Variant") or ""]
         except (ValueError, KeyError, TypeError):
             raise EngineError("host_platform_unverified") from None
 
@@ -1221,8 +1379,8 @@ class ManagedEngine:
                     or set(host.get("CapDrop") or []) != set(desired.get("cap_drop", []))
                     or bool([s for s in host.get("SecurityOpt") or [] if s.startswith("no-new-privileges")]) != bool(desired.get("security_opt"))):
                 raise EngineError("restore_runtime_restriction_mismatch")
-            expected_ports = {(p["target"], p["published"], p["hostIp"]) for p in record.get("ports", []) if p["service"] == name} if active else set()
-            actual_ports = {(int(key.split("/")[0]), int(binding["HostPort"]), binding["HostIp"]) for key, bindings in (host.get("PortBindings") or {}).items() for binding in bindings or [] if key.endswith("/tcp")}
+            expected_ports = {(p["target"], p["published"], str(ipaddress.ip_address(p["hostIp"]))) for p in record.get("ports", []) if p["service"] == name} if active else set()
+            actual_ports = {(int(key.split("/")[0]), int(binding["HostPort"]), str(ipaddress.ip_address(binding["HostIp"] or "0.0.0.0"))) for key, bindings in (host.get("PortBindings") or {}).items() for binding in bindings or [] if key.endswith("/tcp")}
             if actual_ports != expected_ports or any(not key.endswith("/tcp") and bindings for key, bindings in (host.get("PortBindings") or {}).items()):
                 raise EngineError("restore_ports_unverified")
             if host.get("Privileged") or host.get("CapAdd") or host.get("Devices") or host.get("NetworkMode") in {"host", "none"}:
@@ -1942,13 +2100,40 @@ class ManagedEngine:
 
     def _observe_addresses(self):
         values = json.loads(self._run(["ip", "--json", "address", "show", "scope", "global"], timeout=3))
-        addresses = set()
-        for interface in values:
-            for item in interface.get("addr_info", []):
-                value = item.get("local")
-                address = ipaddress.ip_address(value)
-                if not (address.is_loopback or address.is_link_local or address.is_multicast or address.is_unspecified):
+        if not isinstance(values, list):
+            raise ValueError()
+        addresses, partial = set(), len(values) > 1000
+        for interface in values[:1000]:
+            if not isinstance(interface, dict) or not isinstance(interface.get("addr_info"), list):
+                partial = True
+                continue
+            name = interface.get("ifname", "")
+            if not isinstance(name, str):
+                partial = True
+                continue
+            entries = interface["addr_info"]
+            partial = partial or len(entries) > 1000 or any(not isinstance(item, dict) or not isinstance(item.get("local"), str) or not isinstance(item.get("family"), str) or item.get("family") not in {"inet", "inet6"} or item.get("scope") != "global" for item in entries[:1000])
+            linkinfo = interface.get("linkinfo") or {}
+            if not isinstance(linkinfo, dict):
+                partial = True
+                linkinfo = {}
+            if re.match(r"^(?:docker[0-9]*|br[-0-9]|bridge|veth|cni|virbr)", name) or linkinfo.get("info_kind") == "bridge":
+                continue
+            for item in entries[:1000]:
+                if (not isinstance(item, dict) or not isinstance(item.get("family"), str) or item.get("family") not in {"inet", "inet6"} or item.get("scope") != "global" or not isinstance(item.get("local"), str)):
+                    partial = True
+                    continue
+                try:
+                    address = ipaddress.ip_address(item["local"])
+                except ValueError:
+                    partial = True
+                    continue
+                if (address.version == 4) != (item["family"] == "inet"):
+                    partial = True
+                    continue
+                if address.is_global and not (address.is_private or address.is_reserved or address.is_loopback or address.is_link_local or address.is_multicast or address.is_unspecified):
                     addresses.add(str(address))
+        self._local.addresses_partial = partial
         return sorted(addresses)[:20]
 
     def observe(self):
@@ -1957,6 +2142,9 @@ class ManagedEngine:
         try:
             try:
                 output["addresses"] = self._observe_addresses()
+                if self._local.addresses_partial:
+                    output["addressesPartial"] = True
+                    output["addressesError"] = "address_inventory_partial"
             except (EngineError, ValueError, KeyError, TypeError):
                 output["addressesError"] = "address_inventory_unavailable"
             output["key"] = self.sealer.public()
