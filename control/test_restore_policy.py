@@ -25,12 +25,21 @@ class RestorePolicyTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_captured_environment_cannot_override_compose_execution(self):
-        (self.root / ".env").write_text("COMPOSE_FILE=/outside/untrusted.yaml\nCOMPOSE_PROFILES=untrusted\nWEB_IMAGE=untrusted\n")
+    def test_captured_execution_controls_rejected_without_writing(self):
+        for key in ("COMPOSE_FILE", "COMPOSE_PROFILES", "DOCKER_HOST", "export COMPOSE_FILE"):
+            content = key + "=/outside/untrusted.yaml\nWEB_IMAGE=untrusted\n"
+            (self.root / ".env").write_text(content)
+            with self.assertRaises(ValueError):
+                policy.prepare(self.root, self.manifest, self.template, 18082, "SITE A - PREVIEW")
+            self.assertEqual((self.root / ".env").read_text(), content)
+            self.assertEqual((self.root / "compose.yaml").read_bytes(), self.template)
+            self.assertFalse((self.root / "rpo.isolation.json").exists())
+
+    def test_accepted_environment_is_replaced_with_closed_canonical_values(self):
+        (self.root / ".env").write_text("WEB_IMAGE=untrusted\nSITE_LABEL=old\n")
         result = policy.prepare(self.root, self.manifest, self.template, 18082, "SITE A - PREVIEW")
         value = (self.root / ".env").read_text()
-        self.assertNotIn("COMPOSE_FILE", value)
-        self.assertNotIn("COMPOSE_PROFILES", value)
+        self.assertEqual(len(value.splitlines()), 4)
         self.assertNotIn("untrusted", value)
         self.assertIn("WEB_PORT=18082", value)
         self.assertEqual(result["webImage"][0], self.manifest["webImage"])

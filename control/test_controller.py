@@ -68,6 +68,19 @@ class DomainCase(unittest.TestCase):
         self.sync(node, [report])
         return queued
 
+    def test_malformed_result_does_not_hide_liveness_or_claim_success(self):
+        node = self.add()
+        for value in ('invalid', [1], 5):
+            queued, _ = self.job(node, 'verify')
+            assigned = self.sync(node)['job']
+            response = self.sync(node, [{'id': queued['id'], 'nonce': assigned['nonce'], 'status': 'succeeded', 'result': value}])
+            self.assertIn(queued['id'], response['acknowledged'])
+            overview = self.call('overview')
+            self.assertTrue(overview['nodes'][0]['connected'])
+            job = next(j for j in overview['jobs'] if j['id'] == queued['id'])
+            self.assertEqual((job['status'], job['error']), ('failed', 'result_unverified'))
+            self.assertNotIn('result', job)
+
     def test_credentials_only_digests_and_reinstall_preserves(self):
         initial = (Path(self.temp.name) / 'admin-password').read_text().strip()
         self.assertEqual((Path(self.temp.name) / 'admin-password').stat().st_mode & 0o777, 0o600)

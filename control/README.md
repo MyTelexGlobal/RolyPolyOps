@@ -32,6 +32,8 @@ Open `https://control.example.org/ops/`. The initial administrator password is i
 
 Choose Add server in the wizard, name the host and select its role. The primary can create backups and change the backup interval; recovery nodes can verify and restore. Run the displayed enrollment command from the same trusted checkout on that host. It installs the outbound host service. A code expires in 15 minutes and is single-use. It contains temporary authority: do not post it publicly.
 
+Captured `COMPOSE_*` and `DOCKER_*` execution controls are rejected before recovery changes files or loads images. Accepted application settings are replaced with a closed environment for the bundled package.
+
 The host needs the initialized [supported recovery package](../demo/README.md), Docker/Compose, restic and its private repository configuration. This release recognizes that package; it does not configure unknown applications or silently overwrite existing deployments. On the supplied two-host lab these prerequisites are already configured.
 
 Agents use certificate-validated outgoing HTTPS. No agent port, SSH private key upload or Docker socket access from the control process is required. Tokens live in root-only host configuration; the catalog stores their digests. Reconnect rotates a token. Revocation is available after active operations have been resolved.

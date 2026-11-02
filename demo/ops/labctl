@@ -13,7 +13,7 @@ base=${RPO_STATE_DIR:-/var/lib/rolypolyops}
 mkdir -p "$base"
 exec 9>/run/lock/rolypolyops-lab.lock
 flock -n 9 || { echo 'Another lab operation is running.' >&2; exit 1; }
-dc() { docker compose --project-directory "$root" -p "${RPO_PROJECT:-rolypoly-demo}" "$@"; }
+dc() { docker compose -f "$root/compose.yaml" --env-file "$root/.env" --project-directory "$root" -p "${RPO_PROJECT:-rolypoly-demo}" "$@"; }
 restic() { command restic --retry-lock 5m "$@"; }
 stage= work= project= proof_file= paused=0 keep=0
 restore_dc() {

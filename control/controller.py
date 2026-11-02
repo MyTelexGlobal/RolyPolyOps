@@ -695,7 +695,9 @@ class Control:
 
     def sanitize_result(self, action, value, snapshot_id, parameters, job_id):
         if not isinstance(value, dict):
-            raise APIError(400, "invalid_result")
+            # Reached only after node and nonce verification: a malformed result is
+            # unverifiable proof, so the caller records failed/result_unverified.
+            return None
         result = proof(value) or {}
         if isinstance(value.get("verified"), bool):
             result["verified"] = value["verified"]

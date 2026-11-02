@@ -32,7 +32,14 @@ def prepare(service, manifest, template, port, label, isolated=False):
         images[key] = (identity, repo + ":sha-" + identity[7:19])
     if not isinstance(port, int) or not 1024 <= port <= 65535 or not re.fullmatch(r"[A-Za-z0-9 ._-]{1,80}", label):
         raise ValueError("invalid_target_parameters")
-    # Discard all captured environment controls, including COMPOSE_FILE and profiles.
+    # Captured execution controls are rejected, not neutralized: nothing is written,
+    # loaded or started for a package that tries to carry COMPOSE_* or DOCKER_* settings.
+    env_file = service / ".env"
+    if env_file.exists():
+        for line in env_file.read_bytes().replace(b"\r", b"\n").split(b"\n"):
+            if re.match(rb"[ \t\x00\x0b\x0c]*(?:export[ \t\x00\x0b\x0c]+)?[ \t\x00\x0b\x0c]*(?:COMPOSE|DOCKER)_", line, re.I):
+                raise ValueError("reserved_environment_control")
+    # Every other captured value is discarded and replaced by the canonical four lines.
     temporary = service / ".env.prepared"
     fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(fd, "w") as f:
