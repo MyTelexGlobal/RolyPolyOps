@@ -1,0 +1,8 @@
+{
+  "name": "rolypolyops-demo",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "dependencies": { "pg": "8.16.3" }
+}

@@ -1,0 +1,14 @@
+name: rolypoly-storage
+services:
+  repository:
+    image: restic/rest-server:0.14.0@sha256:d2aff06f47eb38637dff580c3e6bce4af98f386c396a25d32eb6727ec96214a5
+    command: [rest-server, --path, /data, --append-only]
+    ports: ['127.0.0.1:8000:8000']
+    volumes: ['${RPO_REPOSITORY_DIR:-/var/lib/rolypolyops/repository}:/data']
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    logging:
+      options: { max-size: 10m, max-file: '3' }

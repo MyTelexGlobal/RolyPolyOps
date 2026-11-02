@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# Recovery exercises for the bundled, disposable PostgreSQL demo only.
+set -Eeuo pipefail
+umask 077
+config=${RPO_CONFIG:-/etc/rolypolyops/lab.env}
+[[ $EUID == 0 && -f $config ]] || { echo 'Root and a private lab.env are required.' >&2; exit 1; }
+set -a
+# shellcheck source=/dev/null
+source "$config"
+set +a
+root=${RPO_ROOT:-/opt/rolypolyops-lab}
+base=/var/lib/rolypolyops
+mkdir -p "$base"
+exec 9>/run/lock/rolypolyops-lab.lock
+flock -n 9 || { echo 'Another lab operation is running.' >&2; exit 1; }
+dc() { docker compose --project-directory "$root" -p "${RPO_PROJECT:-rolypoly-demo}" "$@"; }
+restic() { command restic --retry-lock 5m "$@"; }
+stage= work= project= paused=0 keep=0
+cleanup() {
+  rc=$?
+  trap - EXIT
+  if [[ $paused == 1 ]]; then dc start web || rc=1; fi
+  if [[ -n $project && $keep == 0 ]]; then
+    if ! docker compose --project-directory "$work/service" -p "$project" down --timeout 20; then
+      echo "Cleanup failed; preserving $work" >&2
+      rc=1; work=
+    fi
+  fi
+  [[ -z $stage ]] || rm -rf -- "$stage"
+  [[ -z $work || $keep == 1 ]] || rm -rf -- "$work"
+  exit "$rc"
+}
+trap cleanup EXIT
+command=${1:-status}
+case "$command" in
+  init) restic init ;;
+  status)
+    restic snapshots --tag rolypolyops-demo
+    systemctl list-timers 'rolypolyops-*' --no-pager
+    for f in last-backup.json last-restore-check.json; do
+      [[ ! -f $base/$f ]] || cat "$base/$f"
+    done
+    ;;
+  backup)
+    stage=$(mktemp -d "$base/capture.XXXXXXXX")
+    mkdir -p "$stage/service/state" "$stage/service/secrets"
+    curl -fsS --max-time 8 "http://127.0.0.1:${RPO_SOURCE_PORT:-8080}/api/status" > "$stage/expected.json"
+    web_id=$(docker inspect "${RPO_PROJECT:-rolypoly-demo}-web-1" --format '{{.Image}}')
+    db_id=$(docker inspect "${RPO_PROJECT:-rolypoly-demo}-db-1" --format '{{.Image}}')
+    web_tag=rolypolyops-demo:sha-${web_id:7:12}
+    db_tag=rolypolyops-postgres:sha-${db_id:7:12}
+    # Freeze the application writer while capturing its database and attachments.
+    paused=1
+    dc stop -t 25 web
+    dc exec -T db pg_dump -U demo -d demo -Fc --no-owner --no-acl > "$stage/database.dump"
+    cp -a "$root/state/files" "$stage/service/state/"
+    cp -a "$root/secrets/db_password" "$stage/service/secrets/"
+    cp -a "$root/compose.yaml" "$root/site" "$stage/service/"
+    printf 'WEB_IMAGE=%s\nPOSTGRES_IMAGE=%s\nSITE_LABEL=%s\n' "$web_tag" "$db_tag" "${RPO_SOURCE_LABEL:-SITE A}" > "$stage/service/.env"
+    dc start web
+    paused=0
+    docker tag "$web_id" "$web_tag"
+    docker tag "$db_id" "$db_tag"
+    docker save "$web_tag" "$db_tag" > "$stage/images.tar"
+    python3 - "$stage" "$web_id" "$db_id" <<'PY'
+import hashlib,json,pathlib,sys
+p=pathlib.Path(sys.argv[1]); expected=json.loads((p/'expected.json').read_text())
+assert expected['healthy'] is True
+assert hashlib.sha256((p/'service/state/files/recovery-proof.txt').read_bytes()).hexdigest()==expected['attachmentSha256']
+(p/'capture.json').write_text(json.dumps({'format':'rolypolyops-demo-v1','webImage':sys.argv[2],'dbImage':sys.argv[3]})+'\n')
+PY
+    (cd "$stage"; find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+    restic backup --json --host rolypolyops-demo --tag rolypolyops-demo "$stage" > "$base/backup-result.tmp"
+    python3 - "$base" <<'PY'
+import datetime,json,pathlib,sys
+p=pathlib.Path(sys.argv[1]); rows=[json.loads(x) for x in (p/'backup-result.tmp').read_text().splitlines()]
+s=next(x for x in rows if x.get('message_type')=='summary')
+r={'status':'backup-created','snapshot':s['snapshot_id'],'at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'restoreTest':'separate-operation'}
+(p/'last-backup.json.tmp').write_text(json.dumps(r)+'\n');(p/'last-backup.json.tmp').replace(p/'last-backup.json')
+print(json.dumps(r))
+PY
+    ;;
+  verify) restic check --read-data ;;
+  restore-check|restore-standby)
+    snapshot=${2:-latest}
+    if [[ $snapshot == latest ]]; then
+      snapshot=$(restic snapshots --tag rolypolyops-demo --json | python3 -c 'import json,sys; a=json.load(sys.stdin); assert a,"No snapshots"; print(max(a,key=lambda x:x["time"])["id"])')
+    fi
+    [[ $snapshot =~ ^[a-f0-9]{8,64}$ ]] || { echo 'Invalid snapshot ID' >&2; exit 1; }
+    if [[ $command == restore-standby && -e $base/standby.json ]]; then
+      echo 'A standby already exists. Preserve it and resolve its lifecycle first.' >&2; exit 1
+    fi
+    work=$(mktemp -d "$base/restore.XXXXXXXX")
+    restic restore "$snapshot" --target "$work/download"
+    capture=$(python3 - "$work/download" <<'PY'
+import json,pathlib,sys
+a=list(pathlib.Path(sys.argv[1]).rglob('capture.json')); assert len(a)==1
+assert json.loads(a[0].read_text())['format']=='rolypolyops-demo-v1'
+print(a[0].parent)
+PY
+)
+    (cd "$capture"; sha256sum --quiet -c SHA256SUMS)
+    docker load -i "$capture/images.tar" >/dev/null
+    cp -a "$capture/service" "$work/service"
+    default_port=18080
+    [[ $command != restore-check ]] || default_port=18081
+    port=${RPO_RESTORE_PORT:-$default_port}
+    [[ $port =~ ^[0-9]+$ && $port -ge 1024 && $port -le 65535 ]] || exit 1
+    printf 'SITE_LABEL=%s\nWEB_PORT=%s\n' "${RPO_TARGET_LABEL:-SITE B - RESTORED}" "$port" >> "$work/service/.env"
+    project=rpo-restore-$(basename "$work" | cut -d. -f2 | tr '[:upper:]' '[:lower:]')
+    docker compose --project-directory "$work/service" -p "$project" up -d --no-build --pull never db
+    ready=0
+    for i in $(seq 1 40); do
+      # The image's temporary initialization server accepts only Unix sockets.
+      # Wait for the final TCP listener before importing the dump.
+      if docker compose --project-directory "$work/service" -p "$project" exec -T db pg_isready -h 127.0.0.1 -U demo -d demo >/dev/null; then ready=1; break; fi
+      sleep 1
+    done
+    [[ $ready == 1 ]] || { echo 'Restored database did not start' >&2; exit 1; }
+    docker compose --project-directory "$work/service" -p "$project" exec -T db pg_restore -U demo -d demo --no-owner --no-acl < "$capture/database.dump"
+    docker compose --project-directory "$work/service" -p "$project" up -d --no-build --pull never web
+    ready=0
+    for i in $(seq 1 30); do
+      if curl -fsS --max-time 5 "http://127.0.0.1:$port/api/status" > "$work/actual.json"; then ready=1; break; fi
+      sleep 2
+    done
+    [[ $ready == 1 ]] || { echo 'Restored application is unhealthy' >&2; exit 1; }
+    python3 - "$capture/expected.json" "$work/actual.json" "$capture/capture.json" "$project" "$work/service" <<'PY'
+import json,pathlib,subprocess,sys
+expected,actual,manifest=[json.load(open(p)) for p in sys.argv[1:4]]
+assert actual['healthy'] is True
+for k in ['records','attachmentSha256','version']: assert expected[k]==actual[k],k
+for service,key in [('web','webImage'),('db','dbImage')]:
+    name=f'{sys.argv[4]}-{service}-1'
+    info=json.loads(subprocess.check_output(['docker','inspect',name],text=True))[0]
+    assert info['Image']==manifest[key]
+    host=info['HostConfig']; assert host['Privileged'] is False
+    assert host['Memory']==(128 if service=='web' else 512)*1024*1024
+    for mount in info['Mounts']:
+        if mount['Type']=='bind':
+            assert pathlib.Path(mount['Source']).is_relative_to(pathlib.Path(sys.argv[5]))
+    if service=='web':
+        assert host['ReadonlyRootfs'] is True
+        assert 'ALL' in host['CapDrop']
+        assert 'no-new-privileges:true' in host['SecurityOpt']
+    else: assert not info['NetworkSettings']['Ports'].get('5432/tcp')
+print('PASS: database values, attachment hash, app version, image IDs, fresh mounts and runtime restrictions')
+PY
+    python3 - "$base" "$snapshot" "$work" "$project" "$command" "$port" <<'PY'
+import datetime,json,pathlib,sys
+p=pathlib.Path(sys.argv[1]); r={'status':'restore-check-passed','snapshot':sys.argv[2],'at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'checks':['database-values','file-sha256','application-http','app-version','image-ids','fresh-mounts','runtime-restrictions']}
+(p/'last-restore-check.json.tmp').write_text(json.dumps(r)+'\n');(p/'last-restore-check.json.tmp').replace(p/'last-restore-check.json')
+if sys.argv[5]=='restore-standby':
+    r.update(root=sys.argv[3],project=sys.argv[4],port=int(sys.argv[6]),status='standby-ready-not-promoted')
+    (p/'standby.json').write_text(json.dumps(r)+'\n')
+print(json.dumps(r))
+PY
+    if [[ $command == restore-standby ]]; then keep=1; fi
+    ;;
+  *) echo 'Usage: labctl init|status|backup|verify|restore-check [snapshot]|restore-standby [snapshot]' >&2; exit 2 ;;
+esac

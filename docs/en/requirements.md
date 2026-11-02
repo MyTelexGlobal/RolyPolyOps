@@ -40,4 +40,4 @@ OR-01: recover without the source or control service. OR-02: interrupted operati
 | T11 | Lose a repository and expose backlog and capacity risk |
 | T12 | Recover an older application/package version |
 
-These service scenarios have not been executed. Schema checks do not count as T01-T12.
+The complete T01-T12 acceptance suite has not been executed. The bundled demo exercises a limited database/file recovery case and a separate application check; this does not certify these scenarios for arbitrary services. Schema checks do not count as T01-T12.

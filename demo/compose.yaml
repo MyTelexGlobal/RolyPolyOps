@@ -1,0 +1,55 @@
+name: rolypoly-demo
+services:
+  db:
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine@sha256:266d3c257594e195b309ae9d1805e54c788f1d7b375f56bf6c367aac6c917e7b}
+    environment:
+      POSTGRES_DB: demo
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    volumes:
+      - ./state/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U demo -d demo']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    networks: [backend]
+    mem_limit: 512m
+    logging:
+      options: { max-size: 10m, max-file: '3' }
+  web:
+    build: ./site
+    image: ${WEB_IMAGE:-rolypolyops-demo:0.0.1}
+    environment:
+      SITE_LABEL: ${SITE_LABEL:-SITE A}
+      APP_VERSION: 0.0.1
+    secrets: [db_password]
+    volumes:
+      - ./state/files:/data:ro
+    ports:
+      - '127.0.0.1:${WEB_PORT:-8080}:8080'
+    depends_on:
+      db: { condition: service_healthy }
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 4s
+      retries: 3
+    restart: unless-stopped
+    networks: [backend, frontend]
+    mem_limit: 128m
+    logging:
+      options: { max-size: 10m, max-file: '3' }
+secrets:
+  db_password:
+    file: ./secrets/db_password
+networks:
+  backend:
+    internal: true
+  frontend: {}

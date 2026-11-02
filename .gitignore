@@ -26,3 +26,7 @@ node_modules/
 dist/
 build/
 .DS_Store
+.htpasswd
+*.enc
+*.tar
+*.tar.gz

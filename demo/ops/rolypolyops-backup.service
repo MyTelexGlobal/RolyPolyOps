@@ -1,0 +1,10 @@
+[Unit]
+Description=Capture and encrypt the disposable RolyPolyOps demo
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rolypolyops-lab backup
+TimeoutStartSec=20min
+UMask=0077

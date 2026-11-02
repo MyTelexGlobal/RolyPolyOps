@@ -9,3 +9,4 @@
 | Security | [Security](en/security.md) | [Безопасность](ru/security.md) |
 | Compatibility | [Compatibility](en/compatibility.md) | [Совместимость](ru/compatibility.md) |
 | References | [References](en/references.md) | [Источники](ru/references.md) |
+| Recovery lab | [Lab](../demo/README.md) | [Стенд](../demo/README.ru.md) |

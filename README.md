@@ -4,8 +4,12 @@
 
 Service backups, verified recovery, and safe failover between independent hosting providers.
 
-**Status: initial specification and service-profile contracts. No backup, restore, or failover
-service is available yet. Do not rely on this repository to protect live data.**
+**Status: initial specification, service-profile contracts, and a disposable PostgreSQL
+recovery lab. The general backup/failover service is not implemented. Do not use this
+prototype to protect live data.**
+
+The [recovery lab](demo/README.md) includes a bilingual demo, encrypted restic captures,
+and separate restore exercises. It applies only to the bundled test application.
 
 ## Intended capabilities
 

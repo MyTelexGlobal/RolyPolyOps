@@ -1,0 +1,10 @@
+[Unit]
+Description=Verify and restore a separate RolyPolyOps demo copy
+After=docker.service network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rolypolyops-lab verify
+ExecStart=/usr/local/sbin/rolypolyops-lab restore-check
+TimeoutStartSec=30min
+UMask=0077

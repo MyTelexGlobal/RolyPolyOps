@@ -4,7 +4,7 @@
 
 ## 1 Available repository materials
 
-Available now: product specification in English and Russian, initial JSON Schema for service profiles, and illustrative manifests. No executable service, host enrollment, live backup, restore, replication, DNS change, or provider shutdown is provided.
+Available now: product specification in English and Russian, initial JSON Schema for service profiles, illustrative manifests, and [executable recovery lab tools](../../demo/README.md) for the bundled read-only PostgreSQL demo. The lab captures and restores that application only. General service enrollment, replication, automatic DNS changes, and provider shutdown are not implemented.
 
 ## 2 Target environment
 
@@ -16,4 +16,4 @@ An application needs a consistency and recovery package. Other databases, mail s
 
 Required inputs are application versions, data volumes and change rate, RPO/RTO targets, failure domains, provider API rights, durable fencing capability, network latency, capacity, image availability, and recovery-key access.
 
-No measured recovery time, compression ratio, or unlimited failure tolerance is claimed. The schema validates declarations only; it does not certify these deployment properties.
+No general recovery-time guarantee, compression ratio, or unlimited failure tolerance is claimed. Lab observations apply only to the tested fixture and environment. The schema validates declarations only; it does not certify these deployment properties.

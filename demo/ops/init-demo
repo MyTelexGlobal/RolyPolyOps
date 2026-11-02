@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+[[ $EUID == 0 && ${1:-} =~ ^[AB]$ ]] || { echo 'Usage (root): ops/init-demo A|B' >&2; exit 1; }
+cd "$(dirname "$0")/.."
+[[ ! -d state/postgres ]] || { echo 'Database already exists; initialization refused.' >&2; exit 1; }
+[[ ! -e secrets/db_password ]] || { echo 'Credentials already exist; initialization refused.' >&2; exit 1; }
+[[ -z $(docker ps -aq --filter label=com.docker.compose.project=rolypoly-demo) ]] || { echo 'Demo containers already exist; initialization refused.' >&2; exit 1; }
+mkdir -p secrets state/files
+openssl rand -hex 32 > secrets/db_password
+chmod 444 secrets/db_password
+chmod 700 secrets
+printf 'RolyPolyOps recovery fixture\n%s\n' "$(cat /proc/sys/kernel/random/uuid)" > state/files/recovery-proof.txt
+chmod 755 state/files
+chmod 444 state/files/recovery-proof.txt
+printf 'SITE_LABEL=SITE %s\n' "$1" > .env
+docker compose build web
+docker compose up -d db
+ready=0
+for i in $(seq 1 40); do
+  if [[ $(docker inspect rolypoly-demo-db-1 --format '{{.State.Health.Status}}') == healthy ]]; then ready=1; break; fi
+  sleep 1
+done
+[[ $ready == 1 ]] || { echo 'Database startup failed' >&2; exit 1; }
+file_hash=$(sha256sum state/files/recovery-proof.txt | cut -d ' ' -f 1)
+docker compose exec -T db psql -U demo -d demo -v ON_ERROR_STOP=1 -v hash="$file_hash" -v label="$1" <<'SQL'
+CREATE TABLE demo_records(id text PRIMARY KEY, message text NOT NULL, attachment_sha256 text NOT NULL);
+INSERT INTO demo_records VALUES ('recovery-fixture-' || :'label', 'A service is more than its containers.', :'hash');
+SQL
+docker compose up -d web
+echo 'Demo started. Verify http://127.0.0.1:8080/healthz before configuring a reverse proxy.'
