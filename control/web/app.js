@@ -537,6 +537,42 @@ const dictionary = {
   ],
 };
 Object.assign(dictionary, {
+  orphanTitle: [
+    "Неподтвержденные операции сервера",
+    "Unconfirmed server operations",
+  ],
+  orphanHelp: [
+    "Сервер сообщает об операции, которая не согласуется с текущим каталогом. Новые изменения приостановлены до проверки фактического состояния.",
+    "A server reports work that does not match the current catalog. New changes are paused until its actual state is inspected.",
+  ],
+  orphanInspect: ["Проверить фактическое состояние", "Inspect actual state"],
+  orphanInspectHelp: [
+    "Служба проверит сохраненный результат и состояние процессов. Исходное действие повторно не запускается. Допускается очистка только временной копии, созданной этой системой. Исходный сервис перезапускаться не будет.",
+    "The host service will inspect its saved outcome and running processes. The original action will not run again. Only a temporary copy owned by this system may be cleaned up. The original service will not be restarted.",
+  ],
+  orphanInspectPending: ["Ожидается ответ сервера", "Awaiting host inspection"],
+  orphanInspectRequested: [
+    "Запрошена проверка фактического состояния. Исходное действие не повторяется.",
+    "Actual state inspection requested. The original action is not repeated.",
+  ],
+  orphanFirstSeen: ["Впервые обнаружено", "First observed"],
+  orphanLastSeen: ["Последнее сообщение", "Last reported"],
+  alert_catalog_receipt_orphaned: [
+    "Сервер сообщает об операции вне текущего каталога. Требуется проверка фактического состояния.",
+    "A server reports an operation outside the current catalog. Its actual state must be inspected.",
+  ],
+  error_catalog_receipt_orphaned: [
+    "Неподтвержденная операция сервера блокирует новые изменения. Сначала запросите проверку ее состояния.",
+    "An unconfirmed server operation blocks new changes. Request an inspection of its actual state first.",
+  ],
+  error_orphan_not_found: [
+    "Неподтвержденная операция не найдена. Обновите состояние.",
+    "This unconfirmed operation was not found. Refresh the state.",
+  ],
+  error_orphan_already_terminal: [
+    "Операция уже получила окончательный результат. Обновите состояние.",
+    "This operation already has a terminal outcome. Refresh the state.",
+  ],
   reconcile: ["Проверить фактический результат", "Reconcile actual outcome"],
   reconcileHelp: [
     "Сервер проверит сохраненный результат этой операции. Исходное действие повторно запускаться не будет.",
@@ -834,6 +870,7 @@ function latestMetadata(key) {
 }
 function errorText(error) {
   const aliases = {
+    orphan_already_resolved: "orphan_already_terminal",
     authentication_failed: "invalid_credentials",
     login_rate_limited: "rate_limited",
     authentication_required: "unauthorized",
@@ -1237,6 +1274,8 @@ function shell() {
         ),
       );
     }
+    const quarantined = orphanPanel();
+    if (quarantined) main.append(quarantined);
     const banner = operationBanner();
     if (banner) main.append(banner);
     const views = {
@@ -1254,6 +1293,86 @@ function shell() {
     { class: "app-shell" },
     sidebar,
     h("div", { class: "content" }, top, main),
+  );
+}
+function orphanPanel() {
+  const reports = (state.overview?.orphanReports || []).filter(
+    (report) => !["succeeded", "failed"].includes(report.status),
+  );
+  if (!reports.length) return null;
+  const rows = reports.map((report) => {
+    const node = nodeById(report.nodeId);
+    const id = report.id || report.jobId;
+    const online =
+      !node?.revoked &&
+      node?.connected &&
+      Number.isFinite(Date.parse(node.lastSeen)) &&
+      Date.now() - Date.parse(node.lastSeen) < 45000;
+    const pending =
+      report.inspectionRequested === true || report.inspectRequested === true;
+    const details = h(
+      "div",
+      {},
+      h("h3", {}, node?.name || t("site")),
+      h("p", { class: "mono" }, shortId(id)),
+      h(
+        "div",
+        { class: "orphan-meta" },
+        h(
+          "span",
+          {},
+          t("orphanFirstSeen") + ": " + date(report.firstSeen, true),
+        ),
+        h("span", {}, t("orphanLastSeen") + ": " + date(report.lastSeen, true)),
+      ),
+    );
+    const request = () =>
+      simpleConfirm(
+        t("orphanInspect"),
+        t("orphanInspectHelp"),
+        async () => {
+          await api(
+            `/api/nodes/${encodeURIComponent(report.nodeId)}/orphans/${encodeURIComponent(id)}/reconcile`,
+            {},
+          );
+          toast(t("orphanInspectRequested"));
+        },
+        t("orphanInspect"),
+      );
+    const controls = h(
+      "div",
+      { class: "orphan-controls" },
+      pill(
+        t(
+          pending
+            ? "orphanInspectPending"
+            : dictionary[report.status]
+              ? report.status
+              : "outcome_unknown",
+        ),
+        "warn",
+      ),
+      !online ? h("span", { class: "help" }, t("offline")) : null,
+      button(
+        t(pending ? "orphanInspectPending" : "orphanInspect"),
+        request,
+        "small",
+        { disabled: !online || pending || !id },
+      ),
+    );
+    return h(
+      "article",
+      { class: "verification-row orphan-row" },
+      details,
+      controls,
+    );
+  });
+  return h(
+    "section",
+    { class: "card orphan-panel", "aria-label": t("orphanTitle") },
+    h("div", { class: "card-head" }, h("h2", {}, t("orphanTitle"))),
+    notice(t("orphanHelp"), "warn"),
+    rows,
   );
 }
 function operationBanner() {
@@ -2622,7 +2741,7 @@ function renderDialog() {
   if (c.kind === "confirm") {
     const error = h("p", { class: "form-error", role: "alert" });
     const confirm = button(
-      t("planConfirm"),
+      c.confirmLabel || t("planConfirm"),
       async () => {
         confirm.disabled = true;
         try {
@@ -2724,8 +2843,8 @@ function renderDialog() {
     );
   }
 }
-function simpleConfirm(title, text, run) {
-  openDialog({ kind: "confirm", title, text, run });
+function simpleConfirm(title, text, run, confirmLabel = null) {
+  openDialog({ kind: "confirm", title, text, run, confirmLabel });
 }
 function enrollDialog() {
   openDialog({ kind: "enroll" });

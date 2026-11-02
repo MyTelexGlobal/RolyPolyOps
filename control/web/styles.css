@@ -1367,3 +1367,41 @@ progress.storage-bar::-moz-progress-bar {
   background: #9dbc72;
   border-radius: 5px;
 }
+
+.orphan-panel {
+  margin-bottom: 23px;
+  border-color: #dfca9e;
+}
+.orphan-row {
+  margin: 12px 0 0;
+}
+.orphan-row > div {
+  min-width: 0;
+}
+.orphan-meta {
+  display: grid;
+  gap: 3px;
+  margin-top: 7px;
+  font-size: 10px;
+  color: var(--muted);
+}
+.orphan-controls {
+  display: grid;
+  justify-items: end;
+  gap: 9px;
+}
+.orphan-row .mono {
+  margin-top: 5px;
+}
+@media (max-width: 760px) {
+  .orphan-controls {
+    justify-items: start;
+    width: 100%;
+  }
+  .orphan-controls > .btn {
+    width: 100%;
+  }
+  .orphan-controls .status-pill {
+    white-space: normal;
+  }
+}
