@@ -546,6 +546,19 @@ class Agent:
                     raise RuntimeError("inspection_live_standby")
             if root.exists() and root not in [p.resolve() for p in paths]:
                 paths.append(root)
+        # A retained copy can become active through an operator action while its
+        # preview receipt is lost. Current source and routing records override
+        # temporary ownership markers for every cleanup path.
+        env = package_env() or {}
+        protected = [Path(env["RPO_ROOT"]).resolve()] if env.get("RPO_ROOT") else []
+        for record in ("active.json", "standby.json"):
+            value = read_json(LAB_STATE / record) or {}
+            if value.get("root"):
+                protected.append(Path(value["root"]).resolve())
+        for directory in paths:
+            resolved = directory.resolve()
+            if any(path == resolved or path.is_relative_to(resolved) or resolved.is_relative_to(path) for path in protected):
+                raise RuntimeError("inspection_live_standby")
         for directory in paths:
             if directory.name.startswith("restore."):
                 project = "rpo-restore-" + directory.name.split(".", 1)[1].lower()

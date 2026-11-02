@@ -170,6 +170,24 @@ class HostAuthorityTests(unittest.TestCase):
     def redirected_open(self, name, flags, mode=0o777):
         return self.saved_open(str(self.state / "test.lock") if str(name) == "/run/lock/rolypolyops-lab.lock" else name, flags, mode)
 
+    def test_inspection_preserves_current_source_without_preview_receipt(self):
+        lab = self.state / "lab"
+        identity = str(uuid.uuid4())
+        root = lab / "restore.guardtest"
+        (root / "service").mkdir(parents=True)
+        agent.atomic(root / ".operation.json", {"id": identity, "action": "restore-check"})
+        for record in ("active.json", "standby.json", None):
+            for old in ("active.json", "standby.json"):
+                (lab / old).unlink(missing_ok=True)
+            if record:
+                agent.atomic(lab / record, {"root": str(root)})
+            env = {"RPO_ROOT": str(root / "service")} if record is None else {}
+            with patch.object(agent, "LAB_STATE", lab), patch.object(agent, "PREVIEWS", self.state / "previews"), patch.object(agent, "package_env", return_value=env), patch.object(agent, "run") as run:
+                with self.assertRaisesRegex(RuntimeError, "inspection_live_standby"):
+                    self.agent.cleanup_temporary(identity)
+                run.assert_not_called()
+            self.assertTrue((root / "service").is_dir())
+
     def test_receipt_loss_while_dispatched_cannot_repeat_mutation(self):
         request = job()
         with patch.object(self.agent, "execute") as execute:
