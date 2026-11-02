@@ -537,6 +537,26 @@ const dictionary = {
   ],
 };
 Object.assign(dictionary, {
+  orphanInventorySettled: [
+    "Полная сверка уже не требуется. Состояние обновлено.",
+    "A full inspection is no longer required. The state has been refreshed.",
+  ],
+  orphanInventoryTitle: [
+    "Нужна полная сверка сервера",
+    "Full host inspection required",
+  ],
+  orphanInventoryHelp: [
+    "Состояние части операций сервера пока не подтверждено. Запросите полную сверку перед продолжением.",
+    "The state of some host operations is still unconfirmed. Request a full inspection before continuing.",
+  ],
+  orphanInventoryInspect: [
+    "Проверить все операции сервера",
+    "Inspect host operation inventory",
+  ],
+  orphanInventoryConfirm: [
+    "Служба сверит локальный журнал операций с фактическим состоянием процессов. Исходные действия повторно не запускаются. Допускается очистка только временных копий, созданных этой системой. Исходный сервис перезапускаться не будет.",
+    "The host service will compare its local operation records with the actual process state. The original actions will not run again. Only temporary copies owned by this system may be cleaned up. The original service will not be restarted.",
+  ],
   orphanTitle: [
     "Неподтвержденные операции сервера",
     "Unconfirmed server operations",
@@ -1299,7 +1319,66 @@ function orphanPanel() {
   const reports = (state.overview?.orphanReports || []).filter(
     (report) => !["succeeded", "failed"].includes(report.status),
   );
-  if (!reports.length) return null;
+  const overflowNodes = (state.overview?.nodes || []).filter(
+    (node) => node.orphanOverflow === true,
+  );
+  if (!reports.length && !overflowNodes.length) return null;
+  const overflowRows = overflowNodes.map((node) => {
+    const online =
+      !node.revoked &&
+      node.connected &&
+      Number.isFinite(Date.parse(node.lastSeen)) &&
+      Date.now() - Date.parse(node.lastSeen) < 45000;
+    const pending = node.overflowInspectionRequested === true;
+    const request = () =>
+      simpleConfirm(
+        t("orphanInventoryInspect"),
+        t("orphanInventoryConfirm"),
+        async () => {
+          const result = await api(
+            `/api/nodes/${encodeURIComponent(node.id)}/orphans/reconcile`,
+            {},
+          );
+          if (typeof result.inspectionRequested !== "boolean")
+            throw Object.assign(new Error("invalid_response"), {
+              code: "generic",
+            });
+          toast(
+            t(
+              result.inspectionRequested
+                ? "orphanInspectRequested"
+                : "orphanInventorySettled",
+            ),
+          );
+        },
+        t("orphanInventoryInspect"),
+      );
+    return h(
+      "article",
+      { class: "verification-row orphan-row orphan-overflow-row" },
+      h(
+        "div",
+        {},
+        h("h3", {}, node.name),
+        h("p", { class: "help" }, t("orphanInventoryHelp")),
+      ),
+      h(
+        "div",
+        { class: "orphan-controls" },
+        pill(
+          t(pending ? "orphanInspectPending" : "orphanInventoryTitle"),
+          "warn",
+        ),
+        !online ? h("span", { class: "help" }, t("offline")) : null,
+        button(
+          t(pending ? "orphanInspectPending" : "orphanInventoryInspect"),
+          request,
+          "small",
+          { disabled: !online || pending },
+        ),
+      ),
+    );
+  });
   const rows = reports.map((report) => {
     const node = nodeById(report.nodeId);
     const id = report.id || report.jobId;
@@ -1372,6 +1451,7 @@ function orphanPanel() {
     { class: "card orphan-panel", "aria-label": t("orphanTitle") },
     h("div", { class: "card-head" }, h("h2", {}, t("orphanTitle"))),
     notice(t("orphanHelp"), "warn"),
+    overflowRows,
     rows,
   );
 }

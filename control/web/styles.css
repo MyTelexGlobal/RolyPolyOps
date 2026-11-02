@@ -1405,3 +1405,11 @@ progress.storage-bar::-moz-progress-bar {
     white-space: normal;
   }
 }
+
+.orphan-row h3 {
+  overflow-wrap: anywhere;
+}
+.orphan-overflow-row .help {
+  margin-top: 7px;
+  max-width: 460px;
+}
