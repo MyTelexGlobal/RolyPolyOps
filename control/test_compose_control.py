@@ -219,6 +219,69 @@ class ComposeCatalogTests(unittest.TestCase):
         self.call(self.c.sync,{'nodeId':self.source['nodeId'],'instanceId':self.source['instanceId'],'status':status,'reports':[]},'Bearer '+self.source['token'])
         self.assertIn('package_unsupported',[a['code'] for a in self.call(self.c.overview)['alerts']])
 
+    def unknown_attach(self):
+        storage,_=self.metadata()
+        challenge=self.call(self.c.compose.prepare,storage,self.mutate(sourceNodeId=self.source['nodeId'],nodeIds=[n['nodeId'] for n in self.nodes],mode='attach'))
+        body=self.mutate(requestId=challenge['requestId'],bindings=self.envelopes(challenge))
+        pipeline=self.call(self.c.compose.connect_storage,storage,body)
+        return storage,challenge,body,pipeline
+
+    def test_initial_attach_discovers_only_parent_then_persists_recipient_identity(self):
+        storage,challenge,body,pipeline=self.unknown_attach()
+        with self.c.connect() as db:
+            child=json.loads(db.execute('SELECT parameters FROM jobs WHERE id=?',(pipeline['jobs'][1]['id'],)).fetchone()['parameters'])
+            self.assertNotIn('discoverRepositoryId',child)
+            self.assertNotIn('expectedRepositoryId',child)
+        wire=self.sync(self.source)['job']
+        self.assertIs(wire['parameters']['discoverRepositoryId'],True)
+        self.assertEqual(wire['parameters']['mode'],'attach')
+        self.assertNotIn('expectedRepositoryId',wire['parameters'])
+        self.assertEqual(wire,self.sync(self.source)['job'])
+        result={'storageId':storage,'repositoryId':REPO,'connected':True,'bindingGeneration':challenge['bindings'][0]['bindingGeneration'],'requestId':challenge['requestId']}
+        self.success(self.source,wire,result)
+        recipient=self.sync(self.target)['job']
+        self.assertEqual(recipient['parameters']['expectedRepositoryId'],REPO)
+        self.assertNotIn('discoverRepositoryId',recipient['parameters'])
+        with self.c.connect() as db:
+            self.assertEqual(json.loads(db.execute('SELECT parameters FROM jobs WHERE id=?',(recipient['id'],)).fetchone()['parameters']),recipient['parameters'])
+        self.assertEqual(self.call(self.c.compose.connect_storage,storage,body),pipeline)
+
+    def test_known_repository_rotation_never_discovers_and_cannot_replace_identity(self):
+        storage=self.connected()
+        challenge=self.call(self.c.compose.prepare,storage,self.mutate(sourceNodeId=self.source['nodeId'],nodeIds=[self.source['nodeId']],mode='attach'))
+        self.call(self.c.compose.connect_storage,storage,self.mutate(requestId=challenge['requestId'],bindings=self.envelopes(challenge)))
+        wire=self.sync(self.source)['job']
+        self.assertEqual(wire['parameters']['expectedRepositoryId'],REPO)
+        self.assertNotIn('discoverRepositoryId',wire['parameters'])
+        self.success(self.source,wire,{'storageId':storage,'repositoryId':'e'*64,'connected':True,'bindingGeneration':challenge['bindings'][0]['bindingGeneration'],'requestId':challenge['requestId']})
+        with self.c.connect() as db:
+            self.assertEqual(db.execute('SELECT repository_id FROM compose_storages WHERE id=?',(storage,)).fetchone()[0],REPO)
+            self.assertEqual(db.execute('SELECT status FROM jobs WHERE id=?',(wire['id'],)).fetchone()[0],'outcome_unknown')
+
+    def test_browser_cannot_supply_repository_discovery_authority(self):
+        storage,_=self.metadata()
+        body=self.mutate(sourceNodeId=self.source['nodeId'],nodeIds=[self.source['nodeId']],mode='attach')
+        self.error('invalid_request',self.c.compose.prepare,storage,dict(body,discoverRepositoryId=True))
+        challenge=self.call(self.c.compose.prepare,storage,body)
+        connect=self.mutate(requestId=challenge['requestId'],bindings=self.envelopes(challenge))
+        self.error('invalid_request',self.c.compose.connect_storage,storage,dict(connect,discoverRepositoryId=True))
+        injected=copy.deepcopy(connect)
+        injected['bindings'][0]['envelope']['discoverRepositoryId']=True
+        self.error('invalid_envelope',self.c.compose.connect_storage,storage,injected)
+        self.error('internal_action',self.c.plan,{'nodeId':self.source['nodeId'],'action':'storage-configure','parameters':{'storageId':storage,'discoverRepositoryId':True}})
+        with self.c.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0],0)
+
+    def test_failed_initial_attach_closes_recipient_without_adopting_identity(self):
+        storage,_,_,pipeline=self.unknown_attach()
+        wire=self.sync(self.source)['job']
+        self.sync(self.source,[{'id':wire['id'],'nonce':wire['nonce'],'status':'failed','error':'repository_password_invalid'}])
+        self.assertNotIn('job',self.sync(self.target))
+        with self.c.connect() as db:
+            self.assertIsNone(db.execute('SELECT repository_id FROM compose_storages WHERE id=?',(storage,)).fetchone()[0])
+            child=db.execute('SELECT status,error FROM jobs WHERE id=?',(pipeline['jobs'][1]['id'],)).fetchone()
+            self.assertEqual(tuple(child),('failed','parent_failed'))
+
     def test_metadata_idempotency_and_plaintext_rejection(self):
         sid,body=self.metadata()
         self.assertEqual(self.call(self.c.compose.create_storage,body)['storage']['id'],sid)
