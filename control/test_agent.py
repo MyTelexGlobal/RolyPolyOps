@@ -1,6 +1,7 @@
 """Host authority, replay and receipt recovery checks without privileged execution."""
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -165,6 +166,67 @@ class HostAuthorityTests(unittest.TestCase):
         with patch.object(agent, "LAB_STATE", self.state / "lab"), patch.object(agent.os, "open", side_effect=redirected_open), patch.object(agent, "timer_status", return_value={"enabled": True, "interval": "hourly"}):
             self.agent.reconcile(request, path, receipt)
             self.assertEqual(agent.read_json(path)["status"], "succeeded")
+
+    def redirected_open(self, name, flags, mode=0o777):
+        return self.saved_open(str(self.state / "test.lock") if str(name) == "/run/lock/rolypolyops-lab.lock" else name, flags, mode)
+
+    def test_receipt_loss_while_dispatched_cannot_repeat_mutation(self):
+        request = job()
+        with patch.object(self.agent, "execute") as execute:
+            self.agent.start(request)
+            self.agent.worker.join(2)
+            (self.state / "jobs" / (request["id"] + ".json")).unlink()
+            self.agent.start(request)
+            self.assertEqual(execute.call_count, 1)
+        self.assertEqual(self.agent.reports()[0]["status"], "outcome_unknown")
+
+    def test_receipt_directory_loss_changes_incarnation(self):
+        old = self.agent.instance
+        shutil.rmtree(self.state / "jobs")
+        self.agent.ensure_identity()
+        self.assertNotEqual(self.agent.instance, old)
+        self.assertTrue((self.state / "jobs/incarnation").exists())
+
+    def test_nonobject_proof_keeps_unknown_without_crashing(self):
+        request = job("verify")
+        lab = self.state / "lab"
+        proof = lab / "operation-proofs" / (request["id"] + ".json")
+        proof.parent.mkdir(parents=True)
+        proof.write_text('["invalid-proof"]')
+        receipt = {"id": request["id"], "nonce": request["nonce"], "status": "outcome_unknown"}
+        path = self.state / "jobs" / (request["id"] + ".json")
+        self.saved_open = os.open
+        with patch.object(agent, "LAB_STATE", lab), patch.object(agent.os, "open", side_effect=self.redirected_open):
+            self.agent.reconcile(request, path, receipt)
+        self.assertEqual(agent.read_json(path)["status"], "outcome_unknown")
+
+    def test_orphan_inspection_clears_idle_uncertainty_without_replay(self):
+        identity = str(uuid.uuid4())
+        self.saved_open = os.open
+        with patch.object(agent, "LAB_STATE", self.state / "lab"), patch.object(agent, "PREVIEWS", self.state / "previews"), patch.object(agent.os, "open", side_effect=self.redirected_open), patch.object(self.agent, "command") as execute, patch.object(agent, "run") as subprocess:
+            self.assertTrue(self.agent.inspect_orphan(identity, "n" * 40))
+            execute.assert_not_called()
+            subprocess.assert_not_called()
+        receipt = agent.read_json(self.state / "jobs" / (identity + ".json"))
+        self.assertEqual(receipt["status"], "failed")
+        self.assertTrue(receipt["inspected"])
+        self.assertFalse(receipt["result"]["originalActionRepeated"])
+
+    def test_orphan_inspection_defers_when_operation_lock_held(self):
+        self.saved_open = os.open
+        identity = str(uuid.uuid4())
+        with patch.object(agent.os, "open", side_effect=self.redirected_open), patch.object(agent.fcntl, "flock", side_effect=BlockingIOError):
+            self.assertFalse(self.agent.inspect_orphan(identity))
+        self.assertFalse((self.state / "jobs" / (identity + ".json")).exists())
+
+    def test_acknowledged_newer_receipts_do_not_starve_old_unacknowledged_result(self):
+        identity = str(uuid.uuid4())
+        path = self.state / "jobs" / (identity + ".json")
+        agent.atomic(path, {"id": identity, "nonce": "n" * 40, "status": "succeeded"})
+        for _ in range(105):
+            other = str(uuid.uuid4())
+            agent.atomic(self.state / "jobs" / (other + ".json"), {"id": other, "nonce": "n" * 40, "status": "succeeded", "acknowledged": True})
+        self.assertEqual([r["id"] for r in self.agent.reports()], [identity])
 
 
 if __name__ == "__main__":

@@ -64,6 +64,11 @@ class InstallationAuthorityTests(unittest.TestCase):
             self.perform()
         self.assertFalse(any("init" in args for args in self.commands))
 
+    def test_unit_and_shell_control_characters_are_rejected_before_writes(self):
+        for value in ["https://control.example.test\nExecStartPre=/bin/false", "https://control.example.test;id", "https://control.example.test`id`", "https://control.example.test/ops?token=secret", "https://user:pass@control.example.test"]:
+            with self.assertRaises(ValueError):
+                install.checked_url(value, {"", "/"})
+
 
 if __name__ == "__main__":
     unittest.main()

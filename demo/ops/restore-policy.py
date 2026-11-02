@@ -12,6 +12,8 @@ def prepare(service, manifest, template, port, label, isolated=False):
     service = Path(service)
     if service.is_symlink() or not service.is_dir():
         raise ValueError("unsafe_service_root")
+    if any(p.name not in {"compose.yaml", ".env", "site", "state", "secrets"} for p in service.iterdir()):
+        raise ValueError("unexpected_package_file")
     for item in service.rglob("*"):
         if item.is_symlink() or not (item.is_file() or item.is_dir()):
             raise ValueError("unsupported_file_type")
@@ -37,9 +39,7 @@ def prepare(service, manifest, template, port, label, isolated=False):
         f.write(f"WEB_IMAGE={images['webImage'][1]}\nPOSTGRES_IMAGE={images['dbImage'][1]}\nSITE_LABEL={label}\nWEB_PORT={port}\n")
     os.replace(temporary, service / ".env")
     # Test copies cannot reach the Internet, host gateway or public traffic routes.
-    override = service / "compose.override.yaml"
-    if override.exists():
-        raise ValueError("unexpected_compose_override")
+    override = service / "rpo.isolation.json"
     if isolated:
         options = {"com.docker.network.bridge.gateway_mode_ipv4": "isolated", "com.docker.network.bridge.gateway_mode_ipv6": "isolated"}
         override.write_text(json.dumps({"networks": {name: {"internal": True, "driver_opts": options} for name in ("backend", "frontend")}}))

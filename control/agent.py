@@ -4,6 +4,7 @@ import argparse
 import datetime as dt
 import fcntl
 import hashlib
+import secrets
 import json
 import os
 from pathlib import Path
@@ -58,7 +59,8 @@ def atomic(path, value):
 
 def read_json(path, default=None):
     try:
-        return json.loads(Path(path).read_text())
+        value = json.loads(Path(path).read_text())
+        return value if isinstance(value, dict) else default
     except (OSError, ValueError):
         return default
 
@@ -116,6 +118,11 @@ def metadata(value):
     if not isinstance(value, dict):
         return None
     return {k: value[k] for k in ("status", "snapshot", "at", "checks") if k in value}
+
+
+def has_checks(value, required):
+    checks = value.get("checks") if isinstance(value, dict) else None
+    return isinstance(checks, list) and all(isinstance(item, str) for item in checks) and required <= set(checks)
 
 
 def observe(state):
@@ -184,7 +191,12 @@ class Agent:
         self.origin = config["controller"].rstrip("/")
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         (self.state / "jobs").mkdir(exist_ok=True, mode=0o700)
+        self.seen = {}
+        self.instance = ""
+        self.ensure_identity()
         self.lock, self.worker = threading.Lock(), None
+        self.inspection_worker = None
+        self.inventory_complete = False
         self.status = {"supported": False, "observedAt": now(), "error": "observation_pending"}
         # An interrupted receipt is never treated as permission to replay a mutation.
         for p in (self.state / "jobs").glob("*.json"):
@@ -192,6 +204,47 @@ class Agent:
             if receipt and receipt.get("status") == "running":
                 receipt.update(status="outcome_unknown", stage="reconciliation_required", error="agent_restarted")
                 atomic(p, receipt)
+
+    def ensure_identity(self):
+        directory = self.state / "jobs"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        marker = directory / "incarnation"
+        identity = read_json(marker)
+        try:
+            valid_identity = bool(identity and str(uuid.UUID(identity.get("id", ""))) == identity["id"])
+        except (ValueError, TypeError, AttributeError):
+            valid_identity = False
+        index = self.state / "seen.jsonl"
+        rotate = not valid_identity or not index.exists()
+        corrupt = False
+        if not self.seen and index.exists():
+            try:
+                for line in index.read_text().splitlines():
+                    value = json.loads(line)
+                    if not isinstance(value, dict) or not isinstance(value.get("id"), str) or not isinstance(value.get("fingerprint"), str):
+                        raise ValueError()
+                    self.seen[value["id"]] = value["fingerprint"]
+            except (OSError, ValueError):
+                rotate, corrupt = True, True
+        if rotate:
+            identity = {"id": str(uuid.uuid4())}
+            atomic(marker, identity)
+            # Changing incarnation makes preexisting controller assignments uncertain.
+            # The independent seen index also survives loss of just the receipt directory.
+            with index.open("a") as f:
+                f.flush()
+                os.fsync(f.fileno())
+            if corrupt:
+                for path in directory.glob("*.json"):
+                    receipt = read_json(path)
+                    if receipt and isinstance(receipt.get("id"), str) and isinstance(receipt.get("fingerprint"), str):
+                        self.seen[receipt["id"]] = receipt["fingerprint"]
+                with index.open("w") as f:
+                    for key, fingerprint in self.seen.items():
+                        f.write(json.dumps({"id": key, "fingerprint": fingerprint}) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+        self.instance = identity["id"]
 
     def request(self, path, data):
         raw = json.dumps(data).encode()
@@ -216,10 +269,12 @@ class Agent:
 
     def reports(self):
         result = []
-        for p in sorted((self.state / "jobs").glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:100]:
+        for p in sorted((self.state / "jobs").glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
             receipt = read_json(p)
             if receipt and not receipt.get("acknowledged"):
-                result.append({k: receipt[k] for k in ("id", "nonce", "status", "stage", "result", "error") if k in receipt})
+                result.append({k: receipt[k] for k in ("id", "nonce", "status", "stage", "result", "error", "inspected") if k in receipt})
+                if len(result) == 100:
+                    break
         return result
 
     def start(self, job):
@@ -236,13 +291,22 @@ class Agent:
             return
         if self.worker and self.worker.is_alive():
             raise ValueError("Agent busy")
+        if self.inspection_worker and self.inspection_worker.is_alive():
+            raise ValueError("Inspection busy")
         if any(r["status"] == "outcome_unknown" for r in self.reports()):
             raise ValueError("Reconciliation required")
-        receipt = {"id": job["id"], "nonce": job["nonce"], "status": "running", "stage": "starting", "fingerprint": fingerprint, "startedAt": now(), "action": job["action"]}
-        if job.get("reconcile"):
+        receipt = {"id": job["id"], "nonce": job["nonce"], "status": "running", "stage": "starting", "fingerprint": fingerprint, "startedAt": now(), "action": job["action"], "envelope": envelope}
+        if job.get("reconcile") or job["id"] in self.seen:
+            if job["id"] in self.seen and self.seen[job["id"]] != fingerprint:
+                raise ValueError("Job identity conflict")
             receipt.update(status="outcome_unknown", stage="interrupted", error="receipt_missing")
             atomic(path, receipt)
             return
+        with (self.state / "seen.jsonl").open("a") as index:
+            index.write(json.dumps({"id": job["id"], "fingerprint": fingerprint}) + "\n")
+            index.flush()
+            os.fsync(index.fileno())
+        self.seen[job["id"]] = fingerprint
         atomic(path, receipt)
         self.worker = threading.Thread(target=self.execute, args=(job, path, receipt), daemon=True)
         self.worker.start()
@@ -355,7 +419,7 @@ class Agent:
                     item = json.loads(inspected.stdout)[0]
                     if any(m["Type"] == "bind" and not Path(m["Source"]).resolve().is_relative_to(base) for m in item["Mounts"]):
                         raise RuntimeError("preview_ownership_invalid")
-                self.command(["docker", "compose", "--project-directory", str(root / "service"), "-p", project, "down", "--timeout", "20"], receipt, path)
+                self.command(self.compose_args(root / "service", project, "down", "--timeout", "20"), receipt, path)
                 shutil.rmtree(base)
                 (self.state / "preview.json").unlink()
                 result = {"removed": True, "at": now()}
@@ -397,8 +461,8 @@ class Agent:
             evidence = read_json(LAB_STATE / "operation-proofs" / (job["id"] + ".json"))
             valid_proof = bool(evidence and evidence.get("operationId") == job["id"] and (
                 (job["action"] == "backup" and SNAPSHOT.fullmatch(str(evidence.get("snapshot", "")))) or
-                (job["action"] == "verify" and "repository-data" in evidence.get("checks", [])) or
-                (job["action"] == "restore-check" and evidence.get("snapshot") == job["snapshotId"] and RESTORE_CHECKS <= set(evidence.get("checks", [])))))
+                (job["action"] == "verify" and has_checks(evidence, {"repository-data"})) or
+                (job["action"] == "restore-check" and evidence.get("snapshot") == job["snapshotId"] and has_checks(evidence, RESTORE_CHECKS))))
             if valid_proof:
                 result = metadata(evidence) or {}
                 if job["action"] == "verify": result.update(verified=True, checks=["repository-data"])
@@ -433,6 +497,183 @@ class Agent:
             atomic(path, receipt)
         except BlockingIOError:
             pass
+        except (KeyError, TypeError, ValueError, AttributeError):
+            receipt.update(status="outcome_unknown", stage="interrupted", error="reconciliation_state_invalid")
+            atomic(path, receipt)
+        finally:
+            os.close(lock)
+
+    @staticmethod
+    def compose_args(service, project, *args):
+        result = ["docker", "compose", "-f", str(service / "compose.yaml")]
+        if (service / "rpo.isolation.json").is_file():
+            result += ["-f", str(service / "rpo.isolation.json")]
+        return result + ["--env-file", str(service / ".env"), "--project-directory", str(service), "-p", project] + list(args)
+
+    def owned_temporary_paths(self, identity):
+        paths = []
+        roots = [LAB_STATE, PREVIEWS / identity]
+        for base in roots:
+            if base.is_symlink():
+                raise RuntimeError("inspection_ownership_invalid")
+            for prefix in ("capture.*", "restore.*"):
+                for directory in base.glob(prefix):
+                    marker = read_json(directory / ".operation.json")
+                    if not marker or marker.get("id") != identity:
+                        continue
+                    if marker.get("action") not in {"backup", "restore-check", "restore-standby"}:
+                        raise RuntimeError("inspection_ownership_invalid")
+                    if directory.is_symlink() or directory.resolve().parent != base.resolve():
+                        raise RuntimeError("inspection_ownership_invalid")
+                    # A manually retained live standby is never in inspection cleanup scope.
+                    if marker.get("action") == "restore-standby" and base == LAB_STATE:
+                        raise RuntimeError("inspection_live_standby")
+                    paths.append(directory)
+        return paths
+
+    def cleanup_temporary(self, identity):
+        paths = self.owned_temporary_paths(identity)
+        preview = read_json(self.state / "preview.json")
+        if preview and preview.get("id") == identity:
+            base = (PREVIEWS / identity).resolve()
+            root = Path(preview.get("root", "")).resolve()
+            if Path(preview.get("base", "")).resolve() != base or root.parent != base or not root.name.startswith("restore."):
+                raise RuntimeError("inspection_ownership_invalid")
+            env = package_env() or {}
+            active = read_json(LAB_STATE / "active.json") or read_json(LAB_STATE / "standby.json") or {}
+            for protected in [env.get("RPO_ROOT"), str(Path(active["root"]) / "service") if active.get("root") else None]:
+                if protected and Path(protected).resolve().is_relative_to(base):
+                    raise RuntimeError("inspection_live_standby")
+            if root.exists() and root not in [p.resolve() for p in paths]:
+                paths.append(root)
+        for directory in paths:
+            if directory.name.startswith("restore."):
+                project = "rpo-restore-" + directory.name.split(".", 1)[1].lower()
+                if not re.fullmatch(r"rpo-restore-[a-z0-9]+", project):
+                    raise RuntimeError("inspection_ownership_invalid")
+                response = run(["docker", "ps", "-aq", "--filter", "label=com.docker.compose.project=" + project])
+                if response.returncode:
+                    raise RuntimeError("inspection_docker_unavailable")
+                identities = response.stdout.split()
+                networks = set()
+                if identities:
+                    detail = run(["docker", "inspect"] + identities)
+                    if detail.returncode:
+                        raise RuntimeError("inspection_docker_unavailable")
+                    items = json.loads(detail.stdout)
+                    actual_ids = {item["Id"] for item in items}
+                    for item in items:
+                        if item.get("Config", {}).get("Labels", {}).get("com.docker.compose.project") != project:
+                            raise RuntimeError("inspection_ownership_invalid")
+                        mounts = item.get("Mounts", [])
+                        if not mounts or any(m["Type"] != "bind" or not Path(m["Source"]).resolve().is_relative_to(directory.resolve()) for m in mounts if m["Type"] != "tmpfs"):
+                            raise RuntimeError("inspection_ownership_invalid")
+                        networks.update(item.get("NetworkSettings", {}).get("Networks", {}))
+                    for network in networks:
+                        detail = run(["docker", "network", "inspect", network])
+                        data = json.loads(detail.stdout)[0] if detail.returncode == 0 else {}
+                        if data.get("Labels", {}).get("com.docker.compose.project") != project or set(data.get("Containers", {})) - actual_ids:
+                            raise RuntimeError("inspection_ownership_invalid")
+                    if run(["docker", "rm", "-f"] + identities, timeout=45).returncode:
+                        raise RuntimeError("inspection_cleanup_failed")
+                # Networks can survive a terminated compose-down after containers disappeared.
+                detail = run(["docker", "network", "ls", "-q", "--filter", "label=com.docker.compose.project=" + project])
+                if detail.returncode:
+                    raise RuntimeError("inspection_docker_unavailable")
+                for network in detail.stdout.split():
+                    check = run(["docker", "network", "inspect", network])
+                    data = json.loads(check.stdout)[0] if check.returncode == 0 else {}
+                    if data.get("Containers") or data.get("Labels", {}).get("com.docker.compose.project") != project:
+                        raise RuntimeError("inspection_ownership_invalid")
+                    if run(["docker", "network", "rm", network]).returncode:
+                        raise RuntimeError("inspection_cleanup_failed")
+            shutil.rmtree(directory)
+        if preview and preview.get("id") == identity:
+            base = PREVIEWS / identity
+            if base.exists(): shutil.rmtree(base)
+            (self.state / "preview.json").unlink()
+
+    def inspect_orphan(self, identity, nonce=None):
+        try:
+            if not isinstance(identity, str) or str(uuid.UUID(identity)) != identity:
+                return False
+            if self.worker and self.worker.is_alive():
+                return False
+            path = self.state / "jobs" / (identity + ".json")
+            receipt = read_json(path)
+            if receipt and nonce and receipt.get("nonce") != nonce:
+                return False
+            if receipt and receipt.get("status") in {"succeeded", "failed"}:
+                receipt.update(inspected=True)
+                receipt.pop("acknowledged", None)
+                atomic(path, receipt)
+                return True
+            if receipt and isinstance(receipt.get("envelope"), dict):
+                self.reconcile(receipt["envelope"], path, receipt)
+                receipt = read_json(path)
+                if receipt and receipt.get("status") in {"succeeded", "failed"}:
+                    receipt.update(inspected=True)
+                    receipt.pop("acknowledged", None)
+                    atomic(path, receipt)
+                    return True
+            # A completed preview can outlive a lost agent receipt or final acknowledgment.
+            candidate = read_json(PREVIEWS / identity / "standby.json")
+            if candidate and SNAPSHOT.fullmatch(str(candidate.get("snapshot", ""))):
+                temporary = receipt or {"id": identity, "nonce": nonce or secrets.token_urlsafe(32), "status": "outcome_unknown"}
+                self.reconcile({"id": identity, "action": "restore-preview", "snapshotId": candidate["snapshot"], "parameters": {}}, path, temporary)
+                receipt = read_json(path)
+                if receipt and receipt.get("status") in {"succeeded", "failed"}:
+                    receipt.update(inspected=True)
+                    receipt.pop("acknowledged", None)
+                    atomic(path, receipt)
+                    return True
+            lock = os.open("/run/lock/rolypolyops-lab.lock", os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                proof = read_json(LAB_STATE / "operation-proofs" / (identity + ".json"))
+                if proof and proof.get("operationId") == identity and (
+                    (proof.get("status") == "backup-created" and SNAPSHOT.fullmatch(str(proof.get("snapshot", "")))) or
+                    (proof.get("status") == "repository-verified" and has_checks(proof, {"repository-data"})) or
+                    (proof.get("status") == "restore-check-passed" and has_checks(proof, RESTORE_CHECKS))):
+                    state, result, error = "succeeded", metadata(proof), None
+                else:
+                    self.cleanup_temporary(identity)
+                    state, result, error = "failed", {"inspectedAt": now(), "originalActionRepeated": False}, "interrupted_result_unverified"
+                receipt = receipt or {"id": identity, "nonce": nonce or secrets.token_urlsafe(32)}
+                receipt.update(status=state, stage="completed", result=result, inspected=True)
+                receipt.pop("acknowledged", None)
+                if error: receipt["error"] = error
+                else: receipt.pop("error", None)
+                atomic(path, receipt)
+                return True
+            finally:
+                os.close(lock)
+        except (OSError, ValueError, RuntimeError, TypeError, AttributeError, KeyError, subprocess.TimeoutExpired):
+            return False
+
+    def inspect_batch(self, identities, nonces, overflow):
+        self.inventory_complete = False
+        for identity in identities[:128]:
+            self.inspect_orphan(identity, nonces.get(identity))
+        if not overflow:
+            return
+        uncertain = [r["id"] for r in self.reports() if r["status"] not in {"succeeded", "failed"}]
+        for base in [LAB_STATE] + ([p for p in PREVIEWS.iterdir() if p.is_dir() and not p.is_symlink()] if PREVIEWS.exists() else []):
+            for marker in list(base.glob("restore.*/.operation.json")) + list(base.glob("capture.*/.operation.json")):
+                value = read_json(marker)
+                if value and value.get("id") not in uncertain:
+                    uncertain.append(value["id"])
+        for identity in uncertain[:128]:
+            if not self.inspect_orphan(identity):
+                return
+        if len(uncertain) > 128 or (self.worker and self.worker.is_alive()):
+            return
+        lock = os.open("/run/lock/rolypolyops-lab.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.inventory_complete = not any(r["status"] not in {"succeeded", "failed"} for r in self.reports())
+        except BlockingIOError:
+            pass
         finally:
             os.close(lock)
 
@@ -447,14 +688,28 @@ class Agent:
                 atomic(path, receipt)
 
     def serve(self):
+        daemon_lock = os.open(self.state / "daemon.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(daemon_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Host service is already running")
         threading.Thread(target=self.collect, daemon=True).start()
         while True:
             try:
+                self.ensure_identity()
                 with self.lock:
                     status = self.status.copy()
                 reports = self.reports()
-                response = self.request("/agent/sync", {"nodeId": self.config["nodeId"], "status": status, "reports": reports})
+                payload = {"nodeId": self.config["nodeId"], "instanceId": self.instance, "status": status, "reports": reports}
+                if self.inventory_complete:
+                    payload["orphanInventoryComplete"] = True
+                response = self.request("/agent/sync", payload)
+                if payload.get("orphanInventoryComplete"):
+                    self.inventory_complete = False
                 self.acknowledge(response.get("acknowledged", []), {r["id"]: r["status"] for r in reports})
+                if (response.get("inspectOrphans") or response.get("inspectOverflow")) and not (self.inspection_worker and self.inspection_worker.is_alive()):
+                    self.inspection_worker = threading.Thread(target=self.inspect_batch, args=(response.get("inspectOrphans", []), response.get("inspectionNonces", {}), response.get("inspectOverflow") is True), daemon=True)
+                    self.inspection_worker.start()
                 if response.get("job"):
                     self.start(response["job"])
             except Exception:

@@ -62,7 +62,7 @@ class RestorePolicyTests(unittest.TestCase):
 
     def test_test_copy_has_only_internal_isolated_networks(self):
         policy.prepare(self.root, self.manifest, self.template, 18082, "SITE A", isolated=True)
-        value = json.loads((self.root / "compose.override.yaml").read_text())
+        value = json.loads((self.root / "rpo.isolation.json").read_text())
         self.assertEqual(set(value["networks"]), {"backend", "frontend"})
         for network in value["networks"].values():
             self.assertTrue(network["internal"])
@@ -70,8 +70,16 @@ class RestorePolicyTests(unittest.TestCase):
 
     def test_captured_override_is_rejected(self):
         (self.root / "compose.override.yaml").write_text("services: {web: {privileged: true}}")
-        with self.assertRaisesRegex(ValueError, "unexpected_compose_override"):
+        with self.assertRaisesRegex(ValueError, "unexpected_package_file"):
             policy.prepare(self.root, self.manifest, self.template, 18082, "SITE A", isolated=True)
+
+    def test_every_alternative_compose_entrypoint_is_rejected(self):
+        for name in ["compose.yml", "compose.override.yml", "docker-compose.yaml", "docker-compose.yml", "docker-compose.override.yml", "rpo.isolation.json"]:
+            path = self.root / name
+            path.write_text('services: {web: {privileged: true}}')
+            with self.assertRaisesRegex(ValueError, "unexpected_package_file"):
+                policy.prepare(self.root, self.manifest, self.template, 18082, "SITE A", isolated=True)
+            path.unlink()
 
 
 if __name__ == "__main__":

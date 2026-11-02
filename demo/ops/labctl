@@ -16,6 +16,11 @@ flock -n 9 || { echo 'Another lab operation is running.' >&2; exit 1; }
 dc() { docker compose --project-directory "$root" -p "${RPO_PROJECT:-rolypoly-demo}" "$@"; }
 restic() { command restic --retry-lock 5m "$@"; }
 stage= work= project= proof_file= paused=0 keep=0
+restore_dc() {
+  local files=(-f "$work/service/compose.yaml")
+  [[ ! -f $work/service/rpo.isolation.json ]] || files+=(-f "$work/service/rpo.isolation.json")
+  docker compose "${files[@]}" --env-file "$work/service/.env" --project-directory "$work/service" -p "$project" "$@"
+}
 save_proof() {
   python3 - "$base" "$proof_file" <<'PY'
 import json,os,pathlib,tempfile,uuid,sys
@@ -34,7 +39,7 @@ cleanup() {
   trap - EXIT
   if [[ $paused == 1 ]]; then dc start web || rc=1; fi
   if [[ -n $project && $keep == 0 ]]; then
-    if ! docker compose --project-directory "$work/service" -p "$project" down --timeout 20; then
+    if ! restore_dc down --timeout 20; then
       echo "Cleanup failed; preserving $work" >&2
       rc=1; work=
     fi
@@ -57,6 +62,15 @@ case "$command" in
     ;;
   backup)
     stage=$(mktemp -d "$base/capture.XXXXXXXX")
+    python3 - "$stage" backup <<'PY'
+import json,os,pathlib,sys,uuid
+identity=os.getenv('RPO_OPERATION_ID')
+if identity:
+    assert str(uuid.UUID(identity))==identity
+    p=pathlib.Path(sys.argv[1])/'.operation.json'
+    with p.open('w') as f: json.dump({'id':identity,'action':sys.argv[2]},f);f.flush();os.fsync(f.fileno())
+    fd=os.open(p.parent,os.O_RDONLY);os.fsync(fd);os.close(fd)
+PY
     mkdir -p "$stage/service/state" "$stage/service/secrets"
     curl -fsS --max-time 8 "http://127.0.0.1:${RPO_SOURCE_PORT:-8080}/api/status" > "$stage/expected.json"
     web_id=$(docker inspect "${RPO_PROJECT:-rolypoly-demo}-web-1" --format '{{.Image}}')
@@ -115,6 +129,15 @@ PY
       echo 'A standby already exists. Preserve it and resolve its lifecycle first.' >&2; exit 1
     fi
     work=$(mktemp -d "$base/restore.XXXXXXXX")
+    python3 - "$work" "$command" <<'PY'
+import json,os,pathlib,sys,uuid
+identity=os.getenv('RPO_OPERATION_ID')
+if identity:
+    assert str(uuid.UUID(identity))==identity
+    p=pathlib.Path(sys.argv[1])/'.operation.json'
+    with p.open('w') as f: json.dump({'id':identity,'action':sys.argv[2]},f);f.flush();os.fsync(f.fileno())
+    fd=os.open(p.parent,os.O_RDONLY);os.fsync(fd);os.close(fd)
+PY
     restic restore "$snapshot" --target "$work/download"
     capture=$(python3 - "$work/download" <<'PY'
 import json,pathlib,sys
@@ -133,21 +156,21 @@ PY
     if [[ $command == restore-check || ${RPO_PREVIEW:-0} == 1 ]]; then isolated=1; fi
     python3 /usr/local/lib/rolypolyops/restore-policy.py "$work/service" "$capture/capture.json" "$capture/images.tar" "$port" "${RPO_TARGET_LABEL:-SITE B - RESTORED}" "$isolated"
     project=rpo-restore-$(basename "$work" | cut -d. -f2 | tr '[:upper:]' '[:lower:]')
-    docker compose --project-directory "$work/service" -p "$project" up -d --no-build --pull never db
+    restore_dc up -d --no-build --pull never db
     ready=0
     for i in $(seq 1 40); do
       # The image's temporary initialization server accepts only Unix sockets.
       # Wait for the final TCP listener before importing the dump.
-      if docker compose --project-directory "$work/service" -p "$project" exec -T db pg_isready -h 127.0.0.1 -U demo -d demo >/dev/null; then ready=1; break; fi
+      if restore_dc exec -T db pg_isready -h 127.0.0.1 -U demo -d demo >/dev/null; then ready=1; break; fi
       sleep 1
     done
     [[ $ready == 1 ]] || { echo 'Restored database did not start' >&2; exit 1; }
-    docker compose --project-directory "$work/service" -p "$project" exec -T db pg_restore -U demo -d demo --no-owner --no-acl < "$capture/database.dump"
-    docker compose --project-directory "$work/service" -p "$project" up -d --no-build --pull never web
+    restore_dc exec -T db pg_restore -U demo -d demo --no-owner --no-acl < "$capture/database.dump"
+    restore_dc up -d --no-build --pull never web
     ready=0
     for i in $(seq 1 30); do
       if [[ $isolated == 1 ]]; then
-        if docker compose --project-directory "$work/service" -p "$project" exec -T web node -e "fetch('http://127.0.0.1:8080/api/status').then(async r=>{if(!r.ok)process.exit(1);process.stdout.write(await r.text())}).catch(()=>process.exit(1))" > "$work/actual.json"; then ready=1; break; fi
+        if restore_dc exec -T web node -e "fetch('http://127.0.0.1:8080/api/status').then(async r=>{if(!r.ok)process.exit(1);process.stdout.write(await r.text())}).catch(()=>process.exit(1))" > "$work/actual.json"; then ready=1; break; fi
       elif curl -fsS --max-time 5 "http://127.0.0.1:$port/api/status" > "$work/actual.json"; then ready=1; break; fi
       sleep 2
     done

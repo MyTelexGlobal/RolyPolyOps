@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Install the control service or enroll a host from a trusted source checkout."""
 import argparse
+import ipaddress
 import json
 import os
 from pathlib import Path
 import pwd
+import re
 import shutil
 import socket
 import subprocess
@@ -22,6 +24,23 @@ STATE = Path("/var/lib/rolypolyops-control")
 AGENT_CONFIG = Path("/etc/rolypolyops/agent.json")
 UNIT_DIR = Path("/etc/systemd/system")
 CONFIG_DIR = Path("/etc/rolypolyops")
+
+
+def checked_url(value, paths):
+    if not isinstance(value, str) or len(value) > 512 or not value.isascii() or any(ord(c) <= 32 or ord(c) == 127 for c in value):
+        raise ValueError("Invalid HTTPS URL")
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in paths:
+        raise ValueError("Use a plain HTTPS address")
+    host = parsed.hostname
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if len(host) > 253 or not all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", part) for part in host.rstrip(".").split(".")):
+            raise ValueError("Invalid host")
+    if parsed.port is not None and not 1 <= parsed.port <= 65535:
+        raise ValueError("Invalid port")
+    return parsed
 
 
 def command(args):
@@ -65,9 +84,7 @@ def install_package_policy():
 
 
 def controller(origin, configure_proxy):
-    parsed = urllib.parse.urlsplit(origin)
-    if parsed.scheme != "https" or not parsed.hostname or parsed.path not in {"", "/"} or parsed.query or parsed.fragment or parsed.username or parsed.password:
-        raise ValueError("Use an HTTPS origin without a path or credentials")
+    parsed = checked_url(origin, {"", "/"})
     config_dir = CONFIG_DIR
     config_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     config_stat = config_dir.lstat()
@@ -142,9 +159,7 @@ WantedBy=multi-user.target
 
 
 def agent(controller_url, enrollment, replace=False):
-    parsed = urllib.parse.urlsplit(controller_url)
-    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path.rstrip("/") != "/ops":
-        raise ValueError("Use the HTTPS control URL ending in /ops")
+    parsed = checked_url(controller_url, {"/ops", "/ops/"})
     existing = read_json(AGENT_CONFIG)
     if existing and not replace:
         if existing.get("controller") != controller_url.rstrip("/"):
