@@ -349,6 +349,105 @@ class DomainCase(unittest.TestCase):
         self.assertNotIn('observedAt', observed)
         self.assertIn('next', observed['schedule']['backup'])
 
+    def test_repeated_unknown_receipt_does_not_consume_reconciliation_request(self):
+        node = self.add()
+        queued, _ = self.job(node)
+        assigned = self.sync(node)['job']
+        unknown = {'id': assigned['id'], 'nonce': assigned['nonce'], 'status': 'outcome_unknown', 'error': 'agent_restarted'}
+        self.sync(node, [unknown])
+        self.call('reconcile_job', queued['id'], {})
+        self.control = Control(self.temp.name, 'https://control.example.test')
+        for _ in range(3):
+            response = self.sync(node, [unknown])
+            self.assertTrue(response['job']['reconcile'])
+            self.assertEqual(response['job']['id'], assigned['id'])
+            self.assertEqual(response['job']['nonce'], assigned['nonce'])
+        terminal = {**unknown, 'status': 'succeeded', 'result': {'snapshot': SNAP}}
+        response = self.sync(node, [terminal])
+        self.assertNotIn('job', response)
+        self.assertFalse(self.call('overview')['jobs'][0].get('reconcileRequested', False))
+
+    def test_running_identity_not_redispatched_after_receipt_loss(self):
+        node = self.add()
+        self.job(node)
+        assigned = self.sync(node)['job']
+        self.sync(node, [{'id': assigned['id'], 'nonce': assigned['nonce'], 'status': 'running'}])
+        self.assertNotIn('job', self.sync(node))
+        self.control = Control(self.temp.name, 'https://control.example.test')
+        self.assertNotIn('job', self.sync(node))
+        result = self.call('overview')['jobs'][0]
+        self.assertEqual((result['status'], result['error']), ('outcome_unknown', 'agent_receipt_missing'))
+        self.call('reconcile_job', assigned['id'], {})
+        reconciliation = self.sync(node)['job']
+        self.assertTrue(reconciliation['reconcile'])
+        self.assertEqual(reconciliation['id'], assigned['id'])
+        self.assertEqual(reconciliation['nonce'], assigned['nonce'])
+
+    def test_terminal_orphan_acknowledged_without_accepting_proof(self):
+        node = self.add()
+        orphan = {'id': str(uuid.uuid4()), 'nonce': 'n' * 43, 'status': 'succeeded', 'result': {'snapshot': SNAP, 'password': 'secret-value'}}
+        result = self.sync(node, [orphan])
+        self.assertIn(orphan['id'], result['acknowledged'])
+        self.assertIn(orphan['id'], result['discarded'])
+        overview = self.call('overview')
+        self.assertTrue(overview['nodes'][0]['connected'])
+        self.assertEqual(overview['jobs'], [])
+        self.assertEqual(overview['orphanReports'][0]['status'], 'succeeded')
+        self.assertNotIn('secret-value', json.dumps(overview))
+        self.assertNotIn('nonce', overview['orphanReports'][0])
+        self.assertNotIn('result', overview['orphanReports'][0])
+        self.error('nodes_required', 'complete_setup', {})
+
+    def test_orphan_receipt_does_not_abort_known_receipt_in_same_sync(self):
+        node = self.add()
+        self.job(node)
+        assigned = self.sync(node)['job']
+        orphan = {'id': str(uuid.uuid4()), 'nonce': 'n' * 43, 'status': 'failed'}
+        known = {'id': assigned['id'], 'nonce': assigned['nonce'], 'status': 'succeeded', 'result': {'snapshot': SNAP}}
+        response = self.sync(node, [orphan, known])
+        self.assertEqual(set(response['acknowledged']), {orphan['id'], assigned['id']})
+        self.assertEqual(self.call('overview')['jobs'][0]['status'], 'succeeded')
+
+    def test_quarantine_holds_unacknowledged_dispatch_until_orphan_settles(self):
+        a, b = self.add(), self.add('recovery', 'B')
+        self.job(b, 'verify')
+        assigned = self.sync(b)['job']
+        orphan = {'id': str(uuid.uuid4()), 'nonce': 'n' * 43, 'status': 'outcome_unknown'}
+        self.sync(a, [orphan])
+        self.assertNotIn('job', self.sync(b))
+        self.sync(a, [{**orphan, 'status': 'failed'}])
+        self.assertEqual(self.sync(b)['job'], assigned)
+
+    def test_unknown_orphan_allows_heartbeat_but_blocks_global_mutations(self):
+        a, b = self.add(), self.add('recovery', 'B')
+        orphan = {'id': str(uuid.uuid4()), 'nonce': 'n' * 43, 'status': 'outcome_unknown'}
+        response = self.sync(a, [orphan])
+        self.assertIn(orphan['id'], response['acknowledged'])
+        self.job(b, 'verify')
+        self.assertNotIn('job', self.sync(b))
+        self.error('node_busy', 'revoke_node', a['nodeId'], {})
+        self.error('node_busy', 'enrollment', {}, a['nodeId'])
+        overview = self.call('overview')
+        self.assertTrue(next(node for node in overview['nodes'] if node['id'] == a['nodeId'])['connected'])
+        self.assertIn('catalog_receipt_orphaned', [alert['code'] for alert in overview['alerts']])
+        self.control = Control(self.temp.name, 'https://control.example.test')
+        self.assertNotIn('job', self.sync(b))
+        # Another authenticated node cannot clear the first node's quarantine.
+        self.sync(b, [{**orphan, 'status': 'failed'}])
+        self.assertNotIn('job', self.sync(b))
+        self.sync(a, [{**orphan, 'status': 'failed'}])
+        self.assertIn('job', self.sync(b))
+        self.assertEqual(len(self.call('overview')['jobs']), 1)
+
+    def test_invalid_unicode_nonce_and_password_are_stable_errors(self):
+        node = self.add()
+        self.job(node)
+        assigned = self.sync(node)['job']
+        bad = {'id': assigned['id'], 'nonce': '\u00e9' * 43, 'status': 'running'}
+        self.error('job_report_forbidden', 'sync', {'nodeId': node['nodeId'], 'status': observation(), 'reports': [bad]}, 'Bearer ' + node['token'])
+        self.error('invalid_request', 'login', {'password': '\ud800abc'}, 'test-client')
+        self.error('invalid_request', 'enrollment', {'name': '\ud800abc', 'role': 'recovery'})
+
 
 class HTTPCase(unittest.TestCase):
     def setUp(self):
@@ -449,6 +548,15 @@ class HTTPCase(unittest.TestCase):
         self.assertEqual(self.request('POST', '/ops/api/enrollments', body, {'X-CSRF-Token': ''})[2]['error'], 'csrf_forbidden')
         self.assertEqual(self.request('POST', '/ops/api/enrollments', body, {'Origin': 'https://evil.example'})[2]['error'], 'origin_forbidden')
         self.assertEqual(self.request('POST', '/ops/api/enrollments', body)[0], 200)
+
+    def test_nonascii_csrf_and_surrogate_password_are_stable_client_errors(self):
+        self.login()
+        status, _, body = self.request('POST', '/ops/api/enrollments', {'name': 'A', 'role': 'primary'}, {'X-CSRF-Token': '\u00e9'})
+        self.assertEqual((status, body['error']), (403, 'csrf_forbidden'))
+        status, _, body = self.request('POST', '/ops/api/login', {'password': '\ud800abc'})
+        self.assertEqual((status, body['error']), (400, 'invalid_request'))
+        status, _, body = self.request('POST', '/ops/api/password', {'currentPassword': 'a-new-test-password-123456', 'newPassword': '\ud800' + 'a' * 32})
+        self.assertEqual((status, body['error']), (400, 'invalid_password'))
 
     def test_login_origin_and_rate_limit(self):
         self.assertEqual(self.request('POST', '/ops/api/login', {'password': 'wrong'}, {'Origin': 'https://evil.example'})[0], 403)

@@ -18,7 +18,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
-from http.cookies import SimpleCookie
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 import uuid
@@ -59,9 +59,27 @@ def is_uuid(value):
 
 
 def clean_text(value, limit=100):
-    if not isinstance(value, str) or len(value) > limit or any(ord(c) < 32 or ord(c) == 127 for c in value):
+    if not utf8_text(value, limit) or any(ord(c) < 32 or ord(c) == 127 for c in value):
         return None
     return value
+
+
+def utf8_text(value, limit):
+    if not isinstance(value, str) or len(value) > limit:
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def opaque_matches(received, expected):
+    if not isinstance(received, str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", received):
+        return False
+    if not isinstance(expected, str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", expected):
+        return False
+    return hmac.compare_digest(received.encode("ascii"), expected.encode("ascii"))
 
 
 def timestamp(value, *, allow_future=False):
@@ -109,7 +127,7 @@ def password_hash(password, salt=None):
 
 
 def password_matches(password, stored):
-    if not isinstance(password, str) or len(password) > 1024:
+    if not utf8_text(password, 1024):
         return False
     return hmac.compare_digest(password_hash(password, bytes.fromhex(stored["salt"]))["hash"], stored["hash"])
 
@@ -238,6 +256,7 @@ class Control:
                 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status,created);
                 CREATE TABLE IF NOT EXISTS job_requests(key TEXT PRIMARY KEY,plan_id TEXT NOT NULL,job_id TEXT NOT NULL);
                 INSERT OR IGNORE INTO job_requests SELECT idempotency_key,plan_id,id FROM jobs;
+                CREATE TABLE IF NOT EXISTS orphan_reports(node_id TEXT NOT NULL,job_id TEXT NOT NULL,status TEXT NOT NULL,first_seen REAL NOT NULL,last_seen REAL NOT NULL,PRIMARY KEY(node_id,job_id));
             """)
             for table, column, declaration in (("jobs", "reconcile_requested", "INTEGER NOT NULL DEFAULT 0"), ("nodes", "revoked", "INTEGER NOT NULL DEFAULT 0")):
                 if column not in {entry[1] for entry in db.execute("PRAGMA table_info(" + table + ")")}:
@@ -297,7 +316,7 @@ class Control:
             cookie = SimpleCookie()
             cookie.load(cookie_header)
             token = cookie[COOKIE].value
-        except (KeyError, ValueError):
+        except (KeyError, ValueError, CookieError):
             return None
         if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token):
             return None
@@ -317,7 +336,7 @@ class Control:
     def login(self, db, body, client):
         fields(body, ("password",))
         password = body["password"]
-        if not isinstance(password, str) or len(password) > 1024:
+        if not utf8_text(password, 1024):
             raise APIError(400, "invalid_request")
         db.execute("DELETE FROM attempts WHERE at<?", (time.time() - 900,))
         failures = db.execute("SELECT COUNT(*) FROM attempts WHERE client=?", (client,)).fetchone()[0]
@@ -335,7 +354,9 @@ class Control:
     def change_password(self, db, body):
         fields(body, ("currentPassword", "newPassword"))
         new = body["newPassword"]
-        if not isinstance(new, str) or not 16 <= len(new) <= 256:
+        if not utf8_text(new, 256):
+            raise APIError(400, "invalid_password")
+        if len(new) < 16:
             raise APIError(400, "password_too_short")
         if not password_matches(body["currentPassword"], self.setting(db, "password")):
             raise APIError(403, "invalid_credentials")
@@ -364,6 +385,10 @@ class Control:
         when = timestamp(status.get("observedAt"))
         return when is not None and time.time() - datetime.fromisoformat(when).timestamp() <= 120
 
+    @staticmethod
+    def node_has_unsettled(db, node_id):
+        return db.execute("SELECT 1 FROM jobs WHERE node_id=? AND status IN ('queued','dispatched','running','outcome_unknown')", (node_id,)).fetchone() or db.execute("SELECT 1 FROM orphan_reports WHERE node_id=? AND status IN ('running','outcome_unknown')", (node_id,)).fetchone()
+
     def enrollment(self, db, body, node_id=None):
         if node_id is None:
             fields(body, ("name", "role"))
@@ -375,7 +400,7 @@ class Control:
         else:
             fields(body)
             node = self.node(db, node_id)
-            if db.execute("SELECT 1 FROM jobs WHERE node_id=? AND status IN ('queued','dispatched','running','outcome_unknown')", (node_id,)).fetchone():
+            if self.node_has_unsettled(db, node_id):
                 raise APIError(409, "node_busy")
             name, role = node["name"], node["role"]
             db.execute("UPDATE enrollments SET used=2 WHERE node_id=? AND used=0", (node_id,))
@@ -402,7 +427,7 @@ class Control:
     def revoke_node(self, db, identity, body):
         fields(body)
         self.node(db, identity)
-        if db.execute("SELECT 1 FROM jobs WHERE node_id=? AND status IN ('queued','dispatched','running','outcome_unknown')", (identity,)).fetchone():
+        if self.node_has_unsettled(db, identity):
             raise APIError(409, "node_busy")
         db.execute("UPDATE nodes SET revoked=1,token_hash=?,last_seen=NULL,status='{}' WHERE id=?", (digest(secrets.token_urlsafe(32)), identity))
         db.execute("UPDATE enrollments SET used=2 WHERE node_id=? AND used=0", (identity,))
@@ -429,7 +454,7 @@ class Control:
                 raise APIError(409, "primary_exists")
             db.execute("INSERT INTO nodes(id,name,role,token_hash) VALUES(?,?,?,?)", (node_id, row["name"], row["role"], digest(token)))
         else:
-            if db.execute("SELECT 1 FROM jobs WHERE node_id=? AND status IN ('queued','dispatched','running','outcome_unknown')", (node_id,)).fetchone():
+            if self.node_has_unsettled(db, node_id):
                 raise APIError(409, "node_busy")
             db.execute("UPDATE nodes SET token_hash=?,revoked=0,last_seen=NULL,status='{}' WHERE id=?", (digest(token), node_id))
         db.execute("UPDATE enrollments SET used=1 WHERE id=?", (row["id"],))
@@ -503,8 +528,11 @@ class Control:
         jobs = [self.public_job(row) for row in db.execute("SELECT * FROM jobs ORDER BY created DESC LIMIT 100")]
         if any(job["status"] == "outcome_unknown" for job in jobs):
             alerts.append({"severity": "error", "code": "operation_outcome_unknown"})
+        orphans = [{"nodeId": row["node_id"], "id": row["job_id"], "status": row["status"], "firstSeen": stamp(row["first_seen"]), "lastSeen": stamp(row["last_seen"])} for row in db.execute("SELECT * FROM orphan_reports ORDER BY last_seen DESC LIMIT 100")]
+        for row in db.execute("SELECT DISTINCT node_id FROM orphan_reports WHERE status IN ('running','outcome_unknown')"):
+            alerts.append({"severity": "error", "code": "catalog_receipt_orphaned", "nodeId": row["node_id"]})
         enrollments = [{"id": row["id"], "name": row["name"], "role": row["role"], "expiresAt": stamp(row["expires"]), "status": "used" if row["used"] == 1 else "cancelled" if row["used"] == 2 else "expired" if row["expires"] < time.time() else "pending"} for row in db.execute("SELECT * FROM enrollments ORDER BY expires DESC LIMIT 100")]
-        return {"version": VERSION, "revision": self.revision(db), "setup": self.setting(db, "setup"), "nodes": nodes, "enrollments": enrollments, "jobs": jobs, "capabilities": {"automaticFailover": False}, "alerts": alerts}
+        return {"version": VERSION, "revision": self.revision(db), "setup": self.setting(db, "setup"), "nodes": nodes, "enrollments": enrollments, "jobs": jobs, "orphanReports": orphans, "capabilities": {"automaticFailover": False}, "alerts": alerts}
 
     def settings(self, db, body):
         fields(body, ("profile", "backupInterval", "expectedRevision"))
@@ -624,12 +652,26 @@ class Control:
         if not isinstance(reports, list) or len(reports) > 100:
             raise APIError(400, "invalid_reports")
         acknowledged = []
+        discarded = []
         for report in reports:
             fields(report, ("id", "nonce", "status"), ("stage", "result", "error"))
             if not is_uuid(report["id"]) or not isinstance(report["nonce"], str) or not isinstance(report["status"], str) or report["status"] not in {"running", "succeeded", "failed", "outcome_unknown"}:
                 raise APIError(400, "invalid_report")
+            if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", report["nonce"]):
+                raise APIError(403, "job_report_forbidden")
             job = db.execute("SELECT * FROM jobs WHERE id=?", (report["id"],)).fetchone()
-            if job is None or job["node_id"] != node["id"] or not hmac.compare_digest(job["nonce"], report["nonce"]):
+            if job is None:
+                # A restored catalog may predate a durable receipt. Keep its scope
+                # separate from known jobs and never accept its result as proof.
+                prior = db.execute("SELECT * FROM orphan_reports WHERE node_id=? AND job_id=?", (node["id"], report["id"])).fetchone()
+                state = report["status"]
+                if prior is not None and prior["status"] in TERMINAL:
+                    state = prior["status"]
+                db.execute("INSERT INTO orphan_reports VALUES(?,?,?,?,?) ON CONFLICT(node_id,job_id) DO UPDATE SET status=excluded.status,last_seen=excluded.last_seen", (node["id"], report["id"], state, time.time(), time.time()))
+                acknowledged.append(report["id"])
+                discarded.append(report["id"])
+                continue
+            if job["node_id"] != node["id"] or not opaque_matches(report["nonce"], job["nonce"]):
                 raise APIError(403, "job_report_forbidden")
             if job["status"] == "queued":
                 raise APIError(409, "job_not_dispatched")
@@ -653,13 +695,20 @@ class Control:
             if job["status"] == "outcome_unknown" and new_state == "running":
                 # A running receipt cannot establish the outcome of an interrupted process.
                 continue
-            db.execute("UPDATE jobs SET status=?,started=COALESCE(started,?),ended=?,stage=?,result=?,error=?,reconcile_requested=0 WHERE id=?", (new_state, time.time(), time.time() if new_state in TERMINAL else None, stage, canonical(result) if result is not None else None, error, job["id"]))
+            reconcile_requested = job["reconcile_requested"] if new_state == "outcome_unknown" else 0
+            db.execute("UPDATE jobs SET status=?,started=COALESCE(started,?),ended=?,stage=?,result=?,error=?,reconcile_requested=? WHERE id=?", (new_state, time.time(), time.time() if new_state in TERMINAL else None, stage, canonical(result) if result is not None else None, error, reconcile_requested, job["id"]))
             acknowledged.append(job["id"])
         db.execute("UPDATE nodes SET last_seen=?,status=? WHERE id=?", (time.time(), canonical(status), node["id"]))
         self.mark_lost(db)
         self.expire_queued(db)
         active = db.execute("SELECT * FROM jobs WHERE status IN ('dispatched','running','outcome_unknown') ORDER BY created LIMIT 1").fetchone()
-        if active is None:
+        if active is not None and active["node_id"] == node["id"] and active["status"] == "running" and active["id"] not in {report["id"] for report in reports}:
+            # Running receipts are sent on every heartbeat. Missing local state is
+            # uncertainty to reconcile, never permission to repeat the mutation.
+            db.execute("UPDATE jobs SET status='outcome_unknown',stage='interrupted',error='agent_receipt_missing' WHERE id=?", (active["id"],))
+            active = db.execute("SELECT * FROM jobs WHERE id=?", (active["id"],)).fetchone()
+        orphan_pending = db.execute("SELECT 1 FROM orphan_reports WHERE status IN ('running','outcome_unknown')").fetchone() is not None
+        if active is None and not orphan_pending:
             waiting = db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY created,id LIMIT 1").fetchone()
             if waiting is not None and waiting["node_id"] == node["id"] and self.status_fresh(status) and status.get("supported"):
                 if waiting["action"] == "backup" and status.get("serviceHealthy") is not True:
@@ -672,9 +721,11 @@ class Control:
                 db.execute("UPDATE jobs SET status='dispatched',stage='starting' WHERE id=?", (waiting["id"],))
                 active = db.execute("SELECT * FROM jobs WHERE id=?", (waiting["id"],)).fetchone()
         response = {"acknowledged": acknowledged}
-        if active is not None and active["node_id"] == node["id"] and (active["status"] != "outcome_unknown" or active["reconcile_requested"]):
+        if discarded:
+            response["discarded"] = discarded
+        if active is not None and active["node_id"] == node["id"] and ((active["status"] == "dispatched" and not orphan_pending) or active["reconcile_requested"]):
             response["job"] = {"id": active["id"], "nonce": active["nonce"], "action": active["action"], "snapshotId": active["snapshot"], "parameters": json.loads(active["parameters"])}
-            if active["status"] == "outcome_unknown":
+            if active["reconcile_requested"]:
                 response["job"]["reconcile"] = True
         return response
 
@@ -682,6 +733,8 @@ class Control:
         fields(body)
         if db.execute("SELECT 1 FROM jobs WHERE status IN ('queued','dispatched','running','outcome_unknown')").fetchone():
             raise APIError(409, "operation_in_progress")
+        if db.execute("SELECT 1 FROM orphan_reports WHERE status IN ('running','outcome_unknown')").fetchone():
+            raise APIError(409, "catalog_receipt_orphaned")
         nodes = db.execute("SELECT * FROM nodes").fetchall()
         primaries = [node for node in nodes if node["role"] == "primary"]
         setup = self.setting(db, "setup")
@@ -813,7 +866,7 @@ def handler_for(control):
                 if control.setting(db, "needsPasswordChange") and route not in {"/api/password", "/api/logout"}:
                     raise APIError(403, "password_change_required")
                 if self.command == "POST":
-                    if not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), session["csrf"]):
+                    if not opaque_matches(self.headers.get("X-CSRF-Token", ""), session["csrf"]):
                         raise APIError(403, "csrf_forbidden")
                     if route == "/api/logout":
                         fields(body)
