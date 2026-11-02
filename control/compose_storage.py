@@ -87,7 +87,7 @@ def validate_metadata(metadata):
         raise StorageError("invalid_storage_endpoint")
     try:
         url = urllib.parse.urlsplit(endpoint)
-        port = url.port or 443
+        port = url.port if url.port is not None else 443
     except ValueError:
         raise StorageError("invalid_storage_endpoint") from None
     if (url.scheme != "https" or not url.hostname or url.username is not None or url.password is not None
@@ -403,6 +403,8 @@ class StorageManager:
 
     def configure(self, operation_id, params):
         storage_id, mode, envelope = params["storageId"], params["mode"], params["envelope"]
+        if mode == "create" and "expectedRepositoryId" in params:
+            raise StorageError("create_repository_id_preassigned")
         discover = params.get("discoverRepositoryId") is True
         if "discoverRepositoryId" in params and (not discover or mode != "attach" or "expectedRepositoryId" in params):
             raise StorageError("invalid_repository_discovery")

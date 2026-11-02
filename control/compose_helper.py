@@ -49,22 +49,57 @@ def _path(value):
     return "/".join(parts)
 
 
-def _link(name, target, hard=False):
-    if not target or target.startswith("/") or "\\" in target or len(target) > MAX_PATH:
+def _link_text(target):
+    if (not isinstance(target, str) or not target or target.startswith("/") or "\\" in target
+            or len(target.encode()) > MAX_PATH or any(ord(c) < 32 for c in target)
+            or len(target.split("/")) > MAX_DEPTH):
         raise ArchiveError("archive_link_unsafe")
-    parts = [] if hard else name.split("/")[:-1]
-    for part in target.split("/"):
+    return target
+
+
+def _resolve_link(name, target, hard, kinds, symbolic):
+    """Resolve archive links as a virtual filesystem before any extractor sees them."""
+    pending = _link_text(target).split("/")
+    stack = [] if hard else name.split("/")[:-1]
+    seen, hops, steps = set(), 0, 0
+    while pending:
+        steps += 1
+        if steps > MAX_DEPTH * MAX_DEPTH:
+            raise ArchiveError("archive_link_unsafe")
+        part = pending.pop(0)
         if part in {"", "."}:
             continue
         if part == "..":
-            if not parts:
+            if len(stack) <= 1:
                 raise ArchiveError("archive_link_unsafe")
-            parts.pop()
-        else:
-            parts.append(part)
-    if not parts or parts[0] != name.split("/")[0]:
+            stack.pop()
+            continue
+        if not stack and part != "payload":
+            raise ArchiveError("archive_link_unsafe")
+        candidate = "/".join(stack + [part])
+        kind = kinds.get(candidate)
+        if kind is None:
+            raise ArchiveError("archive_link_unsafe")
+        if kind == "symlink":
+            if hard:
+                raise ArchiveError("archive_link_unsafe")
+            state = (candidate, tuple(stack), tuple(pending))
+            hops += 1
+            if state in seen or hops > 64:
+                raise ArchiveError("archive_link_unsafe")
+            seen.add(state)
+            pending = _link_text(symbolic[candidate]).split("/") + pending
+            continue
+        stack.append(part)
+        if len(stack) > MAX_DEPTH:
+            raise ArchiveError("archive_link_unsafe")
+        if pending and kind != "directory":
+            raise ArchiveError("archive_link_unsafe")
+    result = "/".join(stack)
+    if not stack or stack[0] != "payload" or result not in kinds or (hard and kinds[result] != "file") or hops:
+        # Direct internal links are supported; symlink-to-symlink transit remains outside the accepted data format.
         raise ArchiveError("archive_link_unsafe")
-    return "/".join(parts)
+    return result
 
 
 def _pax(headers):
@@ -120,9 +155,9 @@ def inspect_archive(path, *, data=True):
                 entry = {"path": name, "kind": kind, "uid": member.uid, "gid": member.gid,
                          "mode": member.mode & 0o7777, "mtime": str(member.mtime), "size": member.size, "pax": pax}
                 if kind in {"symlink", "hardlink"}:
-                    target = _link(name, member.linkname, hard=kind == "hardlink")
+                    _link_text(member.linkname)
                     entry["link"] = member.linkname
-                    links.append((name, target, kind))
+                    links.append((name, member.linkname, kind))
                 if kind == "file":
                     stream = archive.extractfile(member)
                     h = hashlib.sha256()
@@ -137,13 +172,14 @@ def inspect_archive(path, *, data=True):
                 if parent in kinds and kinds[parent] != "directory":
                     raise ArchiveError("archive_link_parent")
                 parent = parent.rpartition("/")[0]
+        virtual = dict(kinds)
+        for name in kinds:
+            parts = name.split("/")
+            for index in range(1, len(parts)):
+                virtual.setdefault("/".join(parts[:index]), "directory")
+        symbolic = {name: target for name, target, kind in links if kind == "symlink"}
         for name, target, kind in links:
-            if target not in kinds or (kind == "hardlink" and kinds[target] != "file"):
-                raise ArchiveError("archive_link_unsafe")
-            # A symlink target must not transit another symlink, even if lexically internal.
-            pieces = target.split("/")
-            if any(kinds.get("/".join(pieces[:i])) == "symlink" for i in range(1, len(pieces) + 1)):
-                raise ArchiveError("archive_link_unsafe")
+            _resolve_link(name, target, kind == "hardlink", virtual, symbolic)
         return {"files": len(entries), "bytes": total, "entries": sorted(entries, key=lambda x: x["path"]), "sha256": digest(path)}
     except (tarfile.TarError, OSError, UnicodeError, OverflowError):
         raise ArchiveError("archive_invalid") from None
@@ -153,7 +189,7 @@ def inspect_tree(source):
     source = Path(source)
     if not source.exists() or source.is_symlink():
         raise ArchiveError("source_path_unsafe")
-    count, total = 0, 0
+    count, total, kinds, symbolic = 0, 0, {}, {}
     for base, dirs, files in os.walk(source, followlinks=False) if source.is_dir() else [(source.parent, [], [source.name])]:
         paths = [Path(base)] + [Path(base) / name for name in files] + [Path(base) / name for name in dirs if (Path(base) / name).is_symlink()] if source.is_dir() else [source]
         for path in paths:
@@ -163,10 +199,11 @@ def inspect_tree(source):
                 raise ArchiveError("archive_file_limit")
             relative = "payload" + ("/" + str(path.relative_to(source)) if source.is_dir() and path != source else "")
             _path(relative)
+            kinds[relative] = "symlink" if stat.S_ISLNK(value.st_mode) else "directory" if stat.S_ISDIR(value.st_mode) else "file"
             if value.st_mode & (stat.S_ISUID | stat.S_ISGID) or not (stat.S_ISREG(value.st_mode) or stat.S_ISDIR(value.st_mode) or stat.S_ISLNK(value.st_mode)):
                 raise ArchiveError("archive_metadata_unsafe")
             if stat.S_ISLNK(value.st_mode):
-                target = _link(relative, os.readlink(path))
+                symbolic[relative] = _link_text(os.readlink(path))
                 try:
                     resolved = path.resolve(strict=True)
                     resolved.relative_to(source.resolve())
@@ -178,6 +215,8 @@ def inspect_tree(source):
             total += value.st_size if stat.S_ISREG(value.st_mode) else 0
             if total > MAX_BYTES:
                 raise ArchiveError("archive_byte_limit")
+    for name, target in symbolic.items():
+        _resolve_link(name, target, False, kinds, symbolic)
     return {"files": count, "bytes": total}
 
 

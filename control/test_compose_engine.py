@@ -87,6 +87,14 @@ class EngineTests(unittest.TestCase):
         engine.validate_job(valid)
         self.assertEqual(valid, before)
 
+    def test_create_job_cannot_preassign_repository_identity(self):
+        for expected in ("a" * 64, None, False):
+            job = self.job("storage-configure", {"storageId": self.storage, "mode": "create", "envelope": {}, "expectedRepositoryId": expected})
+            before = copy.deepcopy(job)
+            with self.subTest(expected=expected), self.assertRaisesRegex(engine.EngineError, "create_repository_id_preassigned"):
+                engine.validate_job(job)
+            self.assertEqual(job, before)
+
     def test_controller_only_repository_discovery_flag_has_exact_schema(self):
         params = {"storageId": self.storage, "metadata": {"id": self.storage}, "mode": "attach", "envelope": {}, "discoverRepositoryId": True}
         engine.validate_job(self.job("storage-configure", params))
@@ -585,6 +593,124 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(result["addressesPartial"])
         self.assertEqual(result["addressesError"], "address_inventory_partial")
         self.assertEqual(result["error"], "observation_deadline")
+
+    def test_pre_extraction_virtual_link_graph_rejects_escape_and_cycles_preserves_direct_links(self):
+        entries = [{"name": "payload", "kind": tarfile.DIRTYPE}, {"name": "payload/sym", "kind": tarfile.SYMTYPE, "link": "."}, {"name": "payload/x", "content": b"x"}, {"name": "payload/d", "kind": tarfile.DIRTYPE}, {"name": "payload/d/l", "kind": tarfile.SYMTYPE, "link": "../sym/../x"}, {"name": "payload/s1", "kind": tarfile.SYMTYPE, "link": "sym/.."}, {"name": "payload/s2", "kind": tarfile.SYMTYPE, "link": "s1/.."}]
+        with self.assertRaisesRegex(helper.ArchiveError, "archive_link_unsafe"):
+            helper.inspect_archive(self.archive(entries))
+        cyclic = [{"name": "payload", "kind": tarfile.DIRTYPE}, {"name": "payload/a", "kind": tarfile.SYMTYPE, "link": "b"}, {"name": "payload/b", "kind": tarfile.SYMTYPE, "link": "a"}]
+        with self.assertRaisesRegex(helper.ArchiveError, "archive_link_unsafe"):
+            helper.inspect_archive(self.archive(cyclic))
+        safe = [{"name": "payload", "kind": tarfile.DIRTYPE}, {"name": "payload/d", "kind": tarfile.DIRTYPE}, {"name": "payload/d/file", "content": b"safe"}, {"name": "payload/root", "kind": tarfile.SYMTYPE, "link": "."}, {"name": "payload/file", "kind": tarfile.SYMTYPE, "link": "d/file"}, {"name": "payload/d/link", "kind": tarfile.SYMTYPE, "link": "file"}]
+        self.assertEqual(helper.inspect_archive(self.archive(safe))["files"], 6)
+
+    def test_same_direct_link_policy_is_checked_during_source_preflight(self):
+        payload = self.root / "payload"
+        payload.mkdir()
+        (payload / "file").write_text("safe")
+        (payload / "direct").symlink_to("file")
+        with mock.patch.object(os, "listxattr", create=True, return_value=[]):
+            self.assertEqual(helper.inspect_tree(payload)["files"], 3)
+            (payload / "chain").symlink_to("direct")
+            with self.assertRaisesRegex(helper.ArchiveError, "archive_link_unsafe"):
+                helper.inspect_tree(payload)
+        archive = self.archive([{"name": "payload", "kind": tarfile.DIRTYPE}, {"name": "payload/file", "content": b"safe"}, {"name": "payload/direct", "kind": tarfile.SYMTYPE, "link": "file"}, {"name": "payload/chain", "kind": tarfile.SYMTYPE, "link": "direct"}])
+        with self.assertRaisesRegex(helper.ArchiveError, "archive_link_unsafe"):
+            helper.inspect_archive(archive)
+
+    def _native_files(self, data):
+        with tarfile.open(data["archive"]) as archive:
+            return {m.name: archive.extractfile(m).read() for m in archive if m.isfile()}
+
+    def test_every_native_index_entrypoint_is_bound_to_legacy_verified_config_and_alias(self):
+        data = self.docker29_images()
+        files = self._native_files(data)
+        old_config = json.loads(files["blobs/sha256/" + data["config"][7:]])
+        old_config["config"] = {"Entrypoint": ["/unverified-image"]}
+        config_raw = json.dumps(old_config).encode()
+        config_id = "sha256:" + hashlib.sha256(config_raw).hexdigest()
+        native = json.loads(files["blobs/sha256/" + data["child"][7:]])
+        native["config"].update(digest=config_id, size=len(config_raw))
+        native_raw = json.dumps(native).encode()
+        native_id = "sha256:" + hashlib.sha256(native_raw).hexdigest()
+        files["blobs/sha256/" + config_id[7:]] = config_raw
+        files["blobs/sha256/" + native_id[7:]] = native_raw
+        index = json.loads(files["index.json"])
+        index["manifests"][0].update(mediaType="application/vnd.oci.image.manifest.v1+json", digest=native_id, size=len(native_raw))
+        files["index.json"] = json.dumps(index).encode()
+        path = self.archive([{"name": name, "content": content} for name, content in files.items()])
+        identities = {data["config"]: {"id": data["config"], "os": "linux", "architecture": "amd64", "variant": "", "alias": data["alias"]}}
+        with self.assertRaisesRegex(engine.EngineError, "image_identity_unverified"):
+            self.engine._image_archive(path, identities)
+
+    def _author_bundle(self, *, mutate=None, dishonest=False):
+        data = self.docker29_images()
+        images = {data["config"]: {"id": data["config"], "alias": data["alias"], "os": "linux", "architecture": "amd64", "variant": ""}}
+        measured = self.engine._image_archive(data["archive"], images)
+        images[data["config"]]["size"] = 1 if dishonest else measured[data["config"]]["requiredBytes"]
+        operation, service, repository = uid(), uid(), "a" * 64
+        runtime = {"name": "source", "services": {"app": {"image": data["alias"], "environment": {}}}}
+        manifest = {"format": "rolypolyops-compose-v1", "serviceId": service, "repositoryId": repository, "operationId": operation, "sourceFingerprint": "b" * 64, "platform": ["linux", "amd64", ""], "runtime": runtime, "containers": [{"id": "source-app", "service": "app", "imageId": data["config"], "mounts": []}], "archives": [], "images": images, "imagesSha256": helper.digest(data["archive"]), "helperId": data["config"]}
+        if mutate:
+            mutate(manifest)
+        manifest["runtimeDigest"] = hashlib.sha256(helper.canonical(manifest["runtime"])).hexdigest()
+        raw = helper.canonical(manifest)
+        path = self.archive([{"name": "manifest.json", "content": raw}, {"name": "images.tar", "content": data["archive"].read_bytes()}])
+        directory = self.root / uid()
+        directory.mkdir()
+        point = {"manifestDigest": hashlib.sha256(raw).hexdigest(), "sourceFingerprint": "b" * 64, "operationId": operation}
+        return path, directory, service, repository, point, measured
+
+    def test_bundle_runtime_identity_is_bound_and_honest_measured_budget_is_required(self):
+        path, directory, service, repository, point, measured = self._author_bundle()
+        validated = self.engine._bundle(path, directory, service_id=service, repository_id=repository, point=point)
+        self.assertEqual(validated["measuredImages"], measured)
+        for mutate in (lambda m: m["runtime"]["services"]["app"].update(image="foreign-preexisting:latest"), lambda m: m["containers"].append(dict(m["containers"][0])), lambda m: m["containers"][0].update(imageId="sha256:" + "0" * 64), lambda m: m["containers"][0].update(service="foreign")):
+            path, directory, service, repository, point, _ = self._author_bundle(mutate=mutate)
+            with self.assertRaisesRegex(engine.EngineError, "compose_image_binding_invalid"):
+                self.engine._bundle(path, directory, service_id=service, repository_id=repository, point=point)
+        path, directory, service, repository, point, _ = self._author_bundle(dishonest=True)
+        with self.assertRaisesRegex(engine.EngineError, "bundle_image_budget_mismatch"):
+            self.engine._bundle(path, directory, service_id=service, repository_id=repository, point=point)
+
+    def test_image_layer_gzip_expansion_is_measured_with_hard_limits_and_native_semantics(self):
+        import gzip
+        layer = io.BytesIO()
+        with tarfile.open(fileobj=layer, mode="w") as archive:
+            tar_entry(archive, "data", b"x" * 65536)
+        raw = layer.getvalue()
+        compressed = gzip.compress(raw)
+        archive_path = self.archive([{"name": "layer", "content": compressed}])
+        with tarfile.open(archive_path) as archive:
+            measured = self.engine._measure_image_layer(archive, "layer")
+        self.assertEqual(measured["expandedBytes"], len(raw))
+        self.assertEqual(measured["logicalBytes"], 65536)
+        self.assertGreater(measured["requiredBytes"], len(compressed) * 10)
+        with mock.patch.object(engine, "MAX_BYTES", 32768), tarfile.open(archive_path) as archive:
+            with self.assertRaisesRegex(engine.EngineError, "image_expanded_byte_limit"):
+                self.engine._measure_image_layer(archive, "layer")
+        unsupported = self.archive([{"name": "layer", "content": b"\x28\xb5\x2f\xfdunsupported"}])
+        with tarfile.open(unsupported) as archive, self.assertRaisesRegex(engine.EngineError, "image_compression_unsupported"):
+            self.engine._measure_image_layer(archive, "layer")
+
+    def test_capture_export_records_measured_conservative_image_budget(self):
+        data = self.docker29_images()
+        stage = self.root / "export"
+        stage.mkdir()
+        def command(*args, **kwargs):
+            if args[:2] == ("image", "save") and args[-1] == data["alias"]:
+                Path(args[args.index("--output") + 1]).write_bytes(data["archive"].read_bytes())
+                return b""
+            return data["command"](*args, **kwargs)
+        image = {"id": data["config"], "dockerRef": data["root"], "os": "linux", "architecture": "amd64", "variant": "", "size": 1}
+        with mock.patch.object(self.engine, "docker", side_effect=command):
+            images = self.engine._export_images(stage, {data["config"]: image})
+        required = images[data["config"]]["measuredImage"]["requiredBytes"]
+        self.assertGreater(required, 1)
+        self.assertGreaterEqual(images[data["config"]]["size"], required)
+        with mock.patch.object(engine.shutil, "disk_usage", return_value=mock.Mock(free=required * 3 + 512 * 1024 ** 2 - 1)):
+            with self.assertRaisesRegex(engine.EngineError, "insufficient_staging_space"):
+                self.engine._reserve(0, required, 1)
 
     def test_oci_or_legacy_secondary_tags_cannot_overwrite_other_images(self):
         for name, document in (("index.json", {"manifests": [{"annotations": {"io.containerd.image.name": "production:latest", "org.opencontainers.image.ref.name": "latest"}}]}), ("repositories", {"production": {"latest": "a" * 64}})):
