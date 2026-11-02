@@ -45,8 +45,9 @@ class DomainCase(unittest.TestCase):
         self.sync(node)
         return node
 
-    def sync(self, node, reports=None, status=None):
-        return self.call('sync', {'nodeId': node['nodeId'], 'status': status or observation(), 'reports': reports or []}, 'Bearer ' + node['token'])
+    def sync(self, node, reports=None, status=None, **extra):
+        node.setdefault('instanceId', str(uuid.uuid4()))
+        return self.call('sync', {'nodeId': node['nodeId'], 'instanceId': node['instanceId'], 'status': status or observation(), 'reports': reports or [], **extra}, 'Bearer ' + node['token'])
 
     def job(self, node, action='backup', snap=None, parameters=None):
         body = {'nodeId': node['nodeId'], 'action': action}
@@ -112,7 +113,7 @@ class DomainCase(unittest.TestCase):
         enrollment = self.call('enrollment', {}, node['nodeId'])
         replacement = self.call('enroll_agent', {'code': enrollment['code'], 'hostname': 'replacement', 'version': '0.1.0'})
         self.assertEqual(replacement['nodeId'], node['nodeId'])
-        self.error('agent_unauthorized', 'sync', {'nodeId': node['nodeId'], 'status': observation(), 'reports': []}, 'Bearer ' + node['token'])
+        self.error('agent_unauthorized', 'sync', {'nodeId': node['nodeId'], 'instanceId': node['instanceId'], 'status': observation(), 'reports': []}, 'Bearer ' + node['token'])
         self.sync(replacement)
         self.job(replacement)
         self.error('node_busy', 'enrollment', {}, node['nodeId'])
@@ -185,21 +186,23 @@ class DomainCase(unittest.TestCase):
         self.assertNotIn('job', self.sync(b))
         active = self.sync(a)['job']
         forged = {'id': first['id'], 'nonce': active['nonce'], 'status': 'succeeded', 'result': {'snapshot': SNAP}}
-        self.error('job_report_forbidden', 'sync', {'nodeId': b['nodeId'], 'status': observation(), 'reports': [forged]}, 'Bearer ' + b['token'])
+        self.error('job_report_forbidden', 'sync', {'nodeId': b['nodeId'], 'instanceId': b['instanceId'], 'status': observation(), 'reports': [forged]}, 'Bearer ' + b['token'])
         self.assertNotIn('job', self.sync(b))
         self.sync(a, [forged])
         self.assertEqual(self.sync(b)['job']['id'], second['id'])
 
-    def test_wrong_nonce_and_before_dispatch_cannot_report(self):
+    def test_queued_receipt_quarantines_and_wrong_nonce_is_refused(self):
         node = self.add()
         queued, _ = self.job(node)
         with self.control.connect() as db:
             nonce = db.execute('SELECT nonce FROM jobs').fetchone()[0]
         report = {'id': queued['id'], 'nonce': nonce, 'status': 'running'}
-        self.error('job_not_dispatched', 'sync', {'nodeId': node['nodeId'], 'status': observation(), 'reports': [report]}, 'Bearer ' + node['token'])
+        response = self.sync(node, [report])
+        self.assertIn(queued['id'], response['discarded'])
+        self.assertNotIn('job', response)
         self.sync(node)
         report['nonce'] = 'incorrect'
-        self.error('job_report_forbidden', 'sync', {'nodeId': node['nodeId'], 'status': observation(), 'reports': [report]}, 'Bearer ' + node['token'])
+        self.error('job_report_forbidden', 'sync', {'nodeId': node['nodeId'], 'instanceId': node['instanceId'], 'status': observation(), 'reports': [report]}, 'Bearer ' + node['token'])
 
     def test_disconnected_unknown_holds_global_lock_until_reconciled(self):
         a, b = self.add(), self.add('recovery', 'B')
@@ -233,7 +236,9 @@ class DomainCase(unittest.TestCase):
         self.sync(node, [done, {'id': queued['id'], 'nonce': job['nonce'], 'status': 'running'}])
         self.assertEqual(self.call('overview')['jobs'][0]['status'], 'succeeded')
         done['status'] = 'failed'
-        self.error('terminal_job_conflict', 'sync', {'nodeId': node['nodeId'], 'status': observation(), 'reports': [done]}, 'Bearer ' + node['token'])
+        response = self.sync(node, [done])
+        self.assertIn(queued['id'], response['discarded'])
+        self.assertEqual(self.call('overview')['jobs'][0]['status'], 'succeeded')
 
     def test_setup_requires_same_snapshot_and_successful_schedule(self):
         a, b = self.add(), self.add('recovery', 'B')
@@ -281,7 +286,7 @@ class DomainCase(unittest.TestCase):
         result = self.call('cancel_job', job['id'], {})
         self.assertEqual(result['job']['error'], 'cancelled_before_dispatch')
         self.assertEqual(self.call('revoke_node', node['nodeId'], {}), {'revoked': True})
-        self.error('agent_unauthorized', 'sync', {'nodeId': node['nodeId'], 'status': observation(), 'reports': []}, 'Bearer ' + node['token'])
+        self.error('agent_unauthorized', 'sync', {'nodeId': node['nodeId'], 'instanceId': node['instanceId'], 'status': observation(), 'reports': []}, 'Bearer ' + node['token'])
         self.assertTrue(self.call('overview')['nodes'][0]['revoked'])
         replacement_code = self.call('enrollment', {}, node['nodeId'])
         self.assertIn('--replace-enrollment', replacement_code['command'])
@@ -444,9 +449,137 @@ class DomainCase(unittest.TestCase):
         self.job(node)
         assigned = self.sync(node)['job']
         bad = {'id': assigned['id'], 'nonce': '\u00e9' * 43, 'status': 'running'}
-        self.error('job_report_forbidden', 'sync', {'nodeId': node['nodeId'], 'status': observation(), 'reports': [bad]}, 'Bearer ' + node['token'])
+        self.error('job_report_forbidden', 'sync', {'nodeId': node['nodeId'], 'instanceId': node['instanceId'], 'status': observation(), 'reports': [bad]}, 'Bearer ' + node['token'])
         self.error('invalid_request', 'login', {'password': '\ud800abc'}, 'test-client')
         self.error('invalid_request', 'enrollment', {'name': '\ud800abc', 'role': 'recovery'})
+
+    def test_initial_password_deleted_only_after_successful_change(self):
+        path = Path(self.temp.name) / 'admin-password'
+        initial = path.read_text().strip()
+        self.call('login', {'password': initial}, 'test')
+        self.assertTrue(path.is_file())
+        self.error('password_unchanged', 'change_password', {'currentPassword': initial, 'newPassword': initial})
+        self.assertTrue(path.is_file())
+        self.call('change_password', {'currentPassword': initial, 'newPassword': 'a-new-password-for-recovery-123'})
+        self.assertFalse(path.exists())
+        self.control = Control(self.temp.name, 'https://control.example.test')
+        self.assertFalse(path.exists())
+        result, _ = self.call('login', {'password': 'a-new-password-for-recovery-123'}, 'test')
+        self.assertFalse(result['needsPasswordChange'])
+
+    def test_origin_rejects_unit_injection_and_invalid_hosts_before_writing(self):
+        path = Path(self.temp.name) / 'rejected-origin'
+        invalid = ['https://example.test\nExecStartPre=/bin/false', 'https://é.example', 'https://example.test\x00', 'https://bad..example', 'https://-bad.example', 'https://example.test:0', 'https://example.test:99999', 'https://example.test:notaport', 'https://example.test:', 'https://example.test;bad', 'https://[fe80::1%eth0]']
+        for origin in invalid:
+            with self.subTest(origin=origin):
+                with self.assertRaises(ValueError):
+                    Control(path, origin)
+                self.assertFalse(path.exists())
+        for index, origin in enumerate(['https://example.test', 'https://127.0.0.1:8443', 'https://[2001:db8::1]:8443']):
+            Control(Path(self.temp.name) / str(index), origin)
+
+    def test_incarnation_is_required_and_prevents_dispatched_replay(self):
+        node = self.add()
+        self.error('invalid_request', 'sync', {'nodeId': node['nodeId'], 'status': observation(), 'reports': []}, 'Bearer ' + node['token'])
+        self.error('invalid_instance', 'sync', {'nodeId': node['nodeId'], 'instanceId': 'invalid', 'status': observation(), 'reports': []}, 'Bearer ' + node['token'])
+        self.job(node)
+        assigned = self.sync(node)['job']
+        replacement = {**node, 'instanceId': str(uuid.uuid4())}
+        self.assertNotIn('job', self.sync(replacement))
+        job = self.call('overview')['jobs'][0]
+        self.assertEqual((job['status'], job['error']), ('outcome_unknown', 'agent_instance_changed'))
+        self.control = Control(self.temp.name, 'https://control.example.test')
+        self.assertNotIn('job', self.sync(replacement))
+        self.call('reconcile_job', assigned['id'], {})
+        inspection = self.sync(replacement)['job']
+        self.assertTrue(inspection['reconcile'])
+        self.assertEqual(inspection['nonce'], assigned['nonce'])
+        self.sync(replacement, [{'id': assigned['id'], 'nonce': assigned['nonce'], 'status': 'succeeded', 'result': {'snapshot': SNAP}}])
+        self.assertEqual(self.call('overview')['jobs'][0]['status'], 'succeeded')
+
+    def test_incarnation_change_invalidates_older_queued_work(self):
+        node = self.add()
+        queued, _ = self.job(node)
+        replacement = {**node, 'instanceId': str(uuid.uuid4())}
+        self.assertNotIn('job', self.sync(replacement))
+        job = self.call('overview')['jobs'][0]
+        self.assertEqual((job['status'], job['error']), ('failed', 'agent_instance_changed'))
+        self.assertEqual(job['id'], queued['id'])
+
+    def test_missing_catalog_orphan_can_be_inspected_without_job_authority(self):
+        node = self.add()
+        orphan = {'id': str(uuid.uuid4()), 'nonce': 'n' * 43, 'status': 'outcome_unknown'}
+        self.sync(node, [orphan])
+        result = self.call('inspect_orphan', node['nodeId'], orphan['id'], {})
+        self.assertTrue(result['inspectionRequested'])
+        response = self.sync(node, [orphan])
+        self.assertIn(orphan['id'], response['inspectOrphans'])
+        self.assertNotIn(orphan['id'], response['inspectionNonces'])
+        self.assertNotIn('job', response)
+        self.sync(node, [{**orphan, 'status': 'failed', 'inspected': True}])
+        self.assertEqual(self.call('overview')['jobs'], [])
+        self.assertEqual(self.call('overview')['orphanReports'][0]['status'], 'failed')
+        self.error('orphan_already_resolved', 'inspect_orphan', node['nodeId'], orphan['id'], {})
+
+    def test_known_queued_wrongstate_requires_inspection_and_never_replays(self):
+        node = self.add()
+        queued, _ = self.job(node)
+        with self.control.connect() as db:
+            nonce = db.execute('SELECT nonce FROM jobs WHERE id=?', (queued['id'],)).fetchone()[0]
+        receipt = {'id': queued['id'], 'nonce': nonce, 'status': 'succeeded', 'result': {'snapshot': SNAP}}
+        self.assertNotIn('job', self.sync(node, [receipt]))
+        self.assertTrue(self.call('overview')['nodes'][0]['connected'])
+        self.assertEqual(self.call('overview')['jobs'][0]['error'], 'catalog_delivery_state_lost')
+        self.call('inspect_orphan', node['nodeId'], queued['id'], {})
+        duplicate = self.sync(node, [receipt])
+        self.assertEqual(duplicate['inspectionNonces'][queued['id']], nonce)
+        self.assertEqual(self.call('overview')['jobs'][0]['status'], 'outcome_unknown')
+        self.sync(node, [{**receipt, 'status': 'failed', 'inspected': True}])
+        job = self.call('overview')['jobs'][0]
+        self.assertEqual((job['status'], job['error']), ('failed', 'catalog_delivery_state_lost'))
+        self.assertNotIn('result', job)
+        self.assertNotIn('job', self.sync(node, [receipt]))
+
+    def test_conflicting_terminal_inspection_preserves_catalog_truth(self):
+        node = self.add()
+        queued, _ = self.job(node)
+        with self.control.connect() as db:
+            nonce = db.execute('SELECT nonce FROM jobs WHERE id=?', (queued['id'],)).fetchone()[0]
+        self.call('cancel_job', queued['id'], {})
+        receipt = {'id': queued['id'], 'nonce': nonce, 'status': 'succeeded', 'result': {'snapshot': SNAP}}
+        self.assertNotIn('job', self.sync(node, [receipt]))
+        self.assertEqual(self.call('overview')['jobs'][0]['error'], 'cancelled_before_dispatch')
+        self.call('inspect_orphan', node['nodeId'], queued['id'], {})
+        self.sync(node, [{**receipt, 'inspected': True}])
+        job = self.call('overview')['jobs'][0]
+        self.assertEqual((job['status'], job['error']), ('failed', 'cancelled_before_dispatch'))
+        self.assertEqual(self.call('overview')['orphanReports'][0]['status'], 'succeeded')
+
+    def test_orphan_bound_and_overflow_need_owner_requested_host_inspection(self):
+        node = self.add()
+        receipts = [{'id': str(uuid.uuid4()), 'nonce': 'n' * 43, 'status': 'outcome_unknown'} for _ in range(400)]
+        for start in range(0, 400, 100):
+            self.sync(node, receipts[start:start + 100])
+        with self.control.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM orphan_reports WHERE node_id=?', (node['nodeId'],)).fetchone()[0], 128)
+        self.assertTrue(self.call('overview')['nodes'][0]['orphanOverflow'])
+        self.sync(node, orphanInventoryComplete=True)
+        self.assertTrue(self.call('overview')['nodes'][0]['orphanOverflow'])
+        retained = self.call('overview')['orphanReports']
+        for item in retained[:20]:
+            self.call('inspect_orphan', node['nodeId'], item['id'], {})
+        response = self.sync(node)
+        self.assertLessEqual(len(response['inspectOrphans']), 16)
+        self.assertTrue(response['inspectOverflow'])
+        next_response = self.sync(node)
+        self.assertEqual(len(set(response['inspectOrphans']) | set(next_response['inspectOrphans'])), 20)
+        for start in range(0, len(retained), 100):
+            terminal = [{'id': item['id'], 'nonce': 'n' * 43, 'status': 'failed', 'inspected': True} for item in retained[start:start + 100]]
+            self.sync(node, terminal, orphanInventoryComplete=True)
+        self.assertFalse(self.call('overview')['nodes'][0]['orphanOverflow'])
+        self.assertFalse(any(item['status'] in {'running', 'outcome_unknown'} for item in self.call('overview')['orphanReports']))
+        self.job(node)
+        self.assertIn('job', self.sync(node))
 
 
 class HTTPCase(unittest.TestCase):
@@ -557,6 +690,23 @@ class HTTPCase(unittest.TestCase):
         self.assertEqual((status, body['error']), (400, 'invalid_request'))
         status, _, body = self.request('POST', '/ops/api/password', {'currentPassword': 'a-new-test-password-123456', 'newPassword': '\ud800' + 'a' * 32})
         self.assertEqual((status, body['error']), (400, 'invalid_password'))
+
+    def test_orphan_inspection_http_requires_owner_csrf_and_returns_no_mutation(self):
+        self.login()
+        _, _, enrollment = self.request('POST', '/ops/api/enrollments', {'name': 'A', 'role': 'primary'})
+        _, _, node = self.request('POST', '/ops/agent/enroll', {'code': enrollment['code'], 'hostname': 'test', 'version': '0.1.0'})
+        identity = str(uuid.uuid4())
+        receipt = {'id': str(uuid.uuid4()), 'nonce': 'n' * 43, 'status': 'outcome_unknown'}
+        body = {'nodeId': node['nodeId'], 'instanceId': identity, 'status': observation(), 'reports': [receipt]}
+        status, _, _ = self.request('POST', '/ops/agent/sync', body, {'Authorization': 'Bearer ' + node['token']})
+        self.assertEqual(status, 200)
+        path = '/ops/api/nodes/' + node['nodeId'] + '/orphans/' + receipt['id'] + '/reconcile'
+        self.assertEqual(self.request('POST', path, {}, {'X-CSRF-Token': ''})[0], 403)
+        self.assertEqual(self.request('POST', path, {})[2], {'inspectionRequested': True, 'id': receipt['id']})
+        status, _, result = self.request('POST', '/ops/agent/sync', body, {'Authorization': 'Bearer ' + node['token']})
+        self.assertEqual(status, 200)
+        self.assertEqual(result['inspectOrphans'], [receipt['id']])
+        self.assertNotIn('job', result)
 
     def test_login_origin_and_rate_limit(self):
         self.assertEqual(self.request('POST', '/ops/api/login', {'password': 'wrong'}, {'Origin': 'https://evil.example'})[0], 403)

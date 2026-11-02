@@ -32,6 +32,7 @@ INTERVALS = {"15min", "hourly", "daily"}
 TERMINAL = {"succeeded", "failed"}
 ACTIVE = {"dispatched", "running", "outcome_unknown"}
 CHECKS = {"database-values", "file-sha256", "application-http", "app-version", "image-ids", "fresh-mounts", "runtime-restrictions"}
+ORPHAN_LIMIT = 128
 HEX64 = re.compile(r"[a-f0-9]{64}\Z")
 SLUG = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 STAGES = {"queued", "starting", "checking", "capturing", "transferring", "restoring", "validating", "cleanup", "applying_schedule", "completed", "interrupted", "waiting"}
@@ -230,11 +231,31 @@ class ManagedConnection(sqlite3.Connection):
 
 class Control:
     def __init__(self, data_dir, origin, *, allow_http=False, web_dir=None):
+        if not isinstance(origin, str) or not origin.isascii() or any(ord(char) <= 32 or ord(char) == 127 for char in origin):
+            raise ValueError("A plain ASCII HTTPS origin is required")
         parsed = urlsplit(origin)
         local = parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"} and allow_http
         if (parsed.scheme != "https" and not local) or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
             raise ValueError("A valid HTTPS origin is required")
-        self.origin = origin.rstrip("/")
+        host = parsed.hostname
+        if not host or "%" in host:
+            raise ValueError("A valid DNS or IP host is required")
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            labels = host.rstrip(".").split(".")
+            if len(host) > 253 or any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label) for label in labels):
+                raise ValueError("A valid DNS or IP host is required") from None
+        if parsed.port is not None and not 1 <= parsed.port <= 65535:
+            raise ValueError("A valid origin port is required")
+        expected = "[" + host + "]" if ":" in host else host
+        if parsed.port is not None:
+            expected += ":" + str(parsed.port)
+        if parsed.netloc.lower() != expected.lower():
+            raise ValueError("A plain origin host and port are required")
+        default_port = 443 if parsed.scheme == "https" else 80
+        canonical_host = "[" + host.lower() + "]" if ":" in host else host.lower()
+        self.origin = parsed.scheme + "://" + canonical_host + (":" + str(parsed.port) if parsed.port is not None and parsed.port != default_port else "")
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.data_dir.chmod(0o700)
@@ -258,11 +279,14 @@ class Control:
                 INSERT OR IGNORE INTO job_requests SELECT idempotency_key,plan_id,id FROM jobs;
                 CREATE TABLE IF NOT EXISTS orphan_reports(node_id TEXT NOT NULL,job_id TEXT NOT NULL,status TEXT NOT NULL,first_seen REAL NOT NULL,last_seen REAL NOT NULL,PRIMARY KEY(node_id,job_id));
             """)
-            for table, column, declaration in (("jobs", "reconcile_requested", "INTEGER NOT NULL DEFAULT 0"), ("nodes", "revoked", "INTEGER NOT NULL DEFAULT 0")):
+            for table, column, declaration in (("jobs", "reconcile_requested", "INTEGER NOT NULL DEFAULT 0"), ("jobs", "dispatch_instance", "TEXT"), ("nodes", "revoked", "INTEGER NOT NULL DEFAULT 0"), ("nodes", "instance_id", "TEXT"), ("nodes", "orphan_overflow", "INTEGER NOT NULL DEFAULT 0"), ("nodes", "overflow_inspect_requested", "INTEGER NOT NULL DEFAULT 0"), ("orphan_reports", "inspect_requested", "INTEGER NOT NULL DEFAULT 0"), ("orphan_reports", "reason", "TEXT NOT NULL DEFAULT 'missing_catalog'"), ("orphan_reports", "last_inspected_sent", "REAL NOT NULL DEFAULT 0")):
                 if column not in {entry[1] for entry in db.execute("PRAGMA table_info(" + table + ")")}:
                     db.execute("ALTER TABLE " + table + " ADD COLUMN " + column + " " + declaration)
             db.commit()
             db.execute("BEGIN IMMEDIATE")
+            for row in db.execute("SELECT node_id,COUNT(*) AS amount FROM orphan_reports GROUP BY node_id HAVING COUNT(*)>?", (ORPHAN_LIMIT,)).fetchall():
+                while db.execute("SELECT COUNT(*) FROM orphan_reports WHERE node_id=?", (row["node_id"],)).fetchone()[0] > ORPHAN_LIMIT:
+                    self.evict_orphan(db, row["node_id"])
             if self.setting(db, "password") is None:
                 password_file = self.data_dir / "admin-password"
                 if password_file.exists():
@@ -366,7 +390,13 @@ class Control:
         self.set_setting(db, "needsPasswordChange", False)
         db.execute("DELETE FROM sessions")
         token, session = self.new_session(db)
-        return self.session_info(db, session), token
+        result = self.session_info(db, session)
+        db.commit()
+        try:
+            (self.data_dir / "admin-password").unlink(missing_ok=True)
+        except OSError:
+            raise APIError(500, "password_changed_cleanup_failed") from None
+        return result, token
 
     def node(self, db, node_id):
         if not is_uuid(node_id):
@@ -387,7 +417,44 @@ class Control:
 
     @staticmethod
     def node_has_unsettled(db, node_id):
-        return db.execute("SELECT 1 FROM jobs WHERE node_id=? AND status IN ('queued','dispatched','running','outcome_unknown')", (node_id,)).fetchone() or db.execute("SELECT 1 FROM orphan_reports WHERE node_id=? AND status IN ('running','outcome_unknown')", (node_id,)).fetchone()
+        return db.execute("SELECT 1 FROM jobs WHERE node_id=? AND status IN ('queued','dispatched','running','outcome_unknown')", (node_id,)).fetchone() or db.execute("SELECT 1 FROM orphan_reports WHERE node_id=? AND status IN ('running','outcome_unknown')", (node_id,)).fetchone() or db.execute("SELECT 1 FROM nodes WHERE id=? AND orphan_overflow=1", (node_id,)).fetchone()
+
+    @staticmethod
+    def evict_orphan(db, node_id):
+        row = db.execute("SELECT * FROM orphan_reports WHERE node_id=? ORDER BY CASE WHEN status IN ('succeeded','failed') THEN 0 ELSE 1 END,inspect_requested,first_seen LIMIT 1", (node_id,)).fetchone()
+        if row is None:
+            return
+        if row["status"] not in TERMINAL:
+            # The bounded catalog cannot forget uncertainty: keep a node-wide
+            # latch until an owner-requested, authenticated host scan settles it.
+            db.execute("UPDATE nodes SET orphan_overflow=1,overflow_inspect_requested=MAX(overflow_inspect_requested,?) WHERE id=?", (row["inspect_requested"], node_id))
+        db.execute("DELETE FROM orphan_reports WHERE node_id=? AND job_id=?", (node_id, row["job_id"]))
+
+    def record_orphan(self, db, node_id, job_id, state, reason="missing_catalog", *, force=False):
+        row = db.execute("SELECT * FROM orphan_reports WHERE node_id=? AND job_id=?", (node_id, job_id)).fetchone()
+        if row is not None:
+            if row["status"] in TERMINAL and not force:
+                state = row["status"]
+            db.execute("UPDATE orphan_reports SET status=?,reason=?,last_seen=?,inspect_requested=CASE WHEN ? IN ('succeeded','failed') THEN 0 ELSE inspect_requested END WHERE node_id=? AND job_id=?", (state, reason if force else row["reason"], time.time(), state, node_id, job_id))
+        else:
+            while db.execute("SELECT COUNT(*) FROM orphan_reports WHERE node_id=?", (node_id,)).fetchone()[0] >= ORPHAN_LIMIT:
+                self.evict_orphan(db, node_id)
+            db.execute("INSERT INTO orphan_reports(node_id,job_id,status,first_seen,last_seen,reason) VALUES(?,?,?,?,?,?)", (node_id, job_id, state, time.time(), time.time(), reason))
+        return db.execute("SELECT * FROM orphan_reports WHERE node_id=? AND job_id=?", (node_id, job_id)).fetchone()
+
+    def inspect_orphan(self, db, node_id, job_id, body):
+        fields(body)
+        node = self.node(db, node_id)
+        if not self.connected(node):
+            raise APIError(409, "node_stale")
+        row = db.execute("SELECT * FROM orphan_reports WHERE node_id=? AND job_id=?", (node_id, job_id)).fetchone()
+        if row is None:
+            raise APIError(404, "orphan_not_found")
+        if row["status"] in TERMINAL:
+            raise APIError(409, "orphan_already_resolved")
+        db.execute("UPDATE orphan_reports SET inspect_requested=1 WHERE node_id=? AND job_id=?", (node_id, job_id))
+        db.execute("UPDATE nodes SET overflow_inspect_requested=1 WHERE id=? AND orphan_overflow=1", (node_id,))
+        return {"inspectionRequested": True, "id": job_id}
 
     def enrollment(self, db, body, node_id=None):
         if node_id is None:
@@ -491,6 +558,10 @@ class Control:
             raise APIError(404, "job_not_found")
         if job["status"] != "outcome_unknown":
             raise APIError(409, "job_not_unknown")
+        if job["error"] == "catalog_delivery_state_lost":
+            self.record_orphan(db, job["node_id"], identity, "outcome_unknown", "catalog_delivery_state_lost", force=True)
+            self.inspect_orphan(db, job["node_id"], identity, body)
+            return {"job": self.public_job(job), "inspectionRequested": True}
         db.execute("UPDATE jobs SET reconcile_requested=1 WHERE id=?", (identity,))
         return {"job": self.public_job(db.execute("SELECT * FROM jobs WHERE id=?", (identity,)).fetchone())}
 
@@ -513,7 +584,7 @@ class Control:
         for row in db.execute("SELECT * FROM nodes ORDER BY name,id"):
             status = json.loads(row["status"])
             current = self.connected(row)
-            nodes.append({"id": row["id"], "name": row["name"], "role": row["role"], "revoked": bool(row["revoked"]), "lastSeen": stamp(row["last_seen"]) if row["last_seen"] is not None else None, "connected": current, "status": status})
+            nodes.append({"id": row["id"], "name": row["name"], "role": row["role"], "revoked": bool(row["revoked"]), "orphanOverflow": bool(row["orphan_overflow"]), "overflowInspectionRequested": bool(row["overflow_inspect_requested"]), "lastSeen": stamp(row["last_seen"]) if row["last_seen"] is not None else None, "connected": current, "status": status})
             if not current:
                 alerts.append({"severity": "warning", "code": "node_offline", "nodeId": row["id"]})
             elif not self.status_fresh(status):
@@ -528,11 +599,13 @@ class Control:
         jobs = [self.public_job(row) for row in db.execute("SELECT * FROM jobs ORDER BY created DESC LIMIT 100")]
         if any(job["status"] == "outcome_unknown" for job in jobs):
             alerts.append({"severity": "error", "code": "operation_outcome_unknown"})
-        orphans = [{"nodeId": row["node_id"], "id": row["job_id"], "status": row["status"], "firstSeen": stamp(row["first_seen"]), "lastSeen": stamp(row["last_seen"])} for row in db.execute("SELECT * FROM orphan_reports ORDER BY last_seen DESC LIMIT 100")]
+        orphans = [{"nodeId": row["node_id"], "id": row["job_id"], "status": row["status"], "inspectionRequested": bool(row["inspect_requested"]), "reason": row["reason"], "firstSeen": stamp(row["first_seen"]), "lastSeen": stamp(row["last_seen"])} for row in db.execute("SELECT * FROM orphan_reports ORDER BY CASE WHEN status IN ('succeeded','failed') THEN 1 ELSE 0 END,last_seen DESC LIMIT 512")]
         for row in db.execute("SELECT DISTINCT node_id FROM orphan_reports WHERE status IN ('running','outcome_unknown')"):
             alerts.append({"severity": "error", "code": "catalog_receipt_orphaned", "nodeId": row["node_id"]})
+        for row in db.execute("SELECT id FROM nodes WHERE orphan_overflow=1"):
+            alerts.append({"severity": "error", "code": "catalog_orphan_capacity", "nodeId": row["id"]})
         enrollments = [{"id": row["id"], "name": row["name"], "role": row["role"], "expiresAt": stamp(row["expires"]), "status": "used" if row["used"] == 1 else "cancelled" if row["used"] == 2 else "expired" if row["expires"] < time.time() else "pending"} for row in db.execute("SELECT * FROM enrollments ORDER BY expires DESC LIMIT 100")]
-        return {"version": VERSION, "revision": self.revision(db), "setup": self.setting(db, "setup"), "nodes": nodes, "enrollments": enrollments, "jobs": jobs, "orphanReports": orphans, "capabilities": {"automaticFailover": False}, "alerts": alerts}
+        return {"version": VERSION, "revision": self.revision(db), "setup": self.setting(db, "setup"), "nodes": nodes, "enrollments": enrollments, "jobs": jobs, "orphanReports": orphans, "orphanReportLimit": ORPHAN_LIMIT, "capabilities": {"automaticFailover": False}, "alerts": alerts}
 
     def settings(self, db, body):
         fields(body, ("profile", "backupInterval", "expectedRevision"))
@@ -640,46 +713,70 @@ class Control:
         return result
 
     def sync(self, db, body, bearer):
-        fields(body, ("nodeId", "status", "reports"))
+        fields(body, ("nodeId", "instanceId", "status", "reports"), ("orphanInventoryComplete",))
+        if not is_uuid(body["instanceId"]):
+            raise APIError(400, "invalid_instance")
+        if "orphanInventoryComplete" in body and not isinstance(body["orphanInventoryComplete"], bool):
+            raise APIError(400, "invalid_request")
         if not is_uuid(body["nodeId"]) or not isinstance(bearer, str) or not re.fullmatch(r"Bearer [A-Za-z0-9_-]{32,128}", bearer):
             raise APIError(401, "agent_unauthorized")
         token = bearer[7:]
         node = db.execute("SELECT * FROM nodes WHERE id=? AND token_hash=? AND revoked=0", (body["nodeId"], digest(token))).fetchone()
         if node is None:
             raise APIError(401, "agent_unauthorized")
+        instance = body["instanceId"]
         status = sanitize_status(body["status"])
         reports = body["reports"]
         if not isinstance(reports, list) or len(reports) > 100:
             raise APIError(400, "invalid_reports")
-        acknowledged = []
-        discarded = []
+        if node["instance_id"] != instance:
+            # A new durable agent incarnation cannot inherit permission to replay
+            # work remembered as queued or in flight by an older catalog.
+            db.execute("UPDATE jobs SET status='failed',stage='completed',ended=?,error='agent_instance_changed' WHERE node_id=? AND status='queued'", (time.time(), node["id"]))
+            db.execute("UPDATE jobs SET status='outcome_unknown',stage='interrupted',error='agent_instance_changed' WHERE node_id=? AND status IN ('dispatched','running')", (node["id"],))
+        db.execute("UPDATE jobs SET status='outcome_unknown',stage='interrupted',error='agent_instance_changed' WHERE node_id=? AND status IN ('dispatched','running') AND (dispatch_instance IS NULL OR dispatch_instance<>?)", (node["id"], instance))
+        acknowledged, discarded = [], []
         for report in reports:
-            fields(report, ("id", "nonce", "status"), ("stage", "result", "error"))
+            fields(report, ("id", "nonce", "status"), ("stage", "result", "error", "inspected"))
             if not is_uuid(report["id"]) or not isinstance(report["nonce"], str) or not isinstance(report["status"], str) or report["status"] not in {"running", "succeeded", "failed", "outcome_unknown"}:
+                raise APIError(400, "invalid_report")
+            if "inspected" in report and not isinstance(report["inspected"], bool):
                 raise APIError(400, "invalid_report")
             if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", report["nonce"]):
                 raise APIError(403, "job_report_forbidden")
             job = db.execute("SELECT * FROM jobs WHERE id=?", (report["id"],)).fetchone()
             if job is None:
-                # A restored catalog may predate a durable receipt. Keep its scope
-                # separate from known jobs and never accept its result as proof.
-                prior = db.execute("SELECT * FROM orphan_reports WHERE node_id=? AND job_id=?", (node["id"], report["id"])).fetchone()
-                state = report["status"]
-                if prior is not None and prior["status"] in TERMINAL:
-                    state = prior["status"]
-                db.execute("INSERT INTO orphan_reports VALUES(?,?,?,?,?) ON CONFLICT(node_id,job_id) DO UPDATE SET status=excluded.status,last_seen=excluded.last_seen", (node["id"], report["id"], state, time.time(), time.time()))
+                self.record_orphan(db, node["id"], report["id"], report["status"])
                 acknowledged.append(report["id"])
                 discarded.append(report["id"])
                 continue
             if job["node_id"] != node["id"] or not opaque_matches(report["nonce"], job["nonce"]):
                 raise APIError(403, "job_report_forbidden")
-            if job["status"] == "queued":
-                raise APIError(409, "job_not_dispatched")
+            orphan = db.execute("SELECT * FROM orphan_reports WHERE node_id=? AND job_id=?", (node["id"], job["id"])).fetchone()
             new_state = report["status"]
+            rejected_success = job["status"] == "failed" and job["error"] == "result_unverified" and new_state == "succeeded"
+            wrong_terminal = job["status"] in TERMINAL and ((new_state != job["status"] and not rejected_success) or (job["status"] == "failed" and job["started"] is None))
+            catalog_lost = job["status"] == "queued" or job["error"] == "catalog_delivery_state_lost"
+            quarantined = orphan is not None and orphan["reason"] != "missing_catalog"
+            if catalog_lost or quarantined or wrong_terminal:
+                reason = "catalog_delivery_state_lost" if catalog_lost else "terminal_job_conflict"
+                if orphan is not None and orphan["status"] in TERMINAL and orphan["reason"] != "missing_catalog":
+                    acknowledged.append(job["id"])
+                    discarded.append(job["id"])
+                    continue
+                inspection_pending = (orphan is not None and orphan["inspect_requested"]) or node["overflow_inspect_requested"]
+                if catalog_lost and job["status"] != "outcome_unknown":
+                    db.execute("UPDATE jobs SET status='outcome_unknown',stage='interrupted',error='catalog_delivery_state_lost',reconcile_requested=0 WHERE id=?", (job["id"],))
+                if report.get("inspected") is True and inspection_pending and new_state in TERMINAL:
+                    self.record_orphan(db, node["id"], job["id"], new_state, reason, force=True)
+                    if catalog_lost:
+                        db.execute("UPDATE jobs SET status='failed',ended=?,stage='completed',error='catalog_delivery_state_lost',reconcile_requested=0 WHERE id=?", (time.time(), job["id"]))
+                else:
+                    self.record_orphan(db, node["id"], job["id"], "outcome_unknown", reason, force=True)
+                acknowledged.append(job["id"])
+                discarded.append(job["id"])
+                continue
             if job["status"] in TERMINAL:
-                rejected_success = job["status"] == "failed" and job["error"] == "result_unverified" and new_state == "succeeded"
-                if new_state not in {job["status"], "running"} and not rejected_success:
-                    raise APIError(409, "terminal_job_conflict")
                 acknowledged.append(job["id"])
                 continue
             result, error = None, None
@@ -693,21 +790,20 @@ class Control:
             candidate = report.get("stage")
             stage = candidate if isinstance(candidate, str) and candidate in STAGES else ("completed" if new_state in TERMINAL else "starting")
             if job["status"] == "outcome_unknown" and new_state == "running":
-                # A running receipt cannot establish the outcome of an interrupted process.
                 continue
             reconcile_requested = job["reconcile_requested"] if new_state == "outcome_unknown" else 0
             db.execute("UPDATE jobs SET status=?,started=COALESCE(started,?),ended=?,stage=?,result=?,error=?,reconcile_requested=? WHERE id=?", (new_state, time.time(), time.time() if new_state in TERMINAL else None, stage, canonical(result) if result is not None else None, error, reconcile_requested, job["id"]))
             acknowledged.append(job["id"])
-        db.execute("UPDATE nodes SET last_seen=?,status=? WHERE id=?", (time.time(), canonical(status), node["id"]))
+        if body.get("orphanInventoryComplete") is True and node["overflow_inspect_requested"]:
+            db.execute("UPDATE nodes SET orphan_overflow=0,overflow_inspect_requested=0 WHERE id=?", (node["id"],))
+        db.execute("UPDATE nodes SET last_seen=?,status=?,instance_id=? WHERE id=?", (time.time(), canonical(status), instance, node["id"]))
         self.mark_lost(db)
         self.expire_queued(db)
         active = db.execute("SELECT * FROM jobs WHERE status IN ('dispatched','running','outcome_unknown') ORDER BY created LIMIT 1").fetchone()
         if active is not None and active["node_id"] == node["id"] and active["status"] == "running" and active["id"] not in {report["id"] for report in reports}:
-            # Running receipts are sent on every heartbeat. Missing local state is
-            # uncertainty to reconcile, never permission to repeat the mutation.
             db.execute("UPDATE jobs SET status='outcome_unknown',stage='interrupted',error='agent_receipt_missing' WHERE id=?", (active["id"],))
             active = db.execute("SELECT * FROM jobs WHERE id=?", (active["id"],)).fetchone()
-        orphan_pending = db.execute("SELECT 1 FROM orphan_reports WHERE status IN ('running','outcome_unknown')").fetchone() is not None
+        orphan_pending = db.execute("SELECT 1 FROM orphan_reports WHERE status IN ('running','outcome_unknown')").fetchone() is not None or db.execute("SELECT 1 FROM nodes WHERE orphan_overflow=1").fetchone() is not None
         if active is None and not orphan_pending:
             waiting = db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY created,id LIMIT 1").fetchone()
             if waiting is not None and waiting["node_id"] == node["id"] and self.status_fresh(status) and status.get("supported"):
@@ -718,22 +814,30 @@ class Control:
                     db.execute("UPDATE jobs SET status='failed',stage='completed',ended=?,error='snapshot_unavailable' WHERE id=?", (time.time(), waiting["id"]))
                     waiting = None
             if waiting is not None and waiting["node_id"] == node["id"] and self.status_fresh(status) and status.get("supported"):
-                db.execute("UPDATE jobs SET status='dispatched',stage='starting' WHERE id=?", (waiting["id"],))
+                db.execute("UPDATE jobs SET status='dispatched',stage='starting',dispatch_instance=? WHERE id=?", (instance, waiting["id"]))
                 active = db.execute("SELECT * FROM jobs WHERE id=?", (waiting["id"],)).fetchone()
         response = {"acknowledged": acknowledged}
         if discarded:
             response["discarded"] = discarded
-        if active is not None and active["node_id"] == node["id"] and ((active["status"] == "dispatched" and not orphan_pending) or active["reconcile_requested"]):
+        if active is not None and active["node_id"] == node["id"] and ((active["status"] == "dispatched" and active["dispatch_instance"] == instance and not orphan_pending) or active["reconcile_requested"]):
             response["job"] = {"id": active["id"], "nonce": active["nonce"], "action": active["action"], "snapshotId": active["snapshot"], "parameters": json.loads(active["parameters"])}
             if active["reconcile_requested"]:
                 response["job"]["reconcile"] = True
+        inspections = db.execute("SELECT orphan_reports.job_id,jobs.nonce FROM orphan_reports LEFT JOIN jobs ON jobs.id=orphan_reports.job_id AND jobs.node_id=orphan_reports.node_id WHERE orphan_reports.node_id=? AND orphan_reports.inspect_requested=1 AND orphan_reports.status IN ('running','outcome_unknown') ORDER BY last_inspected_sent,first_seen LIMIT 16", (node["id"],)).fetchall()
+        if inspections:
+            response["inspectOrphans"] = [item["job_id"] for item in inspections]
+            response["inspectionNonces"] = {item["job_id"]: item["nonce"] for item in inspections if item["nonce"] is not None}
+            db.executemany("UPDATE orphan_reports SET last_inspected_sent=? WHERE node_id=? AND job_id=?", [(time.time(), node["id"], item["job_id"]) for item in inspections])
+        node_now = db.execute("SELECT * FROM nodes WHERE id=?", (node["id"],)).fetchone()
+        if node_now["orphan_overflow"] and node_now["overflow_inspect_requested"]:
+            response["inspectOverflow"] = True
         return response
 
     def complete_setup(self, db, body):
         fields(body)
         if db.execute("SELECT 1 FROM jobs WHERE status IN ('queued','dispatched','running','outcome_unknown')").fetchone():
             raise APIError(409, "operation_in_progress")
-        if db.execute("SELECT 1 FROM orphan_reports WHERE status IN ('running','outcome_unknown')").fetchone():
+        if db.execute("SELECT 1 FROM orphan_reports WHERE status IN ('running','outcome_unknown')").fetchone() or db.execute("SELECT 1 FROM nodes WHERE orphan_overflow=1").fetchone():
             raise APIError(409, "catalog_receipt_orphaned")
         nodes = db.execute("SELECT * FROM nodes").fetchall()
         primaries = [node for node in nodes if node["role"] == "primary"]
@@ -892,6 +996,9 @@ def handler_for(control):
                     cancelled = re.fullmatch(r"/api/enrollments/([a-f0-9-]{36})/cancel", route)
                     if cancelled:
                         return self.reply_after_commit(db, 200, control.cancel_enrollment(db, cancelled[1], body))
+                    orphan_inspection = re.fullmatch(r"/api/nodes/([a-f0-9-]{36})/orphans/([a-f0-9-]{36})/reconcile", route)
+                    if orphan_inspection:
+                        return self.reply_after_commit(db, 200, control.inspect_orphan(db, orphan_inspection[1], orphan_inspection[2], body))
                     job_action = re.fullmatch(r"/api/jobs/([a-f0-9-]{36})/(reconcile|cancel)", route)
                     if job_action:
                         function = control.reconcile_job if job_action[2] == "reconcile" else control.cancel_job
