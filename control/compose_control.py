@@ -575,6 +575,8 @@ class ComposeControl:
             params = {'storageId':sid,'envelope':supplied[b['nodeId']],'mode':b['mode'],'metadata':json.loads(challenge['metadata'])}
             if storage['repository_id']:
                 params['expectedRepositoryId'] = storage['repository_id']
+            elif parent is None and b['mode'] == 'attach':
+                params['discoverRepositoryId'] = True
             job = self.queue(db,b['nodeId'],'storage-configure',params,parent=parent,group=challenge['id'],intent={'metadata':json.loads(challenge['metadata']),'requestId':challenge['id'],'bindingGeneration':b['bindingGeneration']})
             # All recipients depend on the creator, rather than each other.
             parent = parent or job['id']
