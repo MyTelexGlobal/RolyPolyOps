@@ -226,6 +226,52 @@ class ComposeCatalogTests(unittest.TestCase):
         pipeline=self.call(self.c.compose.connect_storage,storage,body)
         return storage,challenge,body,pipeline
 
+    def test_first_dispatch_rebinds_queued_discovery_to_newly_known_catalog(self):
+        storage,_=self.metadata()
+        first=self.call(self.c.compose.prepare,storage,self.mutate(sourceNodeId=self.source['nodeId'],nodeIds=[self.source['nodeId']],mode='attach'))
+        self.call(self.c.compose.connect_storage,storage,self.mutate(requestId=first['requestId'],bindings=self.envelopes(first)))
+        wire=self.sync(self.source)['job']
+        second=self.call(self.c.compose.prepare,storage,self.mutate(sourceNodeId=self.target['nodeId'],nodeIds=[self.target['nodeId']],mode='attach'))
+        queued=self.call(self.c.compose.connect_storage,storage,self.mutate(requestId=second['requestId'],bindings=self.envelopes(second)))['jobs'][0]
+        with self.c.connect() as db:
+            self.assertTrue(json.loads(db.execute('SELECT parameters FROM jobs WHERE id=?',(queued['id'],)).fetchone()[0])['discoverRepositoryId'])
+        self.success(self.source,wire,{'storageId':storage,'repositoryId':REPO,'connected':True,'bindingGeneration':first['bindings'][0]['bindingGeneration'],'requestId':first['requestId']})
+        sent=self.sync(self.target)['job']
+        self.assertEqual(sent['id'],queued['id'])
+        self.assertEqual(sent['parameters']['expectedRepositoryId'],REPO)
+        self.assertNotIn('discoverRepositoryId',sent['parameters'])
+        with self.c.connect() as db:
+            row=db.execute('SELECT j.parameters,p.parameters AS planned FROM jobs j JOIN plans p ON p.id=j.plan_id WHERE j.id=?',(sent['id'],)).fetchone()
+            self.assertEqual(json.loads(row['parameters']),sent['parameters'])
+            self.assertEqual(json.loads(row['planned']),sent['parameters'])
+        self.c=Control(self.temp.name,'https://control.example.test')
+        self.assertEqual(self.sync(self.target)['job'],sent)
+
+    def test_repository_learning_never_rewrites_dispatched_discovery_wire(self):
+        storage,challenge,_,_=self.unknown_attach()
+        sent=self.sync(self.source)['job']
+        with self.c.connect() as db:
+            db.execute('UPDATE compose_storages SET repository_id=? WHERE id=?',(REPO,storage))
+            row=db.execute('SELECT * FROM jobs WHERE id=?',(sent['id'],)).fetchone()
+            original=row['parameters']
+            self.c.compose.dispatch(db,row)
+            self.assertEqual(db.execute('SELECT parameters FROM jobs WHERE id=?',(sent['id'],)).fetchone()[0],original)
+        self.assertEqual(self.sync(self.source)['job'],sent)
+        self.assertNotIn('expectedRepositoryId',sent['parameters'])
+
+    def test_recipient_refuses_catalog_and_parent_identity_conflict(self):
+        storage,challenge,_,pipeline=self.unknown_attach()
+        wire=self.sync(self.source)['job']
+        self.success(self.source,wire,{'storageId':storage,'repositoryId':REPO,'connected':True,'bindingGeneration':challenge['bindings'][0]['bindingGeneration'],'requestId':challenge['requestId']})
+        with self.c.connect() as db:
+            db.execute('UPDATE compose_storages SET repository_id=? WHERE id=?',('e'*64,storage))
+        self.assertNotIn('job',self.sync(self.target))
+        with self.c.connect() as db:
+            child=db.execute('SELECT * FROM jobs WHERE id=?',(pipeline['jobs'][1]['id'],)).fetchone()
+            self.assertEqual((child['status'],child['error']),('failed','repository_identity_conflict'))
+            self.assertNotIn('"envelope":',child['parameters'])
+            self.assertEqual(db.execute('SELECT repository_id FROM compose_storages WHERE id=?',(storage,)).fetchone()[0],'e'*64)
+
     def test_initial_attach_discovers_only_parent_then_persists_recipient_identity(self):
         storage,challenge,body,pipeline=self.unknown_attach()
         with self.c.connect() as db:
