@@ -14,7 +14,7 @@ The baseline is rootful Linux Docker 29+, Compose 2.24+ with canonical JSON, Pyt
 
 A fresh installation opens the own-service overview. The optional bundled demo does not produce a setup fault merely because it is absent. Existing selected demo installations retain their recovery and settings views.
 
-Open **Own services**, then **Connect your service**. Select the source, its discovered Compose project and a different recovery host. Review the support reasons, image and mount summary, estimated size and fingerprint. An offline or stale host is not ready. Compose readiness is independent of the bundled demo package.
+Open **Own services**, then **Connect your service**. Select the source, its discovered Compose project and a different recovery host. Review the support reasons, image and mount summary, image size estimate and fingerprint. The estimate excludes application data; the host checks staging space against measured data before stopping the source. An offline or stale host is not ready. Compose readiness is independent of the bundled demo package.
 
 Confirm that only this project's containers write its data. The host detects overlapping running-container mounts, but cannot reliably discover native host writers. Capture briefly stops all project containers, stages their persistent data and exact local images, resumes the previously running set, then uploads the encrypted stage. This is a cold capture, without a zero-downtime guarantee.
 
