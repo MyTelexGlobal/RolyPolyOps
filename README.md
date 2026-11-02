@@ -2,12 +2,13 @@
 
 [Русский](README.ru.md)
 
+**0.2 candidate:** adds the own-Compose service and REST/S3 storage wizard. See the [service guide](docs/en/compose-services.md) for workflow, supported scope and limitations. Live two-host acceptance and release approval remain separate requirements. The demo sections below describe the preserved 0.1 mode.
+
 Service backups, verified recovery, and safe failover between independent hosting providers.
 
-**Status: 0.1.0, an early control release for the bundled PostgreSQL/Compose demo package.
-The bilingual panel supports host enrollment, setup, encrypted captures, verified restore
-exercises, retained isolated previews and schedules. General application support and
-automatic failover are not available.**
+**Status: 0.2 implementation candidate. The existing 0.1 demo remains available.
+Own Compose services use the new guided storage/import/backup/restore/schedule flow.
+Automatic failover is unavailable; live acceptance is required before release.**
 
 Start with the [control guide](control/README.md). The separately versioned
 [recovery lab](demo/README.md) supplies the tested service package and backup mechanism.

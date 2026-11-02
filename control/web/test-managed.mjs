@@ -1,0 +1,116 @@
+// Run: node --test control/web/test-managed.mjs
+// Optional real Chromium UI: PLAYWRIGHT_MODULE=/path/to/playwright/index.mjs node control/web/test-managed.mjs --browser
+import assert from 'node:assert/strict';
+import {webcrypto,randomUUID} from 'node:crypto';
+import {test} from 'node:test';
+import {createServer} from 'node:http';
+import {readFile,mkdir} from 'node:fs/promises';
+import {sealStorage,canonical} from './managed.js';
+const {subtle}=webcrypto;
+const pair=await subtle.generateKey({name:'RSA-OAEP',modulusLength:3072,publicExponent:new Uint8Array([1,0,1]),hash:'SHA-256'},true,['wrapKey','unwrapKey']);
+const der=await subtle.exportKey('spki',pair.publicKey);
+const key={algorithm:'RSA-OAEP-256+A256GCM',publicKey:Buffer.from(der).toString('base64'),id:Buffer.from(await subtle.digest('SHA-256',der)).toString('hex')};
+const secret='SECRET-SENTINEL-<private>&"';
+const ids={source:randomUUID(),target:randomUUID(),storage:randomUUID(),request:randomUUID()};
+const challenge={metadata:{id:ids.storage,name:'Example',kind:'rest',endpoint:'https://storage.example.test/'+ids.storage},requestId:ids.request,expiresAt:new Date(Date.now()+900000).toISOString()};
+const binding={nodeId:ids.source,key,bindingGeneration:1,mode:'create'};
+async function decrypt(envelope,metadata=challenge.metadata) {
+ const aes=await subtle.unwrapKey('raw',Buffer.from(envelope.wrappedKey,'base64'),pair.privateKey,{name:'RSA-OAEP'},{name:'AES-GCM',length:256},false,['decrypt']);
+ const {v,nodeId,keyId,storageId,requestId,bindingGeneration,mode,expiresAt}=envelope;
+ const aad=canonical({v,nodeId,keyId,storageId,requestId,bindingGeneration,mode,expiresAt,purpose:'storage'});
+ const raw=await subtle.decrypt({name:'AES-GCM',iv:Buffer.from(envelope.iv,'base64'),additionalData:new TextEncoder().encode(aad),tagLength:128},aes,Buffer.from(envelope.ciphertext,'base64'));
+ const payload=JSON.parse(new TextDecoder().decode(raw));assert.deepEqual(payload.metadata,metadata);return payload;
+}
+test('RSA3072/OAEP-SHA256 + AES256-GCM exact AAD and payload; fresh envelopes',async()=>{
+ const one=await sealStorage(challenge,binding,secret,{username:'u',password:secret});
+ const two=await sealStorage(challenge,binding,secret,{username:'u',password:secret});
+ assert.equal(Buffer.from(one.wrappedKey,'base64').length,384);assert.equal(Buffer.from(one.iv,'base64').length,12);assert.notEqual(one.iv,two.iv);assert.notEqual(one.wrappedKey,two.wrappedKey);
+ assert.deepEqual(await decrypt(one),{metadata:challenge.metadata,repoPassword:secret,credentials:{username:'u',password:secret},bindingGeneration:1,requestId:ids.request,mode:'create'});
+ assert.equal(JSON.stringify(one).includes(secret),false);
+ for(const binary of ['wrappedKey','iv','ciphertext']){const bytes=Buffer.from(one[binary],'base64');bytes[0]^=1;await assert.rejects(()=>decrypt({...one,[binary]:bytes.toString('base64')}));}
+ for(const field of ['v','nodeId','keyId','storageId','requestId','bindingGeneration','mode','expiresAt'])await assert.rejects(()=>decrypt({...one,[field]:typeof one[field]==='number'?one[field]+1:one[field]+'x'}));
+ await assert.rejects(()=>sealStorage({...challenge,expiresAt:'2000-01-01T00:00:00Z'},binding,secret,{}));
+ await assert.rejects(()=>sealStorage(challenge,{...binding,key:{...key,id:'0'.repeat(64)}},secret,{}));
+});
+
+if(process.argv.includes('--browser')) {
+ const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
+ const repositoryId='a'.repeat(64),snapshot='b'.repeat(64);let outcomes=new Map();let revision=1,storage,service,restores=[],jobs=[],plans=new Map(),requests=[],envelopes=[],failBinding=false,unverified=false,protectedActivation=false,sourceFenced=false,dropConnectReply=false,expireNext=false,legacyMode=false,legacyPreview=null;let replies=new Map();
+ const fixtureProject={id:'ordinary',name:'Ordinary <script>alert(1)</script>',fingerprint:'f'.repeat(64),supported:true,reasons:[],architecture:'linux/amd64',estimatedBytes:2048,services:[{name:'web',imageId:'c'.repeat(64),healthcheck:true,ports:[8080]}],mounts:[{kind:'volume',target:'/data',label:'app-data',readOnly:false}]};
+ function overview(){const now=new Date().toISOString();return {revision,version:'0.2.0',setup:{completed:false,profile:'pair_assisted'},alerts:[],orphanReports:[],jobs,storages:storage?[storage]:[],services:service?[service]:[],restores,nodes:[{id:ids.source,name:'Source',role:'primary'},{id:ids.target,name:'Recovery',role:'recovery'}].map(n=>({...n,connected:true,lastSeen:now,status:{observedAt:now,supported:legacyMode,serviceHealthy:legacyMode,snapshots:legacyMode?[{id:snapshot,time:now}]:[],preview:legacyMode&&n.id===ids.target?legacyPreview:null,compose:{ready:true,key,projects:[fixtureProject,{...fixtureProject,id:'unsafe',name:'Unsafe',supported:false,reasons:['privileged']}],addresses:['203.0.113.10'],services:service?[{serviceId:service.id,state:sourceFenced?'fenced':'running'}]:[]}}}))};}
+ function job(action,nodeId,parameters,result={},error){const j={id:randomUUID(),action,nodeId,serviceId:parameters?.serviceId,storageId:parameters?.storageId,restoreId:parameters?.restoreId,status:action.startsWith('compose-')||action==='storage-configure'?'queued':error?'failed':'succeeded',error,createdAt:new Date().toISOString(),result};outcomes.set(j.id,error?'failed':'succeeded');jobs.push(j);return j;}
+ const server=createServer(async(req,res)=>{try{
+  const url=new URL(req.url,'http://localhost');const path=url.pathname.replace(/^\/ops/,'');
+  let body;if(req.method==='POST'){let raw='';for await(const chunk of req)raw+=chunk;body=JSON.parse(raw);requests.push({path,body});if(path.includes('/connect'))assert(!raw.includes(secret));}
+  let data;const repeatKey=body?.idempotencyKey?path+'/'+body.idempotencyKey:null;if(repeatKey&&replies.has(repeatKey)){assert.deepEqual(body,replies.get(repeatKey).body);res.setHeader('Content-Type','application/json');res.end(JSON.stringify(replies.get(repeatKey).data));return;}
+  if(req.method==='POST'){assert.equal(req.headers['x-csrf-token'],'test-csrf');assert.equal(req.headers.origin,`http://127.0.0.1:${server.address().port}`);}
+  if(path==='/api/session')data={authenticated:true,csrf:'test-csrf',version:'0.2.0'};
+  else if(path==='/api/overview')data=overview();
+  else if(path==='/api/logout')data={};
+  else if(path==='/api/storages'){storage={...body,repositoryId:null,bindings:[]};delete storage.expectedRevision;delete storage.idempotencyKey;data={storage,revision:++revision};}
+  else if(path.endsWith('/prepare')){if(body.mode==='create'){if(storage.kind==='rest')storage.endpoint=storage.endpoint.replace(/\/$/,'')+'/'+storage.id;else storage.prefix=(storage.prefix?storage.prefix+'/':'')+storage.id;}data={metadata:storage,requestId:randomUUID(),expiresAt:new Date(Date.now()+(expireNext?-1000:900000)).toISOString(),bindings:body.nodeIds.map((nodeId,i)=>({nodeId,key,bindingGeneration:1,mode:i?'attach':body.mode})),revision:++revision}; // Metadata must omit catalog-only fields.
+   data.metadata={...storage};delete data.metadata.repositoryId;delete data.metadata.bindings;storage={...data.metadata,repositoryId:null,bindings:[]};challengeForBrowser=data;
+  }
+  else if(path.endsWith('/connect')){for(const b of body.bindings){const payload=await decrypt(b.envelope,challengeForBrowser.metadata);assert.equal(payload.repoPassword,secret);assert.equal(payload.credentials[storage.kind==='rest'?'password':'secretAccessKey'],secret);envelopes.push(b.envelope);}const pipeline=body.bindings.map(b=>job('storage-configure',b.nodeId,{},failBinding?{}:{connected:true,repositoryId},failBinding?'repository_auth_failed':null));if(!failBinding){storage.repositoryId=repositoryId;storage.bindings=body.bindings.map(b=>({nodeId:b.nodeId,state:'connected',repositoryId}));}data={jobs:pipeline,storage,revision:++revision};}
+  else if(path==='/api/services'){service={...body,setupState:'registered',schedule:{},snapshots:[]};delete service.expectedRevision;delete service.idempotencyKey;data={service,job:job('compose-register',body.sourceNodeId,{serviceId:body.id},{registered:true}),revision:++revision};}
+  else if(path==='/api/plans'){const id=randomUUID();plans.set(id,body);data={...body,id,expiresAt:new Date(Date.now()+900000).toISOString()};}
+  else if(path==='/api/jobs'){const plan=plans.get(body.planId);let result={serviceId:service.id};if(plan.action==='compose-backup'){result={...result,snapshot,repositoryId,at:new Date().toISOString()};service.snapshots=[{id:snapshot,time:result.at,serviceId:service.id,repositoryId}];service.latestBackup=result;if(service.setupState==='active_unprotected')service.setupState='restore_required';}if(plan.action==='compose-schedule')service.schedule={enabled:true,interval:plan.parameters.interval};const j=job(plan.action,plan.nodeId,plan.parameters,result);if(plan.action==='compose-restore'){j.result.restoreId=j.id;restores.push({id:j.id,serviceId:service.id,nodeId:plan.nodeId,snapshotId:plan.snapshotId,state:'isolated_ready',checks:['data-hashes','image-identities'],healthScope:unverified?'running-only':'docker',applicationHealthVerified:!unverified,ports:[]});}if(plan.action==='restore-preview')legacyPreview={id:j.id,snapshot,at:new Date().toISOString(),checks:['http']};if(plan.action==='remove-preview')legacyPreview=null;if(plan.action==='compose-remove')restores=restores.filter(r=>r.id!==plan.parameters.restoreId);data={job:j};}
+  else if(path.endsWith('/complete')){assert.equal(body.restoreId,restores.at(-1).id);if(unverified){res.statusCode=409;data={error:'application_health_unverified'};}else{service.setupState='complete';data={completed:true,service};}}
+  else if(path.endsWith('/activate')){assert.equal(body.acceptSnapshotLoss,true);assert.equal(body.allowEgress,true);const r=restores.find(r=>r.id===body.restoreId);r.state='active';r.ports=body.ports;[service.sourceNodeId,service.recoveryNodeId]=[service.recoveryNodeId,service.sourceNodeId];service.setupState=protectedActivation?'restore_required':'active_unprotected';const firstBackup=protectedActivation?{serviceId:service.id,repositoryId,snapshot:'e'.repeat(64),at:new Date().toISOString()}:undefined;if(firstBackup){service.latestBackup=firstBackup;service.snapshots.push({id:firstBackup.snapshot,time:firstBackup.at,serviceId:service.id,repositoryId});}data={activationGroupId:randomUUID(),jobs:[job('compose-stop',ids.source,{serviceId:service.id},{fenced:true}),job('compose-activate',ids.target,{serviceId:service.id},{activated:true,protected:protectedActivation,firstBackup})],revision:++revision};}
+  else if(path.endsWith('/resume-source')){assert.equal(body.activationGroupId,service.activationGroupId);assert.equal(jobs.find(j=>j.id===service.activation.sourceStopJobId).status,'succeeded');assert.equal(jobs.find(j=>j.id===service.activation.targetJobId).status,'failed');assert(sourceFenced);sourceFenced=false;service.setupState='backup_required';data={job:job('compose-resume',service.sourceNodeId,{serviceId:service.id},{resumed:true}),revision:++revision};}
+  else if(path.startsWith('/api/jobs/')){const j=jobs.find(j=>j.id===path.split('/').at(-1));j.status=outcomes.get(j.id);data={job:j};}
+  else {const name=path==='/'?'index.html':path.slice(1);const raw=await readFile(new URL(name,import.meta.url));res.setHeader('Content-Type',name.endsWith('.js')?'application/javascript':name.endsWith('.css')?'text/css':'text/html');res.end(raw);return;}
+  if(repeatKey&&res.statusCode<400)replies.set(repeatKey,{body,data:structuredClone(data)});if(path.endsWith('/connect')&&dropConnectReply){dropConnectReply=false;res.statusCode=503;res.setHeader('Content-Type','application/json');res.end(JSON.stringify({error:'network'}));return;}
+  res.setHeader('Content-Type','application/json');res.end(JSON.stringify(data));
+ }catch(e){res.statusCode=500;res.end(JSON.stringify({error:'fixture_assertion_failed'}));serverErrors.push(String(e.stack));}});
+ let challengeForBrowser,serverErrors=[];
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ console.log('Browser fixture listening');let browser;try{browser=await chromium.launch({headless:true,timeout:20000,...(process.env.CHROMIUM_EXECUTABLE?{executablePath:process.env.CHROMIUM_EXECUTABLE}:{})});console.log('Chromium started');const page=await browser.newPage();let errors=[];page.setDefaultTimeout(10000);page.on('pageerror',e=>errors.push(String(e)));
+ if(process.env.UI_SCREENSHOT_DIR)await mkdir(process.env.UI_SCREENSHOT_DIR,{recursive:true});
+  await page.goto(`http://127.0.0.1:${server.address().port}/ops/#services`);console.log('Own services loaded');
+  await page.getByRole('button',{name:'Подключить свой сервис',exact:true}).click();
+  await page.getByLabel('Исходный сервер',{exact:true}).selectOption(ids.source);
+  await page.getByLabel('Отдельный сервер восстановления').selectOption(ids.target);
+  await page.getByLabel('Обнаруженная группа Compose').selectOption('unsafe');
+  assert.equal(await page.getByRole('button',{name:'Подготовить защищенное подключение'}).isDisabled(),true);
+  await page.getByLabel('Обнаруженная группа Compose').selectOption('ordinary');
+  await page.getByLabel('Название сервиса',{exact:true}).fill('My application');
+  await page.getByLabel('Подтверждаю:').check();
+  await page.getByLabel('Название хранилища',{exact:true}).fill('Repository');
+  await page.getByLabel('Адрес HTTPS').fill('https://storage.example.test/base');
+  await page.getByLabel('Имя пользователя REST').fill('tester');await page.getByLabel('Пароль REST',{exact:true}).fill(secret);await page.getByLabel('Независимый пароль шифрования restic').fill(secret);
+  await page.getByRole('button',{name:'Подготовить защищенное подключение'}).click();
+  await page.getByRole('button',{name:'Подтвердить подключение',exact:true}).waitFor();
+  assert((await page.locator('.managed-code').textContent()).includes(storage.id));
+  dropConnectReply=true;await page.getByRole('button',{name:'Подтвердить подключение',exact:true}).click();await page.getByText(/\[network\]/).first().waitFor();await page.getByRole('button',{name:'Подтвердить подключение',exact:true}).click();assert.deepEqual(requests.filter(r=>r.path.endsWith('/connect')).map(r=>r.body)[0],requests.filter(r=>r.path.endsWith('/connect')).map(r=>r.body)[1]);
+  await page.getByRole('button',{name:'Продолжить настройку',exact:true}).waitFor();await page.getByRole('button',{name:'Продолжить настройку',exact:true}).click();
+  await page.getByText('Настройка подтверждена сервером.',{exact:true}).waitFor();
+  assert.equal(service.setupState,'complete');assert.equal(restores.length,1);assert.equal(envelopes.length,2);
+  assert(!JSON.stringify(await page.evaluate(()=>({...localStorage}))).includes(secret));assert(!JSON.stringify(await page.evaluate(()=>({...sessionStorage}))).includes(secret));assert.deepEqual(await page.evaluate(async()=>await indexedDB.databases()),[]);assert(!(await page.content()).includes(secret));assert.equal(await page.locator('script').count(),1);
+  await page.getByRole('button',{name:'Закрыть',exact:true}).click();
+  await page.getByRole('button',{name:'Перенести сюда'}).click();
+  await page.getByLabel('web:8080',{exact:true}).check();await page.getByLabel('Разрешаю исходящие подключения новой копии').check();await page.getByLabel('Принимаю потерю изменений после выбранного снимка').check();await page.getByRole('button',{name:'Подтвердить',exact:true}).click();
+  await page.locator('[data-setup-state="active_unprotected"]').waitFor();assert.equal(service.sourceNodeId,ids.target);
+  // Recover protection using persisted service identities after an incomplete move.
+  await page.reload();await page.getByRole('button',{name:'Создать копию',exact:true}).click();await page.getByRole('button',{name:'Подтвердить',exact:true}).click();await page.getByRole('button',{name:'Завершить проверку защиты',exact:true}).waitFor();await page.getByRole('button',{name:'Завершить проверку защиты',exact:true}).click();await page.getByRole('button',{name:'Подтвердить',exact:true}).click();await page.locator('[data-setup-state="complete"]').waitFor();
+  // A protected activation automatically checks the exact new-source firstBackup on its new recovery host.
+  protectedActivation=true;await page.getByRole('button',{name:'Перенести сюда',exact:true}).last().click();await page.getByLabel('Разрешаю исходящие подключения новой копии').check();await page.getByLabel('Принимаю потерю изменений после выбранного снимка').check();await page.getByRole('button',{name:'Подтвердить',exact:true}).click();await page.locator('#dialog').waitFor({state:'hidden'});await page.locator('[data-setup-state="complete"]').waitFor();assert.equal(service.sourceNodeId,ids.source);assert.equal(restores.at(-1).snapshotId,'e'.repeat(64));assert.equal(restores.at(-1).nodeId,ids.target);
+  // Reloaded finish validation does not activate again, and missing health cannot complete.
+  unverified=true;service.setupState='unverified';await page.reload();await page.getByRole('button',{name:'Завершить проверку защиты',exact:true}).click();await page.getByRole('button',{name:'Подтвердить',exact:true}).click();await page.getByText(/application_health_unverified/).waitFor();assert.equal(service.setupState,'unverified');await page.getByRole('button',{name:'Отмена',exact:true}).click();unverified=false;service.setupState='complete';
+  // Both languages and mobile shell; preserve all original routes.
+  for(const width of [1440,390]){await page.setViewportSize({width,height:900});for(const route of ['services','storages','dashboard','restore','nodes','history','settings']){await page.goto(`http://127.0.0.1:${server.address().port}/ops/#${route}`);await page.locator('.main').waitFor();await page.waitForTimeout(60);assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),`overflow ${route} ${width}`);if(process.env.UI_SCREENSHOT_DIR&&route==='services')await page.screenshot({path:process.env.UI_SCREENSHOT_DIR+`/own-services-${width}-ru.png`,fullPage:true});}}
+  const english=page.getByRole('button',{name:'Switch to English',exact:true});if(await english.count())await english.click();await page.goto(`http://127.0.0.1:${server.address().port}/ops/#services`);await page.getByRole('heading',{name:'Compose services',exact:true}).waitFor();for(const width of [1440,390]){await page.setViewportSize({width,height:900});if(process.env.UI_SCREENSHOT_DIR)await page.screenshot({path:process.env.UI_SCREENSHOT_DIR+`/own-services-${width}-en.png`,fullPage:true});}
+  // S3 form and bad-credential failure may never mark a connection successful.
+  await page.getByRole('button',{name:'Connect your service',exact:true}).click();await page.getByLabel('Source host',{exact:true}).selectOption(ids.source);await page.getByLabel('Separate recovery host').selectOption(ids.target);await page.getByLabel('Discovered Compose project').selectOption('ordinary');await page.getByLabel('I confirm').check();await page.getByLabel('Storage',{exact:true}).selectOption('');await page.getByLabel('Storage name',{exact:true}).fill('S3');await page.getByLabel('Storage kind').selectOption('s3');await page.getByLabel('HTTPS endpoint').fill('https://s3.example.test');await page.getByLabel('Bucket',{exact:true}).fill('test-bucket');await page.getByLabel('S3 access key').fill('access');await page.getByLabel('S3 secret key',{exact:true}).fill(secret);await page.getByLabel('Independent restic encryption password').fill(secret);await page.getByRole('button',{name:'Prepare secure connection'}).click();failBinding=true;await page.getByRole('button',{name:'Confirm connection',exact:true}).click();await page.getByText(/repository_auth_failed/).first().waitFor();assert.equal(await page.getByRole('button',{name:'Continue setup',exact:true}).count(),0);
+  const beforeExpiry=requests.filter(r=>r.path.endsWith('/connect')).length;expireNext=true;await page.getByRole('button',{name:'Start fresh challenge'}).click();await page.getByRole('button',{name:'Prepare secure connection'}).click();await page.getByRole('button',{name:'Confirm connection',exact:true}).click();await page.getByText(/challenge_expired/).first().waitFor();assert.equal(requests.filter(r=>r.path.endsWith('/connect')).length,beforeExpiry);expireNext=false;
+  // Persistent safe activation scope: unknown result hides resume, known failure plus fresh isolation permits it.
+  service.setupState='attention_required';sourceFenced=true;const isolated=restores.find(r=>r.state==='isolated_ready'&&r.nodeId===service.recoveryNodeId);const stop=job('compose-stop',service.sourceNodeId,{serviceId:service.id},{fenced:true});stop.status='succeeded';const target=job('compose-activate',service.recoveryNodeId,{serviceId:service.id,restoreId:isolated.id},{},'activation_failed');target.status='outcome_unknown';service.activationGroupId=randomUUID();service.activation={groupId:service.activationGroupId,sourceStopJobId:stop.id,targetJobId:target.id,status:'outcome_unknown'};await page.reload();assert.equal(await page.getByRole('button',{name:'Resume source',exact:true}).count(),0);target.status='failed';service.activation.status='failed';await page.reload();await page.getByRole('button',{name:'Resume source',exact:true}).click();await page.getByRole('button',{name:'Confirm',exact:true}).click();await page.locator('#dialog').waitFor({state:'hidden'});assert.equal(requests.filter(r=>r.path.endsWith('/resume-source')).length,1);assert.equal(await page.getByRole('button',{name:'Resume source',exact:true}).count(),0);
+  // Original demo actions remain wired to their original action names and plan/job flow.
+  legacyMode=true;
+  for(const [route,label,action] of [['dashboard','Back up now','backup'],['restore','Verify integrity','verify'],['restore','Run restore check','restore-check'],['restore','Keep a restored copy','restore-preview'],['restore','Remove this copy','remove-preview'],['settings','Apply schedule','set-schedule']]){
+    await page.goto(`http://127.0.0.1:${server.address().port}/ops/#${route}`);await page.reload();await page.getByRole('button',{name:label,exact:true}).click();await page.getByRole('button',{name:'Start operation',exact:true}).click();await page.locator('#dialog').waitFor({state:'hidden'});assert(jobs.some(j=>j.action===action),action);
+  }
+  assert.equal(serverErrors.length,0,serverErrors.join('\n'));assert.equal(errors.length,0,errors.join('\n'));
+  console.log('PASS real Chromium synthetic transport: REST wizard, exact scoped restore, schedule/complete, controlled move with unprotected state, S3 bad credentials, unsupported discovery, RU/EN, 390/1440px, legacy actions/routes, identical uncertain retry, expiry, persistent guarded resume, no secret browser storage, no HTML execution.');
+ }finally{await browser?.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+}

@@ -2,11 +2,13 @@
 
 [Русский](README.ru.md)
 
+**0.2 candidate:** adds the own-Compose service and REST/S3 storage wizard. See the [service guide](../docs/en/compose-services.md) for workflow, supported scope and limitations. Live two-host acceptance and release approval remain separate requirements. The demo sections below describe the preserved 0.1 mode.
+
 ## 1 Available functions
 
 The control panel manages the bundled PostgreSQL/Compose recovery package: connect hosts, view observed health and recovery points, create an encrypted backup, verify a repository, test an exact recovery point, retain a separate preview and remove that preview, and apply a backup schedule. The setup wizard completes only after a successful backup and a matching restore check. Russian and English interfaces are included.
 
-General application discovery, arbitrary databases, automatic DNS switching and provider fencing are not implemented. Connecting an unsupported host shows that state and does not make its applications protected.
+The own-service view discovers supported ordinary Compose projects; see the guide above. Arbitrary database correctness, automatic DNS switching and provider fencing are not implemented. Connecting an unsupported host shows that state and does not make its applications protected.
 
 ## 2 Installation
 
@@ -34,7 +36,7 @@ Choose Add server in the wizard, name the host and select its role. The primary 
 
 Captured `COMPOSE_*` and `DOCKER_*` execution controls are rejected before recovery changes files or loads images. Accepted application settings are replaced with a closed environment for the bundled package.
 
-The host needs the initialized [supported recovery package](../demo/README.md), Docker/Compose, restic and its private repository configuration. This release recognizes that package; it does not configure unknown applications or silently overwrite existing deployments. On the supplied two-host lab these prerequisites are already configured.
+For the legacy demo, the host needs the initialized [supported recovery package](../demo/README.md), Docker/Compose, restic and its private repository configuration. This release recognizes that package; it does not configure unknown applications or silently overwrite existing deployments. On the supplied two-host lab these prerequisites are already configured.
 
 Agents use certificate-validated outgoing HTTPS. No agent port, SSH private key upload or Docker socket access from the control process is required. Tokens live in root-only host configuration; the catalog stores their digests. Reconnect rotates a token. Revocation is available after active operations have been resolved.
 

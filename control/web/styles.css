@@ -1413,3 +1413,28 @@ progress.storage-bar::-moz-progress-bar {
   margin-top: 7px;
   max-width: 460px;
 }
+
+/* Managed Compose views inherit the original panel shell. */
+.managed-form, .managed-service { margin-block: 1.25rem; }
+.managed-form fieldset { border: 0; padding: 0; min-width: 0; }
+.managed-form legend { font-weight: 700; margin-block: 1rem; }
+.managed-form input, .managed-form select { max-width: 100%; }
+.managed-check { display: flex; align-items: flex-start; gap: .7rem; margin-block: 1rem; line-height: 1.5; }
+.managed-check input { flex: 0 0 1.15rem; width: 1.15rem; margin-top: .2rem; }
+.managed-preflight, .managed-restore { padding: 1rem; background: var(--surface-alt, #f4f6ef); border-radius: .7rem; margin-block: .8rem; }
+.managed-row { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: .75rem; border-bottom: 1px solid #dde3d6; padding-block: .8rem; }
+.managed-code { white-space: pre-wrap; overflow-wrap: anywhere; padding: 1rem; background: #f3f5ef; border-radius: .6rem; }
+.managed-service p, .managed-form p, .managed-restore p, .mono { overflow-wrap: anywhere; }
+.managed-port { display: grid; gap: 1rem; grid-template-columns: 1fr 1fr 1fr; }
+.managed-service .actions { align-items: flex-end; }
+.managed-service .actions .field { margin: 0; }
+dialog .dialog-content { padding: 1.5rem; }
+@media (max-width: 600px) {
+  .managed-port { grid-template-columns: 1fr; gap: .2rem; }
+  .managed-row { align-items: stretch; }
+  .managed-row .btn, .managed-form .actions .btn { width: 100%; }
+}
+.managed-service, .managed-form, .managed-row > div { min-width: 0; }
+.managed-form details, .managed-service details { margin-block: 1rem; }
+.managed-form summary, .managed-service summary { cursor: pointer; font-weight: 600; }
+.managed-service > .btn { margin-block: .8rem; }

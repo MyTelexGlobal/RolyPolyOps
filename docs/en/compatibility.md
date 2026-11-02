@@ -2,9 +2,11 @@
 
 [Русский](../ru/compatibility.md)
 
+**0.2 candidate:** adds the own-Compose service and REST/S3 storage wizard. See the [service guide](../../docs/en/compose-services.md) for workflow, supported scope and limitations. Live two-host acceptance and release approval remain separate requirements. The demo sections below describe the preserved 0.1 mode.
+
 ## 1 Available repository materials
 
-Available now: product specification in English and Russian, initial JSON Schema for service profiles, illustrative manifests, and [executable recovery lab tools](../../demo/README.md) for the bundled read-only PostgreSQL demo. The lab captures and restores that application only. The [initial control panel](../../control/README.md) enrolls hosts and manages this package. General application enrollment, replication, automatic DNS changes, and provider shutdown are not implemented.
+Available now: product specification in English and Russian, initial JSON Schema for service profiles, illustrative manifests, and [executable recovery lab tools](../../demo/README.md) for the bundled read-only PostgreSQL demo. The lab captures and restores that application only. The [initial control panel](../../control/README.md) enrolls hosts and manages this package. The 0.2 candidate adds enrollment of supported ordinary Compose projects through the own-service wizard. Replication, automatic DNS changes and provider shutdown are not implemented.
 
 ## 2 Target environment
 
