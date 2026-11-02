@@ -2,6 +2,12 @@
 
 [Русский](../ru/architecture.md)
 
+## Current implementation
+
+Version 0.1 provides the authenticated panel, host enrollment and the bundled demo recovery package. The 0.2 candidate adds self-contained Docker Compose discovery, REST/S3 connection, encrypted service bundles, exact isolated restore, independent schedules and a source-online controlled move. Its runtime acceptance is separate from this architecture description. Read the [Compose guide](compose-services.md) and [current behavior contract](../../control/contracts/compose-v2.md).
+
+Sections 2–20 describe target profiles and integrations. PostgreSQL replication, Patroni/etcd, host certificates, provider fencing, automatic DNS changes and automatic failover are future work. The current Compose contract defines implemented API states and limits.
+
 ## 1 Scope
 
 RolyPolyOps is intended to restore an entire service onto a compatible site and to switch service delivery to a prepared standby when policy permits. A service includes its database, persistent files, configuration, application version, required secrets, and external dependencies.
@@ -141,7 +147,7 @@ Immutable storage, versioning, and append-only modes require tested compatibilit
 
 The panel presents service location, independent copy count, last complete point, replica lag, last restore drill, and violated policies. Users act on services and recovery points rather than low-level engine commands.
 
-The proposed API exposes service state, protection state, operation planning, execution, status, and cancellation. Mutations carry expected revisions and idempotency keys. A changed plan invalidates prior confirmation. The [initial control API](../../control/API.md) implements a limited subset for the bundled demo package; the full service contract remains a target.
+The proposed API exposes service state, protection state, operation planning, execution, status, and cancellation. Mutations carry expected revisions and idempotency keys. A changed plan invalidates prior confirmation. The [shared control API](../../control/API.md) covers identity, the queue and the original demo profile. The [Compose contract](../../control/contracts/compose-v2.md) defines the 0.2 candidate service/storage API. The replication and automatic switching profiles in this document remain targets.
 
 ## 20 Observability and recovery objectives
 
@@ -151,6 +157,6 @@ RPO and RTO targets are policy inputs. Actual available-data age and measured re
 
 ## 21 Compatibility and current limits
 
-Version 0.1.0 adds an authenticated bilingual control panel, outgoing host services, a persistent operation queue, connection/setup wizard, and backup/restore controls for the bundled demo package. The lab remains separately versioned. General service discovery, replication, provider fencing, automatic DNS changes and cluster operation are not implemented. A valid manifest is not evidence that a target can safely run it. See the [control guide](../../control/README.md).
+Version 0.1.0 adds an authenticated bilingual control panel, outgoing host services, a persistent operation queue, connection/setup wizard, and backup/restore controls for the bundled demo package. The lab remains separately versioned. The 0.2 candidate implements bounded Compose discovery and backup/restore through its own wizard. Replication, provider fencing, automatic DNS changes and cluster operation remain unimplemented. A valid manifest is not evidence that a target can safely run it. See the [control guide](../../control/README.md).
 
 Actual application versions, volumes, provider APIs, network latency, disk behavior, key access, and failure domains must be established for each supported deployment. One-site failure is the baseline cluster scenario; arbitrary simultaneous failures are outside that claim. See [compatibility](compatibility.md) and [technical references](references.md).
