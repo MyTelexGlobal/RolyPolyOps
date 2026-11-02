@@ -70,5 +70,92 @@ class InstallationAuthorityTests(unittest.TestCase):
                 install.checked_url(value, {"", "/"})
 
 
+class GenericPrerequisiteTests(unittest.TestCase):
+    def setUp(self):
+        self.commands=[]
+
+    def probe(self,args):
+        if args[:2] == ['docker','version']:
+            return '29.1.3'
+        if args[:2] == ['docker','info']:
+            return '["name=seccomp", "name=cgroupns"]'
+        if args[:3] == ['docker','compose','version']:
+            return '2.40.0'
+        if args[:2] == ['restic','version']:
+            return 'restic 0.18.0 compiled with go'
+        if len(args)>2 and args[1]=='-c':
+            return '46.0.5 6.0.3'
+        if args[:3] == ['docker','image','inspect']:
+            return '[]'
+        raise AssertionError(args)
+
+    def run_prerequisites(self,probe=None,which=None):
+        with patch.object(install.shutil,'which',side_effect=which or (lambda name:'/usr/bin/'+name)), patch.object(install,'output',side_effect=probe or self.probe), patch.object(install,'command',side_effect=lambda args:self.commands.append(args)), patch.object(install,'supported_packages',return_value=True):
+            return install.agent_prerequisites()
+
+    def test_working_runtime_never_installs_upgrades_or_restarts_docker(self):
+        self.assertEqual(self.run_prerequisites(),install.sys.executable)
+        self.assertEqual(self.commands,[])
+
+    def test_old_existing_docker_is_rejected_without_replacement(self):
+        def probe(args):
+            return '28.0.0' if args[:2]==['docker','version'] else self.probe(args)
+        with self.assertRaisesRegex(ValueError,'existing installation preserved'):
+            self.run_prerequisites(probe)
+        self.assertEqual(self.commands,[])
+
+    def test_rootless_daemon_is_rejected(self):
+        def probe(args):
+            return '["name=rootless"]' if args[:2]==['docker','info'] else self.probe(args)
+        with self.assertRaisesRegex(ValueError,'rootful Docker'):
+            self.run_prerequisites(probe)
+        self.assertEqual(self.commands,[])
+
+    def test_absent_restic_installs_only_missing_package(self):
+        self.run_prerequisites(which=lambda name:None if name=='restic' else '/usr/bin/'+name)
+        self.assertEqual(self.commands,[['apt-get','update'],['apt-get','install','-y','--no-upgrade','--no-install-recommends','restic']])
+
+    def test_missing_crypto_bootstraps_supported_library_before_agent_start(self):
+        probes=[]
+        def probe(args):
+            if len(args)>2 and args[1]=='-c':
+                probes.append(args[0])
+                if len(probes)<4:
+                    raise install.subprocess.CalledProcessError(1,args)
+                return '46.0.5 6.0.3'
+            return self.probe(args)
+        with patch.object(Path,'is_symlink',return_value=False):
+            python=self.run_prerequisites(probe)
+        self.assertEqual(python,str(install.RUNTIME/'bin/python3'))
+        self.assertIn([python,'-m','pip','install','--only-binary=:all:','cryptography==46.0.5','PyYAML==6.0.3'],self.commands)
+        self.assertFalse(any('docker.io' in arg for args in self.commands for arg in args))
+
+    def test_pinned_helper_pull_only_when_absent(self):
+        def probe(args):
+            if args[:3]==['docker','image','inspect']:
+                raise install.subprocess.CalledProcessError(1,args)
+            return self.probe(args)
+        self.run_prerequisites(probe)
+        self.assertEqual(self.commands,[['docker','pull',install.HELPER]])
+        self.assertIn('@sha256:',install.HELPER)
+
+    def test_copy_installs_all_generic_modules_and_web_assets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base=Path(directory)
+            source=base/'source';source.mkdir()
+            modules=('controller.py','agent.py','install.py','compose_control.py','compose_engine.py','compose_storage.py','compose_seal.py','compose_helper.py')
+            for name in modules:
+                (source/name).write_text('# '+name)
+            (source/'web').mkdir()
+            (source/'web'/'wizard.js').write_text('sealed form')
+            destination=base/'installed'/'control'
+            with patch.object(install,'__file__',str(source/'install.py')),patch.object(install,'DEST',destination):
+                install.copy_source()
+            for name in modules:
+                self.assertEqual((destination/name).read_text(),'# '+name)
+                self.assertEqual((destination/name).stat().st_mode & 0o777,0o644)
+            self.assertEqual((destination/'web'/'wizard.js').read_text(),'sealed form')
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -729,6 +729,22 @@ class HTTPCase(unittest.TestCase):
         self.assertEqual(self.request('POST', '/ops/api/enrollments', body, {'Origin': 'https://evil.example'})[2]['error'], 'origin_forbidden')
         self.assertEqual(self.request('POST', '/ops/api/enrollments', body)[0], 200)
 
+    def test_compose_routes_inherit_login_password_origin_and_csrf_gates(self):
+        sid=str(uuid.uuid4())
+        routes=['/ops/api/storages','/ops/api/storages/'+sid+'/prepare','/ops/api/storages/'+sid+'/connect','/ops/api/services','/ops/api/services/'+sid+'/complete','/ops/api/services/'+sid+'/activate','/ops/api/services/'+sid+'/resume-source']
+        for route in routes:
+            self.assertEqual(self.request('POST',route,{})[0],401)
+        self.login(change=False)
+        for route in routes:
+            self.assertEqual(self.request('POST',route,{})[2]['error'],'password_change_required')
+        initial=(Path(self.temp.name)/'admin-password').read_text().strip()
+        status,headers,body=self.request('POST','/ops/api/password',{'currentPassword':initial,'newPassword':'changed-compose-password-123456'})
+        self.cookie,self.csrf=headers['Set-Cookie'].split(';')[0],body['csrf']
+        for route in routes:
+            self.assertEqual(self.request('POST',route,{}, {'Origin':'https://evil.example'})[2]['error'],'origin_forbidden')
+            self.assertEqual(self.request('POST',route,{}, {'X-CSRF-Token':''})[2]['error'],'csrf_forbidden')
+            self.assertEqual(self.request('POST',route,{})[2]['error'],'invalid_request')
+
     def test_nonascii_csrf_and_surrogate_password_are_stable_client_errors(self):
         self.login()
         status, _, body = self.request('POST', '/ops/api/enrollments', {'name': 'A', 'role': 'primary'}, {'X-CSRF-Token': '\u00e9'})
