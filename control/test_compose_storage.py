@@ -129,6 +129,52 @@ class StorageTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "envelope_plaintext_mismatch"):
             self.manager.configure(uid(), {"storageId": self.sid, "metadata": self.metadata | {"name": "changed"}, "mode": "create", "envelope": self.sealed(generation=3)})
 
+    def test_first_unknown_source_discovery_attach_reads_config_without_init(self):
+        sealed = self.sealed(mode="attach")
+        @contextlib.contextmanager
+        def session(binding):
+            yield {}, "proxy"
+        with mock.patch.object(self.manager, "session", session), mock.patch.object(self.manager, "_run", return_value=json.dumps({"id": "a" * 64}).encode()) as run, mock.patch.object(storage, "prove_empty") as empty:
+            result = self.manager.configure(uid(), {"storageId": self.sid, "metadata": self.metadata, "mode": "attach", "envelope": sealed, "discoverRepositoryId": True})
+        self.assertEqual(result["repositoryId"], "a" * 64)
+        self.assertTrue(result["connected"])
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[1], ["cat", "config"])
+        empty.assert_not_called()
+        self.assertNotIn("sentinel", json.dumps(result))
+
+    def test_discovery_attach_wrong_password_has_no_init_or_success(self):
+        @contextlib.contextmanager
+        def session(binding):
+            yield {}, "proxy"
+        with mock.patch.object(self.manager, "session", session), mock.patch.object(self.manager, "_run", side_effect=storage.StorageError("repository_access_failed")) as run, mock.patch.object(storage, "prove_empty") as empty:
+            with self.assertRaisesRegex(storage.StorageError, "repository_access_failed"):
+                self.manager.configure(uid(), {"storageId": self.sid, "metadata": self.metadata, "mode": "attach", "envelope": self.sealed(mode="attach"), "discoverRepositoryId": True})
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[1], ["cat", "config"])
+        empty.assert_not_called()
+        self.assertEqual(storage.read(self.manager.directory / (self.sid + ".json"))["status"], "accepted")
+
+    def test_known_identity_cannot_be_replaced_or_rediscovered_after_failed_rotation(self):
+        previous = {"status": "accepted", "bindingGeneration": 1, "consumedRequests": [], "authoritativeRepositoryId": "a" * 64}
+        storage.atomic(self.manager.directory / (self.sid + ".json"), previous)
+        for extra, error in (({"discoverRepositoryId": True}, "expected_repository_required"), ({}, "expected_repository_required"), ({"expectedRepositoryId": "b" * 64}, "repository_identity_mismatch")):
+            params = {"storageId": self.sid, "metadata": self.metadata, "mode": "attach", "envelope": self.sealed(mode="attach", generation=2), **extra}
+            with self.subTest(extra=extra), mock.patch.object(self.manager, "_password") as password, mock.patch.object(self.manager, "session") as session:
+                with self.assertRaisesRegex(storage.StorageError, error):
+                    self.manager.configure(uid(), params)
+                password.assert_not_called()
+                session.assert_not_called()
+        self.assertEqual(storage.read(self.manager.directory / (self.sid + ".json")), previous)
+
+    def test_missing_recipient_identity_and_forged_discovery_shapes_fail_before_application(self):
+        for mode, extra, error in (("attach", {}, "expected_repository_required"), ("attach", {"discoverRepositoryId": False}, "invalid_repository_discovery"), ("attach", {"discoverRepositoryId": 1}, "invalid_repository_discovery"), ("attach", {"discoverRepositoryId": True, "expectedRepositoryId": None}, "invalid_repository_discovery"), ("create", {"discoverRepositoryId": True}, "invalid_repository_discovery")):
+            params = {"storageId": self.sid, "metadata": self.metadata, "mode": mode, "envelope": self.sealed(mode=mode), **extra}
+            with self.subTest(mode=mode, extra=extra), mock.patch.object(self.manager, "_password") as password:
+                with self.assertRaisesRegex(storage.StorageError, error):
+                    self.manager.configure(uid(), params)
+                password.assert_not_called()
+
     def test_attach_mismatch_never_inits_and_password_not_in_argv(self):
         sealed = self.sealed(mode="attach")
         @contextlib.contextmanager
