@@ -175,6 +175,23 @@ class StorageTests(unittest.TestCase):
                     self.manager.configure(uid(), params)
                 password.assert_not_called()
 
+    def test_create_rejects_any_expected_id_before_decrypt_password_or_repository_effects(self):
+        for expected in ("a" * 64, None, False):
+            params = {"storageId": self.sid, "mode": "create", "envelope": {}, "metadata": self.metadata, "expectedRepositoryId": expected}
+            with self.subTest(expected=expected), mock.patch.object(self.manager.sealer, "open") as decrypt, mock.patch.object(self.manager, "_password") as password, mock.patch.object(self.manager, "_run") as run:
+                with self.assertRaisesRegex(storage.StorageError, "create_repository_id_preassigned"):
+                    self.manager.configure(uid(), params)
+                decrypt.assert_not_called()
+                password.assert_not_called()
+                run.assert_not_called()
+        self.assertFalse((self.manager.directory / (self.sid + ".json")).exists())
+
+    def test_explicit_zero_endpoint_port_is_not_default_https(self):
+        with self.assertRaisesRegex(storage.StorageError, "invalid_storage_endpoint"):
+            storage.validate_metadata(self.metadata | {"endpoint": "https://storage.example:0/repo"})
+        self.assertEqual(storage.validate_metadata(self.metadata)[1], 443)
+        self.assertEqual(storage.validate_metadata(self.metadata | {"endpoint": "https://storage.example:8443/repo"})[1], 8443)
+
     def test_attach_mismatch_never_inits_and_password_not_in_argv(self):
         sealed = self.sealed(mode="attach")
         @contextlib.contextmanager

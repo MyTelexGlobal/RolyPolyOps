@@ -87,6 +87,8 @@ def validate_job(job):
         raise EngineError("invalid_schedule")
     if action == "storage-configure" and ((not isinstance(p["mode"], str) or p["mode"] not in {"create", "attach"}) or not isinstance(p["envelope"], dict)):
         raise EngineError("invalid_parameters")
+    if action == "storage-configure" and p["mode"] == "create" and "expectedRepositoryId" in p:
+        raise EngineError("create_repository_id_preassigned")
     if action == "storage-configure" and "discoverRepositoryId" in p:
         if p["discoverRepositoryId"] is not True or p["mode"] != "attach" or "expectedRepositoryId" in p:
             raise EngineError("invalid_repository_discovery")
@@ -961,6 +963,160 @@ class ManagedEngine:
         journal.update(sourceResumed=True, resumeComplete=True)
         atomic(self._journal_path(journal["id"]), journal)
 
+    def _measure_image_layer(self, archive, name):
+        import gzip
+        import zlib
+        member = archive.getmember(name)
+        if not member.isfile():
+            raise ValueError()
+        source = archive.extractfile(member)
+        head = source.read(6)
+        source.seek(0)
+        if head.startswith(b"\x28\xb5\x2f\xfd") or head.startswith(b"BZh") or head.startswith(b"\xfd7zXZ"):
+            raise EngineError("image_compression_unsupported")
+        stream = gzip.GzipFile(fileobj=source) if head.startswith(b"\x1f\x8b") else source
+        class Measured:
+            def __init__(self):
+                self.count, self.hasher = 0, hashlib.sha256()
+            def read(self, count=1024 * 1024):
+                block = stream.read(min(count if count >= 0 else 1024 * 1024, 1024 * 1024))
+                self.count += len(block)
+                if self.count > MAX_BYTES:
+                    raise EngineError("image_expanded_byte_limit")
+                self.hasher.update(block)
+                return block
+        measured = Measured()
+        logical, files = 0, 0
+        try:
+            with tarfile.open(fileobj=measured, mode="r|") as layer:
+                for entry in layer:
+                    files += 1
+                    logical += entry.size
+                    if files > 100000 or entry.size < 0 or logical > MAX_BYTES:
+                        raise EngineError("image_expanded_byte_limit")
+            # Include tar padding and compressed members in the diff-id and actual load budget.
+            while measured.read():
+                pass
+        except (tarfile.TarError, EOFError, OSError, ValueError, zlib.error):
+            raise EngineError("image_layer_invalid") from None
+        finally:
+            if stream is not source:
+                stream.close()
+            source.close()
+        required = measured.count + logical
+        if required > MAX_BYTES:
+            raise EngineError("image_expanded_byte_limit")
+        return {"diffId": "sha256:" + measured.hasher.hexdigest(), "expandedBytes": measured.count, "logicalBytes": logical, "files": files, "requiredBytes": required}
+
+    def _oci_entrypoints(self, archive, identities, measured_layer):
+        if "index.json" not in archive.getnames():
+            if "oci-layout" in archive.getnames():
+                raise ValueError()
+            return 0
+        def document(name):
+            member = archive.getmember(name)
+            if not member.isfile() or member.size > 4 * 1024 * 1024:
+                raise ValueError()
+            return json.loads(archive.extractfile(member).read()), member.size
+        index, metadata_bytes = document("index.json")
+        if index.get("schemaVersion") != 2 or not isinstance(index.get("manifests"), list) or not 1 <= len(index["manifests"]) <= 1000:
+            raise ValueError()
+        aliases = {item["alias"]: identity for identity, item in identities.items()}
+        platforms = {(v["os"], v["architecture"], v.get("variant") or "") for v in identities.values()}
+        seen, slots, nodes = set(), {}, 0
+        names = set(archive.getnames())
+        def alias_of(annotations, inherited):
+            if annotations is None:
+                return inherited
+            if not isinstance(annotations, dict):
+                raise ValueError()
+            full, short = annotations.get("io.containerd.image.name"), annotations.get("org.opencontainers.image.ref.name")
+            def canonical_alias(value):
+                if not isinstance(value, str):
+                    raise ValueError()
+                value = value.removeprefix("docker.io/")
+                if value not in aliases:
+                    raise ValueError()
+                return value
+            value = canonical_alias(full) if full is not None else inherited
+            if short is not None:
+                if short == "bundle" and value:
+                    pass
+                else:
+                    other = canonical_alias(short)
+                    if value is not None and value != other:
+                        raise ValueError()
+                    value = other
+            if inherited is not None and value is not None and inherited != value:
+                raise ValueError()
+            return value
+        def walk(raw_descriptor, inherited=None, ancestors=frozenset(), depth=0, top=False):
+            nonlocal metadata_bytes, nodes
+            descriptor = self._descriptor(raw_descriptor)
+            digest_value = descriptor["digest"]
+            nodes += 1
+            if depth > 16 or nodes > 1000 or digest_value in ancestors:
+                raise ValueError()
+            alias = alias_of(raw_descriptor.get("annotations"), inherited)
+            name = "blobs/sha256/" + digest_value[7:]
+            p = descriptor.get("platform")
+            if name not in names:
+                # A platform-filtered Docker save can keep index references to absent foreign/attestation blobs.
+                if not top and p and (p.get("os"), p.get("architecture"), p.get("variant") or "") not in platforms:
+                    return set()
+                raise ValueError()
+            member = archive.getmember(name)
+            if member.size != descriptor["size"]:
+                raise ValueError()
+            node, size = document(name)
+            metadata_bytes += size
+            if node.get("schemaVersion") != 2 or node.get("mediaType", descriptor.get("mediaType")) != descriptor.get("mediaType"):
+                raise ValueError()
+            if "manifests" in node:
+                if "config" in node or "layers" in node:
+                    raise ValueError()
+                if descriptor.get("mediaType") not in {"application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"} or not isinstance(node["manifests"], list) or not node["manifests"]:
+                    raise ValueError()
+                found = set()
+                for child in node["manifests"]:
+                    found |= walk(child, alias, ancestors | {digest_value}, depth + 1)
+                if not found:
+                    raise ValueError()
+                return found
+            if descriptor.get("mediaType") not in {"application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"}:
+                raise ValueError()
+            cfg = self._descriptor(node["config"])
+            identity = cfg["digest"]
+            if identity not in identities:
+                raise ValueError()
+            config_name = "blobs/sha256/" + identity[7:]
+            config, config_size = document(config_name)
+            metadata_bytes += config_size
+            expected = identities[identity]
+            actual_platform = (config["os"], config["architecture"], config.get("variant") or "")
+            if cfg["size"] != config_size or actual_platform != (expected["os"], expected["architecture"], expected.get("variant") or "") or (p and actual_platform != (p.get("os"), p.get("architecture"), p.get("variant") or "")):
+                raise ValueError()
+            if alias is None or aliases.get(alias) != identity:
+                raise ValueError()
+            if alias in slots and slots[alias] != identity:
+                raise ValueError()
+            slots[alias] = identity
+            layers, diff_ids = node.get("layers"), config.get("rootfs", {}).get("diff_ids")
+            if not isinstance(layers, list) or not isinstance(diff_ids, list) or len(layers) != len(diff_ids):
+                raise ValueError()
+            for raw_layer, expected_diff in zip(layers, diff_ids):
+                layer = self._descriptor(raw_layer)
+                layer_name = "blobs/sha256/" + layer["digest"][7:]
+                if archive.getmember(layer_name).size != layer["size"] or measured_layer(layer_name)["diffId"] != expected_diff:
+                    raise ValueError()
+            seen.add(identity)
+            return {identity}
+        for root in index["manifests"]:
+            walk(root, top=True)
+        if seen != set(identities) or set(slots) != set(aliases):
+            raise ValueError()
+        return metadata_bytes
+
     def _image_archive(self, path, identities):
         inspect_archive(path, data=False)
         try:
@@ -969,7 +1125,13 @@ class ManagedEngine:
                 if member.size > 1024 * 1024:
                     raise ValueError()
                 manifests = json.load(archive.extractfile(member))
-                seen = set()
+                if not isinstance(manifests, list) or len(manifests) != len(identities) or not 1 <= len(manifests) <= 21:
+                    raise ValueError()
+                seen, measurements, layer_cache = set(), {}, {}
+                def measured_layer(name):
+                    if name not in layer_cache:
+                        layer_cache[name] = self._measure_image_layer(archive, name)
+                    return layer_cache[name]
                 for item in manifests:
                     config_name = item["Config"]
                     config_member = archive.getmember(config_name)
@@ -981,6 +1143,8 @@ class ManagedEngine:
                         raise ValueError()
                     config = json.loads(raw)
                     expected = identities[identity]
+                    if expected.get("alias") != "rolypolyops-reserved/sha256-" + identity[7:] + ":bundle":
+                        raise ValueError()
                     if expected.get("proofKind") == "native-manifest":
                         proven = self._native_chain(archive, item, [expected["os"], expected["architecture"], expected.get("variant") or ""], expected.get("selectedDescriptor"), expected.get("rootDescriptor"))
                         if proven["id"] != identity or proven.get("manifestDigest") != expected.get("manifestDigest"):
@@ -994,24 +1158,18 @@ class ManagedEngine:
                     diff_ids = config.get("rootfs", {}).get("diff_ids", [])
                     if len(layers) != len(diff_ids):
                         raise ValueError()
+                    required, logical, expanded, file_count = len(raw), 0, 0, 0
                     for layer, expected_diff in zip(layers, diff_ids):
-                        layer_member = archive.getmember(layer)
-                        if not layer_member.isfile():
+                        stats = measured_layer(layer)
+                        if stats["diffId"] != expected_diff:
                             raise ValueError()
-                        stream = archive.extractfile(layer_member)
-                        head = stream.read(2)
-                        stream.seek(0)
-                        if head == b"\x1f\x8b":
-                            import gzip
-                            stream = gzip.GzipFile(fileobj=stream)
-                        h, logical = hashlib.sha256(), 0
-                        for block in iter(lambda: stream.read(1024 * 1024), b""):
-                            logical += len(block)
-                            if logical > MAX_BYTES:
-                                raise ValueError()
-                            h.update(block)
-                        if "sha256:" + h.hexdigest() != expected_diff:
-                            raise ValueError()
+                        required += stats["requiredBytes"]
+                        logical += stats["logicalBytes"]
+                        expanded += stats["expandedBytes"]
+                        file_count += stats["files"]
+                    if required > MAX_BYTES:
+                        raise EngineError("image_expanded_byte_limit")
+                    measurements[identity] = {"requiredBytes": required, "logicalBytes": logical, "expandedBytes": expanded, "files": file_count}
                     seen.add(identity)
                 if seen != set(identities):
                     raise ValueError()
@@ -1066,6 +1224,12 @@ class ManagedEngine:
                               or re.fullmatch(r"[a-f0-9]{64}\.json", name)
                               or re.fullmatch(r"[a-f0-9]{64}/(?:layer.tar|json|VERSION)", name)):
                         raise ValueError()
+                metadata_bytes = self._oci_entrypoints(archive, identities, measured_layer)
+                for measurement in measurements.values():
+                    measurement["requiredBytes"] += metadata_bytes
+                if sum(value["requiredBytes"] for value in measurements.values()) > MAX_BYTES:
+                    raise EngineError("image_expanded_byte_limit")
+                return measurements
         except (KeyError, ValueError, TypeError, tarfile.TarError, OSError, RecursionError):
             raise EngineError("image_identity_unverified") from None
 
@@ -1083,7 +1247,10 @@ class ManagedEngine:
         platform = "/".join(x for x in (next(iter(descriptors.values()))["os"], next(iter(descriptors.values()))["architecture"], next(iter(descriptors.values())).get("variant", "")) if x)
         args = ["image", "save", "--platform", platform, "--output", str(image_path), *[item["alias"] for item in descriptors.values()]]
         self.docker(*args, timeout=3600)
-        self._image_archive(image_path, descriptors)
+        measured = self._image_archive(image_path, descriptors)
+        for identity, item in descriptors.items():
+            item["size"] = max(item.get("size", 0), measured[identity]["requiredBytes"])
+            item["measuredImage"] = measured[identity]
         return descriptors
 
     def _backup(self, params):
@@ -1125,6 +1292,7 @@ class ManagedEngine:
         images = dict(project["images"])
         images[helper["id"]] = helper
         image_descriptors = self._export_images(stage, images)
+        self._reserve(sum(a["bytes"] for a in archives), sum(i["size"] for i in image_descriptors.values()), sum(a["files"] for a in archives) + sum(i["measuredImage"]["files"] for i in image_descriptors.values()))
         runtime = copy.deepcopy(project["model"])
         for name, item in runtime["services"].items():
             identity = next(c["imageId"] for c in project["containers"] if c["service"] == name)
@@ -1136,6 +1304,8 @@ class ManagedEngine:
                     "runtimeDigest": hashlib.sha256(canonical(runtime)).hexdigest(), "containers": project["containers"], "archives": archives,
                     "images": image_descriptors, "imagesSha256": digest(stage / "images.tar"), "helperId": helper["id"],
                     "healthCheck": service.get("healthCheck"), "backupInterval": service["backupInterval"]}
+        if len(canonical(manifest)) + 1 > 16 * 1024 * 1024:
+            raise EngineError("bundle_manifest_limit")
         atomic(stage / "manifest.json", manifest)
         manifest_digest = digest(stage / "manifest.json")
         self._journal(stage="repository-write-intent", manifestDigest=manifest_digest, repositoryId=binding["repositoryId"])
@@ -1198,10 +1368,33 @@ class ManagedEngine:
                 points.append({"id": value["id"], "time": value.get("time"), "serviceId": service_id, "repositoryId": binding["repositoryId"], "manifestDigest": manifest, "sourceFingerprint": source, "operationId": tag("operation:")})
         return points
 
+    def _bundle_image_bindings(self, manifest):
+        services, containers, images = manifest["runtime"]["services"], manifest["containers"], manifest["images"]
+        if not isinstance(images, dict) or not 1 <= len(images) <= 21 or not isinstance(containers, list) or len(containers) != len(services) or manifest.get("helperId") not in images:
+            raise EngineError("compose_image_binding_invalid")
+        seen, ids = set(), set()
+        for identity, image in images.items():
+            if (not isinstance(identity, str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", identity) or not isinstance(image, dict)
+                    or image.get("id") != identity or image.get("alias") != "rolypolyops-reserved/sha256-" + identity[7:] + ":bundle"
+                    or [image.get("os"), image.get("architecture"), image.get("variant") or ""] != manifest.get("platform")):
+                raise EngineError("compose_image_binding_invalid")
+        for container in containers:
+            if not isinstance(container, dict) or container.get("service") not in services or container["service"] in seen or not isinstance(container.get("id"), str) or not 1 <= len(container["id"]) <= 128 or container["id"] in ids:
+                raise EngineError("compose_image_binding_invalid")
+            seen.add(container["service"])
+            ids.add(container["id"])
+            image = images.get(container.get("imageId"))
+            if image is None or services[container["service"]].get("image") != image["alias"]:
+                raise EngineError("compose_image_binding_invalid")
+        if seen != set(services):
+            raise EngineError("compose_image_binding_invalid")
+
     def _bundle(self, path, directory, *, service_id, repository_id, point):
         package = inspect_archive(path, data=False)
         if any(e["kind"] != "file" or "/" in e["path"] for e in package["entries"]):
             raise EngineError("bundle_structure_invalid")
+        if shutil.disk_usage(directory).free < package["bytes"] + 512 * 1024 ** 2:
+            raise EngineError("insufficient_staging_space")
         try:
             with tarfile.open(path) as archive:
                 entry = archive.getmember("manifest.json")
@@ -1218,6 +1411,7 @@ class ManagedEngine:
                 self._validate_model(manifest["runtime"], owned=True)
                 if hashlib.sha256(canonical(manifest["runtime"])).hexdigest() != manifest["runtimeDigest"]:
                     raise EngineError("runtime_digest_mismatch")
+                self._bundle_image_bindings(manifest)
                 files = {e["path"] for e in package["entries"]}
                 wanted = {"manifest.json", "images.tar"} | {a["filename"] for a in manifest["archives"]}
                 if files != wanted or len(manifest["archives"]) > 100 or len(manifest["images"]) > 21:
@@ -1244,7 +1438,14 @@ class ManagedEngine:
                 raise EngineError("archive_byte_limit")
         if digest(directory / "images.tar") != manifest["imagesSha256"]:
             raise EngineError("bundle_image_mismatch")
-        self._image_archive(directory / "images.tar", manifest["images"])
+        measured = self._image_archive(directory / "images.tar", manifest["images"])
+        for identity, required in measured.items():
+            declared = manifest["images"][identity].get("size")
+            if type(declared) is not int or declared < required["requiredBytes"]:
+                raise EngineError("bundle_image_budget_mismatch")
+        if total + sum(i["requiredBytes"] for i in measured.values()) > MAX_BYTES:
+            raise EngineError("image_expanded_byte_limit")
+        manifest["measuredImages"] = measured
         return manifest
 
     def _platform(self):
@@ -1443,7 +1644,7 @@ class ManagedEngine:
         self._journal(stage="bundle-download")
         self.storage.run(binding, ["dump", params["snapshotId"], "/bundle.tar"], output_file=directory / "bundle.tar", output_limit=min(MAX_BYTES * 2, free - 512 * 1024 ** 2))
         manifest = self._bundle(directory / "bundle.tar", directory, service_id=params["serviceId"], repository_id=binding["repositoryId"], point=point)
-        self._reserve(sum(a["bytes"] for a in manifest["archives"]), sum(i.get("size", 0) for i in manifest["images"].values()), sum(a["files"] for a in manifest["archives"]))
+        self._reserve(sum(a["bytes"] for a in manifest["archives"]), sum(i["requiredBytes"] for i in manifest["measuredImages"].values()), sum(a["files"] for a in manifest["archives"]) + sum(i["files"] for i in manifest["measuredImages"].values()))
         if manifest["platform"] != self._platform():
             raise EngineError("image_platform_mismatch")
         record = {"id": identity, "restoreId": identity, "serviceId": params["serviceId"], "storageId": params["storageId"], "repositoryId": binding["repositoryId"],
