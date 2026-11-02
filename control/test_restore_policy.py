@@ -63,6 +63,7 @@ class RestorePolicyTests(unittest.TestCase):
     def test_test_copy_has_only_internal_isolated_networks(self):
         policy.prepare(self.root, self.manifest, self.template, 18082, "SITE A", isolated=True)
         value = json.loads((self.root / "rpo.isolation.json").read_text())
+        self.assertNotIn(b"    ports:\n", (self.root / "compose.yaml").read_bytes())
         self.assertEqual(set(value["networks"]), {"backend", "frontend"})
         for network in value["networks"].values():
             self.assertTrue(network["internal"])

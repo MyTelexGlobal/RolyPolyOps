@@ -41,6 +41,12 @@ def prepare(service, manifest, template, port, label, isolated=False):
     # Test copies cannot reach the Internet, host gateway or public traffic routes.
     override = service / "rpo.isolation.json"
     if isolated:
+        # Transform only the already byte-validated bundled definition. Compose
+        # merges empty port lists, so remove this exact declaration explicitly.
+        ports = b"    ports:\n      - '127.0.0.1:${WEB_PORT:-8080}:8080'\n"
+        if template.count(ports) != 1:
+            raise ValueError("unsupported_port_definition")
+        (service / "compose.yaml").write_bytes(template.replace(ports, b""))
         options = {"com.docker.network.bridge.gateway_mode_ipv4": "isolated", "com.docker.network.bridge.gateway_mode_ipv6": "isolated"}
         override.write_text(json.dumps({"networks": {name: {"internal": True, "driver_opts": options} for name in ("backend", "frontend")}}))
     return images
