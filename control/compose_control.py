@@ -846,26 +846,44 @@ class ComposeControl:
                 self.purge(db,child)
 
     def dispatch(self, db, job):
-        """Return a refreshed immutable wire row only after typed prerequisites."""
+        """Bind queued work once; already-dispatched wire remains immutable."""
+        if job['status'] != 'queued':
+            return job
         meta = db.execute('SELECT * FROM compose_jobs WHERE job_id=?',(job['id'],)).fetchone()
         if not meta:
             db.execute("UPDATE jobs SET status='failed',stage='completed',error='generic_job_untyped',ended=? WHERE id=?",(time.time(),job['id']))
             return None
         params = json.loads(job['parameters'])
+        parent = None
         if meta['parent_id']:
             parent = db.execute('SELECT * FROM jobs WHERE id=?',(meta['parent_id'],)).fetchone()
             if not parent or parent['status'] != 'succeeded':
                 return None
-            if job['action'] == 'storage-configure':
-                proof = json.loads(parent['result'] or '{}')
-                expected = proof.get('repositoryId')
-                if not isinstance(expected,str) or not HEX.fullmatch(expected):
+        if job['action'] == 'storage-configure':
+            current=self.storage(db,params['storageId'])['repository_id']
+            expected=json.loads(parent['result'] or '{}').get('repositoryId') if parent else current
+            conflict=bool(parent and (not isinstance(expected,str) or not HEX.fullmatch(expected) or expected != current))
+            conflict=conflict or bool(expected and params.get('expectedRepositoryId') not in (None,expected))
+            if conflict:
+                db.execute("UPDATE jobs SET status='failed',stage='blocked',error='repository_identity_conflict',ended=? WHERE id=?",(time.time(),job['id']))
+                self.purge(db,job)
+                return None
+            if expected:
+                params['expectedRepositoryId']=expected
+                params.pop('discoverRepositoryId',None)
+            elif params.get('mode') == 'attach':
+                if parent or params.get('discoverRepositoryId') is not True or 'expectedRepositoryId' in params:
+                    db.execute("UPDATE jobs SET status='failed',stage='blocked',error='repository_identity_required',ended=? WHERE id=?",(time.time(),job['id']))
+                    self.purge(db,job)
                     return None
-                params['expectedRepositoryId'] = expected
-                # Persist learned identity before the first dispatch. Later
-                # delivery/reconciliation uses exactly these wire parameters.
-                db.execute('UPDATE jobs SET parameters=? WHERE id=?',(canonical(params),job['id']))
-                db.execute('UPDATE plans SET parameters=? WHERE id=?',(canonical(params),job['plan_id']))
+            elif 'discoverRepositoryId' in params:
+                db.execute("UPDATE jobs SET status='failed',stage='blocked',error='repository_identity_required',ended=? WHERE id=?",(time.time(),job['id']))
+                self.purge(db,job)
+                return None
+            # This runs only for first queued dispatch. Catalog learning and
+            # parent proof are bound to both durable rows in this transaction.
+            db.execute('UPDATE jobs SET parameters=? WHERE id=?',(canonical(params),job['id']))
+            db.execute('UPDATE plans SET parameters=? WHERE id=?',(canonical(params),job['plan_id']))
         if job['action'] == 'compose-activate':
             activation = db.execute('SELECT * FROM compose_activations WHERE activate_job=?',(job['id'],)).fetchone()
             if not activation or activation['stop_job'] != params['sourceStopJobId']:
