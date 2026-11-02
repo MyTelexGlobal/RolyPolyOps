@@ -1438,3 +1438,4 @@ dialog .dialog-content { padding: 1.5rem; }
 .managed-form details, .managed-service details { margin-block: 1rem; }
 .managed-form summary, .managed-service summary { cursor: pointer; font-weight: 600; }
 .managed-service > .btn { margin-block: .8rem; }
+.managed-row .status-pill { white-space: normal; max-width: 100%; overflow-wrap: anywhere; }

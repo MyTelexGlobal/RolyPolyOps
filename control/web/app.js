@@ -820,12 +820,14 @@ function fresh(node) {
 }
 function nodeKind(node) {
   if (!fresh(node)) return "warn";
+  if (!demoViewsSelected() && node.status?.compose) return node.status.compose.ready === true ? "" : "warn";
   if (node.status?.supported !== true) return "warn";
   return node.status?.serviceHealthy === true ? "" : "bad";
 }
 function nodeState(node) {
   if (node?.revoked) return t("revoked");
   if (!fresh(node)) return t("offline");
+  if (!demoViewsSelected() && node.status?.compose) return node.status.compose.ready === true ? (state.lang === "ru" ? "Compose готов" : "Compose ready") : (state.lang === "ru" ? "Compose не готов" : "Compose not ready");
   if (node.status?.supported !== true) return t("unsupported");
   return t(node.status.serviceHealthy === true ? "healthy" : "unhealthy");
 }
@@ -1208,6 +1210,14 @@ function authView(change) {
     ),
   );
 }
+function demoViewsSelected() {
+  const overview=state.overview;
+  if (overview?.setup?.demoSelected === true) return true;
+  const nodes=overview?.nodes||[];
+  if (overview?.setup?.demoSelected === false) return nodes.length>0 && !nodes.some(n=>n.status?.compose);
+  // Older controllers do not expose selection. Preserve their legacy surface.
+  return overview?.setup?.completed === true || nodes.some(n=>n.status?.supported === true) || !nodes.some(n=>n.status?.compose);
+}
 function shell() {
   const navItems = [
     ["dashboard", "▦"],
@@ -1217,7 +1227,7 @@ function shell() {
     ["nodes", "▤"],
     ["history", "◷"],
     ["settings", "⚙"],
-  ];
+  ].filter(([id]) => demoViewsSelected() || !["restore", "settings"].includes(id));
   const sidebar = h(
     "aside",
     { class: "sidebar" },
@@ -1305,7 +1315,7 @@ function shell() {
       const k = `alert_${alert.code}`;
       main.append(
         notice(
-          t(dictionary[k] ? k : "alert_generic") +
+          (dictionary[k] ? t(k) : managed.explain(alert.code)) +
             (alert.nodeId && nodeById(alert.nodeId)
               ? ` · ${nodeById(alert.nodeId).name}`
               : ""),
@@ -1557,6 +1567,7 @@ function siteBox(node, role) {
   );
 }
 function dashboardView() {
+  if (!demoViewsSelected()) return managed.homeView();
   const view = h("div");
   const p = primary();
   view.append(
@@ -2009,6 +2020,7 @@ function nodesView() {
   return view;
 }
 function nodeCard(node) {
+  const composeOnly = !demoViewsSelected() && Boolean(node.status?.compose);
   const disk = node.status?.disk;
   const used = disk?.total
     ? Math.min(100, Math.max(0, 100 - (100 * disk.free) / disk.total))
@@ -2062,8 +2074,8 @@ function nodeCard(node) {
         h("div", { class: "detail-label" }, t("lastSeen")),
         h("div", { class: "detail-value" }, date(node.lastSeen, true)),
       ),
-      schedule("backup", "backupSchedule"),
-      schedule("restore", "restoreSchedule"),
+      composeOnly ? h("div", {}, h("div", {class:"detail-label"}, state.lang === "ru" ? "Свои сервисы Compose" : "Own Compose services"), h("div", {class:"detail-value"}, node.status.compose.services?.length || 0)) : schedule("backup", "backupSchedule"),
+      composeOnly ? h("div", {}, h("div", {class:"detail-label"}, t("storages")), h("div", {class:"detail-value"}, node.status.compose.storages?.filter(s=>s.connected).length || 0)) : schedule("restore", "restoreSchedule"),
     ),
     h(
       "div",

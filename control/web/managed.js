@@ -25,6 +25,19 @@ export async function sealStorage(challenge, binding, repoPassword, credentials)
   } finally { plaintext.fill(0); }
 }
 
+export function canReuseStorage(storage, selectedNodes, isFresh) {
+  if (!storage || !/^[a-f0-9]{64}$/.test(storage.repositoryId || '') || selectedNodes.length !== 2 || selectedNodes[0]?.id === selectedNodes[1]?.id) return false;
+  return selectedNodes.every(node => {
+    if (!node || !isFresh(node) || node.status?.compose?.ready !== true) return false;
+    const binding = storage.bindings?.find(b => b.nodeId === node.id);
+    const seen = node.status.compose.storages?.find(b => b.storageId === storage.id);
+    return binding?.state === 'connected' && binding.repositoryId === storage.repositoryId &&
+      Number.isInteger(binding.bindingGeneration) && binding.bindingGeneration > 0 && Boolean(binding.requestId) &&
+      seen?.connected === true && seen.repositoryId === storage.repositoryId &&
+      seen.bindingGeneration === binding.bindingGeneration && seen.requestId === binding.requestId;
+  });
+}
+
 export function createManagedUI(ctx) {
   const {h,button,field,select,notice,pill,head,state,api,render,fresh,date,bytes,showJob,refreshOverview} = ctx;
   const tr = (ru,en) => state.lang === 'ru' ? ru : en;
@@ -33,6 +46,7 @@ export function createManagedUI(ctx) {
   const nodes = () => list('nodes');
   const node = id => nodes().find(n=>n.id===id);
   const ready = n => fresh(n) && n.status?.compose?.ready === true;
+  const reuse = a => !a.storageOnly && canReuseStorage(list('storages').find(s=>s.id===a.storage),[node(a.source),node(a.target)],fresh);
   const rev = () => state.overview.revision;
   let wizard, busy=false, error='', progress='', pending=new Map(), activations=new Map(), alive=0;
   const init = () => ({id:crypto.randomUUID(),serviceId:crypto.randomUUID(),name:'',source:'',target:'',project:'',storage:'',storageName:'',kind:'rest',mode:'create',endpoint:'',bucket:'',prefix:'',region:'',username:'',password:'',accessKeyId:'',secretAccessKey:'',sessionToken:'',repoPassword:'',interval:'hourly',exclusive:false,http:false,healthService:'',port:'8080',path:'/',expectedStatus:'200',stage:'select',jobs:[]});
@@ -53,11 +67,33 @@ export function createManagedUI(ctx) {
       throw e;
     }
   }
-  const message = e => {
-    const code=e.code||'unknown_error';
-    const friendly={operation_busy:tr('Сервер занят. Дождитесь завершения и повторите действие.','Host busy. Wait for completion and retry.'),envelope_expired:tr('Срок шифрованного запроса истек. Получите новый запрос.','The sealed request expired. Request a fresh challenge.'),outcome_unknown:tr('Результат неизвестен. Сначала проверьте фактическое состояние в операциях.','Outcome unknown. Inspect its actual state in Operations first.'),network:tr('Нет ответа панели. Повтор использует тот же номер запроса.','Panel response unavailable. Retry uses the same request identity.')};
-    return (friendly[code] || tr('Действие не подтверждено. Проверьте настройки и состояние серверов.','Action not confirmed. Review settings and host state.'))+' ['+String(code).slice(0,100)+']';
-  };
+  function explain(code) {
+    const explanations={
+      operation_busy:tr('Сервер занят. Дождитесь завершения и повторите действие.','Host busy. Wait for completion and retry.'),
+      envelope_expired:tr('Срок шифрованного запроса истек. Получите новый запрос.','The sealed request expired. Request a fresh challenge.'),
+      challenge_expired:tr('Срок запроса истек. Подготовьте новый запрос подключения.','The challenge expired. Prepare a fresh connection request.'),
+      outcome_unknown:tr('Результат неизвестен. Сначала проверьте фактическое состояние в операциях.','Outcome unknown. Inspect its actual state in Operations first.'),
+      operation_outcome_unknown:tr('Результат операции неизвестен. Новые изменения заблокированы до проверки ее состояния.','An operation outcome is unknown. New changes are blocked until its state is inspected.'),
+      network:tr('Нет ответа панели. Повтор использует тот же номер запроса.','Panel response unavailable. Retry uses the same request identity.'),
+      package_unsupported:tr('Тестовый пакет этого сервера не поддерживается. Проверьте его установку и совместимость.','This host’s bundled demo package is unsupported. Check its installation and compatibility.'),
+      compose_not_ready:tr('Служба сервера еще не подтвердила готовность Compose. Проверьте требования и дождитесь свежего состояния.','The host has not confirmed Compose readiness. Check prerequisites and wait for a fresh observation.'),
+      compose_key_unavailable:tr('Открытый ключ сервера недоступен. Защищенное подключение хранилища пока невозможно.','The host public key is unavailable. Secure storage binding cannot proceed.'),
+      prerequisite_unavailable:tr('На сервере отсутствует обязательная зависимость. Проверьте требования установки Compose.','A required host dependency is unavailable. Check Compose installation prerequisites.'),
+      observation_deadline:tr('Проверка сервера не завершилась вовремя. Дождитесь свежих сведений.','Host observation timed out. Wait for fresh observations.'),
+      managed_observation_failed:tr('Не удалось получить состояние Compose на сервере. Готовность не подтверждена.','The host could not observe Compose state. Readiness is unconfirmed.'),
+      compose_status_invalid:tr('Сервер передал неполное состояние Compose. Требуется новая проверка.','The host reported invalid Compose state. A new observation is required.'),
+      docker_result_invalid:tr('Не удалось проверить ответ Docker на сервере. Состояние приложений не подтверждено.','The host could not validate Docker’s response. Application state is unconfirmed.'),
+      discovery_limit:tr('Обнаружение превысило допустимое число проектов или ресурсов. Этот набор не поддерживается.','Discovery exceeded project or resource limits. This inventory is unsupported.'),
+      storage_binding_stale:tr('Подключение хранилища изменилось или устарело. Дождитесь свежих серверов; если подключение не подтвердится, введите учетные данные заново.','The storage binding changed or became stale. Wait for fresh hosts; if the binding remains unconfirmed, reenter credentials.'),
+      storage_not_connected:tr('Хранилище не подключено к выбранному серверу. Выполните защищенное подключение.','Storage is not connected on the selected host. Complete the secure connection.'),
+      repository_password_required:tr('Для нового или неподтвержденного подключения нужен пароль шифрования restic.','A new or unconfirmed binding requires the restic encryption password.'),
+      choose_two_ready_nodes:tr('Выберите два разных сервера со свежим подтверждением готовности Compose.','Choose two different hosts with fresh confirmed Compose readiness.'),
+      repository_auth_failed:tr('Хранилище отклонило учетные данные. Исправьте их перед новым подключением.','Storage rejected the credentials. Correct them before connecting again.'),
+      application_health_unverified:tr('Здоровье приложения не подтверждено. Настройте Docker healthcheck или проверку HTTP и повторите восстановление.','Application health is unverified. Configure Docker healthcheck or an HTTP check and repeat recovery.')
+    };
+    return (explanations[code] || tr('Служба сообщила условие, требующее проверки.','The service reported a condition that requires inspection.'))+' ['+String(code||'unknown_error').slice(0,100)+']';
+  }
+  const message = e => explain(e.code||'unknown_error');
   async function run(fn) { if(busy)return;busy=true;error='';render();try{await fn();}catch(e){progress='';error=message(e);}finally{busy=false;render();} }
   async function observeJobs(items) {
     const epoch=alive;
@@ -96,6 +132,13 @@ export function createManagedUI(ctx) {
   async function connect() {
     const a=w();
     if(!ready(node(a.source))||!ready(node(a.target))||a.source===a.target)throw Object.assign(new Error(),{code:'choose_two_ready_nodes'});
+    const wasReusable=reuse(a);
+    if(wasReusable) {
+      await refreshOverview(false);
+      if(!reuse(a))throw Object.assign(new Error(),{code:'storage_binding_stale'});
+      wipeSecrets(a);a.stage='import';a.reused=true;
+      await advance();return;
+    }
     if(!a.repoPassword)throw Object.assign(new Error(),{code:'repository_password_required'});
     if(!a.created && !a.storage){const body={id:a.id,name:a.storageName,kind:a.kind,endpoint:a.endpoint};if(a.kind==='s3'){body.bucket=a.bucket;body.prefix=a.prefix;if(a.region)body.region=a.region;}await mutate('/api/storages',body);a.created=true;}
     const sid=a.storage||a.id;
@@ -133,7 +176,7 @@ export function createManagedUI(ctx) {
     if(a.stage==='complete'){const completed=await api('/api/services/'+a.serviceId+'/complete',{restoreId:a.restoreId,expectedRevision:rev()});if(completed.completed!==true||completed.service?.setupState!=='complete')throw Object.assign(new Error(),{code:'completion_unconfirmed'});a.stage='done';wipeSecrets(a);await refreshOverview(false);}
   }
   function input(a,key,label,type='text',required=false) {return field(label,h('input',{type,value:a[key]||'',required,autocomplete:'off',maxlength:type==='password'?4096:1024,oninput:e=>{a[key]=e.target.value;}}));}
-  function choice(a,key,label,options){return field(label,select(options,a[key],value=>{a[key]=value;render();}));}
+  function choice(a,key,label,options){const id='managed-choice-'+key;return field(label,select(options,a[key],value=>{a[key]=value;render();document.getElementById(id)?.focus();},{id}));}
   function check(a,key,label){return h('label',{class:'managed-check'},h('input',{type:'checkbox',checked:a[key],onchange:e=>{a[key]=e.target.checked;}}),label);}
   function reason(code) {
     const reasons={
@@ -152,7 +195,7 @@ export function createManagedUI(ctx) {
     return (reasons[code]||tr('Служба не разрешила этот проект','Host service refused this project'))+' ['+code+']';
   }
   function optionsNodes(){return [['',tr('Выберите сервер','Select server')],...nodes().map(n=>[n.id,n.name+' · '+(ready(n)?tr('готов','ready'):n.status?.compose?.error||tr('нет свежих данных','not fresh'))])];}
-  function alerts(){return [error?notice(error,'bad'):null,progress?notice(progress):null,busy?h('p',{'aria-live':'polite'},tr('Выполняется. Ожидаем подтвержденный результат.','Working. Waiting for a confirmed result.')):null];}
+  function alerts(){return [error?notice(error,'bad'):null,progress?notice(progress):null,busy?h('p',{'aria-live':'polite'},tr('Выполняется. Ожидаем подтвержденный результат.','Working. Waiting for a confirmed result.')):null].filter(Boolean);}
   function kit() {
     const a=w();const data={format:'rolypolyops-recovery-kit-v1',metadata:a.challenge?.metadata||list('storages').find(s=>s.id===(a.storage||a.id)),repoPassword:a.repoPassword,credentials:a.kind==='rest'?{username:a.username,password:a.password}:{accessKeyId:a.accessKeyId,secretAccessKey:a.secretAccessKey,sessionToken:a.sessionToken}};
     const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));const link=h('a',{href:url,download:'rolypolyops-recovery-kit.json'});document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
@@ -162,7 +205,7 @@ export function createManagedUI(ctx) {
     const project=node(a.source)?.status?.compose?.projects?.find(p=>p.id===a.project);
     const form=h('form',{class:'card managed-form',onsubmit:e=>{e.preventDefault();run(()=>a.stage==='seal'?confirmConnect():['import','backup','restore','schedule','complete'].includes(a.stage)?advance():connect());}});
     form.append(h('h2',{},storageOnly?tr('Подключить хранилище','Connect storage'):tr('Подключить свой сервис','Connect your service')),notice(tr('Вся группа Compose будет кратко остановлена для согласованного копирования. Образы, данные, настройки и секреты сохраняются в зашифрованной копии. Внешние маршруты и автоматизация по меткам не переносятся.','The whole Compose project pauses briefly for a consistent capture. Images, data, configuration and secrets are included in the encrypted backup. External routing and label-driven automation are not reproduced.')),...alerts());
-    if(a.stage==='done'){form.append(a.restoreId?h('p',{class:'mono'},tr('Восстановление: ','Restore: ')+a.restoreId):null,notice(storageOnly?tr('Хранилище подключено.','Storage connected.'):tr('Настройка подтверждена сервером.','Setup confirmed by the server.')),button(tr('Закрыть','Close'),()=>{clear();render();}));return form;}
+    if(a.stage==='done'){form.append(...(a.restoreId?[h('p',{class:'mono'},tr('Восстановление: ','Restore: ')+a.restoreId)]:[]),notice(storageOnly?tr('Хранилище подключено.','Storage connected.'):tr('Настройка подтверждена сервером.','Setup confirmed by the server.')),button(tr('Закрыть','Close'),()=>{clear();render();}));return form;}
     if(['select','storage'].includes(a.stage)) {
       form.append(h('fieldset',{disabled:busy},h('legend',{},tr('1. Сервис и серверы','1. Service and servers')),choice(a,'source',tr('Исходный сервер','Source host'),optionsNodes()),choice(a,'target',tr('Отдельный сервер восстановления','Separate recovery host'),optionsNodes())));
       if(!storageOnly){
@@ -175,14 +218,18 @@ export function createManagedUI(ctx) {
       }
       form.append(h('h3',{},tr('2. Хранилище','2. Storage')),choice(a,'storage',tr('Хранилище','Storage'),[['',tr('Новое хранилище','New storage')],...list('storages').map(s=>[s.id,s.name])]));
       const existing=list('storages').find(s=>s.id===a.storage);if(existing)a.kind=existing.kind;
+      const reusing=reuse(a);
+      if(reusing){wipeSecrets(a);form.append(notice(tr('Используется существующее подключение к одному репозиторию на обоих выбранных серверах. Повторный ввод паролей и изменение подключения не требуются.','Reusing the existing connection to the same repository on both selected hosts. No passwords or binding changes are needed.')),h('p',{class:'mono'},existing.repositoryId));}
       if(!existing)form.append(input(a,'storageName',tr('Название хранилища','Storage name')),choice(a,'kind',tr('Тип хранилища','Storage kind'),[['rest','REST'],['s3','S3']]),choice(a,'mode',tr('Репозиторий','Repository'),[['create',tr('Создать в новом выделенном месте','Create in a new dedicated namespace')],['attach',tr('Подключить существующий','Attach existing')]]),input(a,'endpoint',tr('Адрес HTTPS','HTTPS endpoint'),'url',true));
       else form.append(h('p',{class:'mono'},existing.endpoint));
+      if(!reusing){
       if(a.kind==='s3'){if(!existing)form.append(input(a,'bucket',tr('Бакет','Bucket')),input(a,'prefix',tr('Префикс','Prefix')),input(a,'region',tr('Регион','Region')));form.append(input(a,'accessKeyId',tr('Ключ доступа S3','S3 access key')),input(a,'secretAccessKey',tr('Секретный ключ S3','S3 secret key'),'password'),input(a,'sessionToken',tr('Временный токен S3 (необязательно)','S3 session token (optional)'),'password'));}else form.append(input(a,'username',tr('Имя пользователя REST','REST username')),input(a,'password',tr('Пароль REST','REST password'),'password'));
       form.append(input(a,'repoPassword',tr('Независимый пароль шифрования restic','Independent restic encryption password'),'password',true),button(tr('Создать случайный пароль','Generate random password'),()=>{a.repoPassword=encode(crypto.getRandomValues(new Uint8Array(32)));render();}),notice(tr('Пароль шифрования нужен для восстановления. Сохраните комплект локально в защищенном месте. Учетные данные шифруются в браузере отдельно для каждого сервера. Сервер панели их не расшифровывает.','The encryption password is required for recovery. Save the kit locally in a secure place. Credentials are encrypted separately for each host in this browser. The controller cannot decrypt them.')),button(tr('Скачать закрытый комплект восстановления','Download private recovery kit'),kit,'',{disabled:!a.challenge&&!list('storages').some(s=>s.id===(a.storage||a.id))}));
+      }
     }
     if(a.stage==='seal')form.append(h('h3',{},tr('Подтвердите точное место хранения','Confirm the exact repository namespace')),h('pre',{class:'managed-code'},JSON.stringify(a.challenge.metadata,null,2)),h('p',{},tr('Срок запроса: ','Challenge expires: ')+date(a.challenge.expiresAt)),h('p',{},a.challenge.bindings.map(b=>(node(b.nodeId)?.name||b.nodeId)+' · '+b.mode+' · '+b.bindingGeneration).join('; ')),notice(tr('Создание допускается только после подтверждения пустого выделенного места. Ошибка пароля, TLS или прав завершает подключение ошибкой.','Creation requires proof that the dedicated namespace is empty. Password, TLS or permission failure fails the connection.')),button(tr('Скачать закрытый комплект восстановления','Download private recovery kit'),kit));
     if(['import','backup','restore','schedule','complete'].includes(a.stage))form.append(h('p',{},tr('Следующий этап: ','Next step: ')+a.stage),notice(tr('Будут выполнены: регистрация, копия, восстановление точной копии на другом сервере, применение расписания и проверка готовности. При ошибке этап не считается завершенным.','The flow registers, captures, restores the exact snapshot on the other host, applies a schedule and checks readiness. Failed stages remain incomplete.')));
-    form.append(h('div',{class:'actions'},h('button',{class:'btn primary',type:'submit',disabled:busy||(!storageOnly&&!project?.supported&&['select','storage'].includes(a.stage))},tr(a.stage==='seal'?'Подтвердить подключение':a.stage==='select'||a.stage==='storage'?'Подготовить защищенное подключение':'Продолжить настройку',a.stage==='seal'?'Confirm connection':a.stage==='select'||a.stage==='storage'?'Prepare secure connection':'Continue setup')),button(tr('Начать новый запрос','Start fresh challenge'),()=>{a.challenge=null;a.sealed=null;a.connectResult=null;pending.clear();a.stage='storage';error='';render();},'',{disabled:busy}),button(tr('Отменить и удалить секреты из формы','Cancel and clear credentials'),()=>{clear();render();},'',{disabled:busy})));
+    form.append(h('div',{class:'actions'},h('button',{class:'btn primary',type:'submit',disabled:busy||(!storageOnly&&!project?.supported&&['select','storage'].includes(a.stage))},tr(a.stage==='seal'?'Подтвердить подключение':['select','storage'].includes(a.stage)?reuse(a)?'Использовать подключение и продолжить':'Подготовить защищенное подключение':'Продолжить настройку',a.stage==='seal'?'Confirm connection':['select','storage'].includes(a.stage)?reuse(a)?'Use connected storage and continue':'Prepare secure connection':'Continue setup')),button(tr('Начать новый запрос','Start fresh challenge'),()=>{a.challenge=null;a.sealed=null;a.connectResult=null;pending.clear();a.stage='storage';error='';render();},'',{disabled:busy}),button(tr('Отменить и удалить секреты из формы','Cancel and clear credentials'),()=>{clear();render();},'',{disabled:busy})));
     if(a.jobs.length)form.append(h('p',{class:'mono'},a.jobs.join('\n')));
     if(busy)for(const control of form.querySelectorAll('input,select,button'))control.disabled=true;
     return form;
@@ -285,7 +332,8 @@ export function createManagedUI(ctx) {
     return view;
   }
   function nodeSummary() {
-    return h('section',{class:'card'},h('h2',{},tr('Готовность своих сервисов Compose','Own-service Compose readiness')),nodes().map(n=>h('div',{class:'managed-row'},h('span',{},n.name),pill(ready(n)?tr('Compose готов','Compose ready'):!fresh(n)?tr('Нет свежей связи','No fresh connection'):n.status?.compose?.error||tr('Возможность Compose не подтверждена','Compose capability unconfirmed'),ready(n)?'neutral':'warn'),h('span',{},tr('Обнаружено проектов: ','Discovered projects: ')+(n.status?.compose?.projects?.length||0)))));
+    return h('section',{class:'card'},h('h2',{},tr('Готовность своих сервисов Compose','Own-service Compose readiness')),nodes().map(n=>h('div',{class:'managed-row'},h('span',{},n.name),pill(ready(n)?tr('Compose готов','Compose ready'):!fresh(n)?tr('Нет свежей связи','No fresh connection'):explain(n.status?.compose?.error||'compose_not_ready'),ready(n)?'neutral':'warn'),h('span',{},tr('Обнаружено проектов: ','Discovered projects: ')+(n.status?.compose?.projects?.length||0)))));
   }
-  return {servicesView,storagesView,nodeSummary,clear};
+  function homeView(){const view=servicesView();if(nodes().length)view.append(nodeSummary());return view;}
+  return {servicesView,storagesView,homeView,nodeSummary,explain,clear};
 }
