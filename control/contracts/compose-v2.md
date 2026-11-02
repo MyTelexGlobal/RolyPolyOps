@@ -1,3 +1,5 @@
+[Русский](compose-v2.ru.md)
+
 # Compose service and storage contract, version 2
 
 Status: implementation contract for 0.2.0; capabilities require acceptance before release. Existing demo APIs remain compatible. This contract concerns product behavior, not a delivery process.

@@ -1,4 +1,7 @@
+import { createManagedUI } from "./managed.js";
 const dictionary = {
+  services: ["Свои сервисы", "Own services"],
+  storages: ["Хранилища", "Storage"],
   edition: ["Управление защитой", "Recovery control"],
   dashboard: ["Обзор", "Overview"],
   restore: ["Восстановление", "Recovery"],
@@ -17,8 +20,8 @@ const dictionary = {
     "A backup becomes useful when recovery has been checked.",
   ],
   scope: [
-    "Поддерживается тестовый сервис PostgreSQL + файлы.",
-    "Supports the bundled PostgreSQL + files demo service.",
+    "Свои сервисы Compose и тестовый PostgreSQL + файлы.",
+    "Compose services and the bundled PostgreSQL + files demo.",
   ],
   authTitle: ["Сохранить данные.", "Keep your data."],
   authAccent: ["Вернуть сервис.", "Bring services back."],
@@ -657,6 +660,18 @@ Object.assign(dictionary, {
     "A host has an operation missing from the catalog. Establish its outcome before new changes."
   ]
 });
+Object.assign(dictionary, {
+  "storage-configure": ["Подключение хранилища", "Connect storage"],
+  "compose-register": ["Регистрация Compose", "Register Compose"],
+  "compose-backup": ["Копирование сервиса", "Back up service"],
+  "compose-verify": ["Проверка репозитория сервиса", "Verify service repository"],
+  "compose-restore": ["Восстановление сервиса", "Restore service"],
+  "compose-remove": ["Удаление отдельной копии", "Remove isolated restore"],
+  "compose-schedule": ["Расписание сервиса", "Service schedule"],
+  "compose-stop": ["Остановка источника", "Stop source"],
+  "compose-activate": ["Активация новой копии", "Activate restored copy"],
+  "compose-resume": ["Возобновление источника", "Resume source"]
+});
 const $ = (id) => document.getElementById(id);
 const stored = (key, fallback) => {
   try {
@@ -960,6 +975,7 @@ async function api(path, body) {
     e.code = result.error || "generic";
     e.http = response.status;
     if (response.status === 401 && path !== "/api/login") {
+      managed.clear();
       state.session = { authenticated: false };
       state.overview = null;
       if ($("dialog").open) closeDialog();
@@ -971,7 +987,7 @@ async function api(path, body) {
 }
 function setRoute(route) {
   if (
-    !["dashboard", "restore", "nodes", "history", "settings", "setup"].includes(
+    !["dashboard", "services", "storages", "restore", "nodes", "history", "settings", "setup"].includes(
       route,
     )
   )
@@ -1195,6 +1211,8 @@ function authView(change) {
 function shell() {
   const navItems = [
     ["dashboard", "▦"],
+    ["services", "◈"],
+    ["storages", "▱"],
     ["restore", "↶"],
     ["nodes", "▤"],
     ["history", "◷"],
@@ -1258,6 +1276,7 @@ function shell() {
           onclick: async () => {
             try {
               await api("/api/logout", {});
+              managed.clear();
               state.session = { authenticated: false };
               state.overview = null;
               render();
@@ -1300,6 +1319,8 @@ function shell() {
     if (banner) main.append(banner);
     const views = {
       dashboard: dashboardView,
+      services: managed.servicesView,
+      storages: managed.storagesView,
       restore: restoreView,
       nodes: nodesView,
       history: historyView,
@@ -1544,9 +1565,10 @@ function dashboardView() {
         disabled: !fresh(p) || p?.status?.supported !== true,
       }),
       button(t("viewRecovery"), () => setRoute("restore")),
+      button(state.lang === "ru" ? "Подключить свой сервис" : "Connect your service", () => setRoute("services"), "primary"),
     ]),
   );
-  if (!state.overview.setup.completed)
+  if (!state.overview.setup?.completed)
     view.append(
       notice(t("setupIncomplete"), "warn"),
       button(
@@ -1923,6 +1945,7 @@ function nodesView() {
       button(t("addNode"), enrollDialog, "primary"),
     ]),
   );
+  view.append(managed.nodeSummary());
   if (!state.overview.nodes.length)
     view.append(
       h(
@@ -3025,7 +3048,7 @@ $("dialog").addEventListener("close", () => {
 window.addEventListener("hashchange", () => {
   state.route = location.hash.slice(1) || "dashboard";
   if (
-    !["dashboard", "restore", "nodes", "history", "settings", "setup"].includes(
+    !["dashboard", "services", "storages", "restore", "nodes", "history", "settings", "setup"].includes(
       state.route,
     )
   )
@@ -3033,4 +3056,5 @@ window.addEventListener("hashchange", () => {
   render();
 });
 window.addEventListener("online", () => refreshOverview(true));
+const managed = createManagedUI({t,h,button,field,select,notice,pill,head,state,api,render,fresh,date,bytes,showJob,refreshOverview,setRoute});
 start();
