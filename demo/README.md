@@ -35,7 +35,7 @@ handle_path /backup/* {
 
 Generate a strong random restic encryption password independently of the HTTP password. Store it as `/etc/rolypolyops/repository-password`, root-owned, mode 0600, on both hosts and in a separate protected recovery kit. Loss of this password makes recovery impossible. Keep all private configuration outside this repository.
 
-Install `ops/labctl` as `/usr/local/sbin/rolypolyops-lab`. Create a root-owned `/etc/rolypolyops/lab.env`, mode 0600:
+Install `ops/labctl` as `/usr/local/sbin/rolypolyops-lab`, `ops/restore-policy.py` as `/usr/local/lib/rolypolyops/restore-policy.py`, and this release's `compose.yaml` as the root-owned `/etc/rolypolyops/package-compose.yaml`. The control agent installer performs these steps automatically. Recovery rejects different Compose definitions and symbolic links before container startup, and reconstructs a closed environment rather than trusting captured execution controls. Create a root-owned `/etc/rolypolyops/lab.env`, mode 0600:
 
 ```sh
 RPO_ROOT=/opt/rolypolyops-lab
@@ -63,7 +63,7 @@ sudo rolypolyops-lab restore-standby latest
 
 A capture pauses the demo web process, takes a logical PostgreSQL dump and matching files, preserves the application credential and Compose definition, then resumes the web process. Image export and encrypted transfer happen afterward. Only this demo's known writer is stopped; this procedure is unsuitable for an application with other writers.
 
-The capture includes exact web/database image IDs, saved images, checksums, and expected record values. Restore uses a fresh directory, a separate Compose project and loopback port 18081 for a drill or 18080 for a retained standby. It loads the saved images, restores the database, and checks actual record values, file SHA-256, HTTP health, version, image identity, fresh bind mounts and runtime restrictions. The original Compose recreates those restrictions. Existing source/target demo data is not overwritten.
+The capture includes exact web/database image IDs, saved images, checksums, and expected record values. Restore uses a fresh directory and separate Compose project. Drills and control-panel previews use internal isolated networks without published ports; a standalone retained standby can use loopback port 18080. It loads the saved images, restores the database, and checks actual record values, file SHA-256, HTTP health, version, image identity, fresh bind mounts and runtime restrictions. The original Compose recreates those restrictions. Existing source/target demo data is not overwritten.
 
 `restore-check` removes its temporary containers, networks and directory after verification. Failed cleanup preserves the directory for investigation and returns failure. `restore-standby` retains the checked copy and records its location in `/var/lib/rolypolyops/standby.json`. It refuses to overwrite an existing standby record. A ready standby is not promoted automatically.
 

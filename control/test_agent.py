@@ -1,5 +1,6 @@
 """Host authority, replay and receipt recovery checks without privileged execution."""
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -130,6 +131,40 @@ class HostAuthorityTests(unittest.TestCase):
         agent.atomic(target, {"secret": "not-for-log"})
         self.assertEqual(target.stat().st_mode & 0o777, 0o600)
         self.assertEqual(json.loads(target.read_text()), {"secret": "not-for-log"})
+
+    def test_reconcile_uses_operation_proof_not_an_unrelated_latest_success(self):
+        request = job("restore-check", snapshotId="a" * 64)
+        path = self.state / "jobs" / (request["id"] + ".json")
+        receipt = {"id": request["id"], "nonce": request["nonce"], "status": "outcome_unknown"}
+        lab = self.state / "lab"
+        agent.atomic(lab / "last-restore-check.json", {"operationId": str(uuid.uuid4()), "snapshot": "a" * 64})
+        original_open = os.open
+        def redirected_open(name, flags, mode=0o777):
+            return original_open(str(self.state / "test.lock") if str(name) == "/run/lock/rolypolyops-lab.lock" else name, flags, mode)
+        with patch.object(agent, "LAB_STATE", lab), patch.object(agent.os, "open", side_effect=redirected_open):
+            self.agent.reconcile(request, path, receipt)
+            self.assertEqual(agent.read_json(path)["status"], "outcome_unknown")
+            agent.atomic(lab / "operation-proofs" / (request["id"] + ".json"), {"operationId": request["id"], "snapshot": "a" * 64, "checks": ["database-values"]})
+            self.agent.reconcile(request, path, receipt)
+            self.assertEqual(agent.read_json(path)["status"], "outcome_unknown")
+            agent.atomic(lab / "operation-proofs" / (request["id"] + ".json"), {"operationId": request["id"], "snapshot": "a" * 64, "checks": sorted(agent.RESTORE_CHECKS)})
+            self.agent.reconcile(request, path, receipt)
+            self.assertEqual(agent.read_json(path)["status"], "succeeded")
+            self.assertEqual(agent.read_json(path)["result"]["snapshot"], "a" * 64)
+
+    def test_reconcile_schedule_checks_actual_enabled_interval(self):
+        request = job("set-schedule", parameters={"interval": "hourly"})
+        path = self.state / "jobs" / (request["id"] + ".json")
+        receipt = {"id": request["id"], "nonce": request["nonce"], "status": "outcome_unknown"}
+        original_open = os.open
+        def redirected_open(name, flags, mode=0o777):
+            return original_open(str(self.state / "test.lock") if str(name) == "/run/lock/rolypolyops-lab.lock" else name, flags, mode)
+        with patch.object(agent, "LAB_STATE", self.state / "lab"), patch.object(agent.os, "open", side_effect=redirected_open), patch.object(agent, "timer_status", return_value={"enabled": True, "interval": "daily"}):
+            self.agent.reconcile(request, path, receipt)
+            self.assertEqual(agent.read_json(path)["status"], "outcome_unknown")
+        with patch.object(agent, "LAB_STATE", self.state / "lab"), patch.object(agent.os, "open", side_effect=redirected_open), patch.object(agent, "timer_status", return_value={"enabled": True, "interval": "hourly"}):
+            self.agent.reconcile(request, path, receipt)
+            self.assertEqual(agent.read_json(path)["status"], "succeeded")
 
 
 if __name__ == "__main__":

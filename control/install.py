@@ -21,6 +21,7 @@ DEST = Path("/opt/rolypolyops/control")
 STATE = Path("/var/lib/rolypolyops-control")
 AGENT_CONFIG = Path("/etc/rolypolyops/agent.json")
 UNIT_DIR = Path("/etc/systemd/system")
+CONFIG_DIR = Path("/etc/rolypolyops")
 
 
 def command(args):
@@ -44,11 +45,35 @@ def copy_source():
             file.chmod(0o755 if file.is_dir() else 0o644)
 
 
+def install_package_policy():
+    package = Path(__file__).resolve().parent.parent / "demo"
+    if not all((package / name).is_file() for name in ("compose.yaml", "ops/labctl", "ops/restore-policy.py")):
+        raise ValueError("A complete trusted release checkout is required")
+    config = CONFIG_DIR
+    config.mkdir(parents=True, exist_ok=True, mode=0o700)
+    shutil.copyfile(package / "compose.yaml", config / "package-compose.yaml")
+    (config / "package-compose.yaml").chmod(0o644)
+    library = Path("/usr/local/lib/rolypolyops")
+    library.mkdir(parents=True, exist_ok=True, mode=0o755)
+    library.chmod(0o755)
+    shutil.copyfile(package / "ops/restore-policy.py", library / "restore-policy.py")
+    (library / "restore-policy.py").chmod(0o644)
+    temporary = Path("/usr/local/sbin/.rolypolyops-lab.new")
+    shutil.copyfile(package / "ops/labctl", temporary)
+    temporary.chmod(0o755)
+    os.replace(temporary, Path("/usr/local/sbin/rolypolyops-lab"))
+
+
 def controller(origin, configure_proxy):
     parsed = urllib.parse.urlsplit(origin)
     if parsed.scheme != "https" or not parsed.hostname or parsed.path not in {"", "/"} or parsed.query or parsed.fragment or parsed.username or parsed.password:
         raise ValueError("Use an HTTPS origin without a path or credentials")
-    existing = read_json(STATE / "installation.json")
+    config_dir = CONFIG_DIR
+    config_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    config_stat = config_dir.lstat()
+    if config_dir.is_symlink() or config_stat.st_uid != 0 or config_stat.st_mode & 0o022:
+        raise ValueError("Untrusted installation configuration directory")
+    existing = read_json(config_dir / "control-installation.json")
     if existing and existing.get("origin") != origin.rstrip("/"):
         raise ValueError("Existing installation uses a different origin; refusing to replace it")
     try:
@@ -56,12 +81,17 @@ def controller(origin, configure_proxy):
     except KeyError:
         command(["useradd", "--system", "--home-dir", str(STATE), "--shell", "/usr/sbin/nologin", "rolypolyops-control"])
         account = pwd.getpwnam("rolypolyops-control")
+    if account.pw_uid == 0:
+        raise ValueError("The control account must be unprivileged")
     copy_source()
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
-    command([sys.executable, str(DEST / "controller.py"), "init", "--data-dir", str(STATE), "--origin", origin])
-    atomic(STATE / "installation.json", {"origin": origin.rstrip("/"), "version": VERSION})
-    for file in [STATE] + list(STATE.rglob("*")):
-        os.chown(file, account.pw_uid, account.pw_gid)
+    if STATE.is_symlink():
+        raise ValueError("Untrusted control data directory")
+    # User-writable catalog paths are opened only with the service account's authority.
+    # Never recursively chown paths supplied by an unprivileged process.
+    os.chown(STATE, account.pw_uid, account.pw_gid, follow_symlinks=False)
+    command(["runuser", "-u", "rolypolyops-control", "--", sys.executable, str(DEST / "controller.py"), "init", "--data-dir", str(STATE), "--origin", origin])
+    atomic(config_dir / "control-installation.json", {"origin": origin.rstrip("/"), "version": VERSION})
     unit = f"""[Unit]
 Description=RolyPolyOps control service
 After=network-online.target
@@ -133,6 +163,7 @@ def agent(controller_url, enrollment, replace=False):
         config = {"controller": controller_url.rstrip("/"), "nodeId": enrolled["nodeId"], "token": enrolled["token"], "role": enrolled["role"]}
         atomic(AGENT_CONFIG, config)
     copy_source()
+    install_package_policy()
     unit = f"""[Unit]
 Description=RolyPolyOps outbound host service
 After=network-online.target docker.service

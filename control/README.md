@@ -40,7 +40,7 @@ Agents use certificate-validated outgoing HTTPS. No agent port, SSH private key 
 
 Select the service and recovery point, review the proposed action and confirm it. The panel saves the operation before dispatch. Repeated submission returns the same job. Keep or reload the page while it runs; results and history remain available. Backups can briefly pause the bundled writer, which is disclosed in the confirmation.
 
-A recovery test uses new directories, a separate project and a loopback listener. A retained preview uses port 18082 and never replaces the live site on port 18080. Only the preview recorded by the host service can be removed. Checks cover actual database values, file hash, HTTP, app version, image identity, fresh mounts and runtime restrictions.
+A recovery test uses new directories, a separate project and internal isolated networks without published ports. A retained preview uses the same network restriction and never replaces the live site. Its HTTP check runs inside the container. Only the preview recorded by the host service can be removed. Checks cover actual database values, file hash, HTTP, app version, image identity, fresh mounts and runtime restrictions.
 
 The backup interval changes through a host operation, not merely a saved preference. The wizard checks the observed timer state before marking setup complete. Unknown or old observations are shown explicitly. Losing the control process does not stop existing local systemd schedules.
 
@@ -55,7 +55,7 @@ Rollback removes the added Caddy route and stops only `rolypolyops-control.servi
 ## 6 Checks and limits
 
 ```sh
-python3 -m unittest control.test_controller control.test_agent
+python3 -m unittest control.test_controller control.test_agent control.test_restore_policy control.test_install
 ```
 
 These checks cover authentication, request protection, job identity, queue persistence and host authority. They complement real browser and two-host recovery tests. They do not prove provider-outage recovery, split-brain prevention or support for other service packages. The public demo remains read-only.

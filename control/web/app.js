@@ -595,6 +595,12 @@ Object.assign(dictionary, {
     "The operation was cancelled before dispatch.",
   ],
 });
+Object.assign(dictionary, {
+  alert_catalog_receipt_orphaned: [
+    "Сервер учитывает операцию, которой нет в каталоге. Перед новыми изменениями нужно установить ее результат.",
+    "A host has an operation missing from the catalog. Establish its outcome before new changes."
+  ]
+});
 const $ = (id) => document.getElementById(id);
 const stored = (key, fallback) => {
   try {

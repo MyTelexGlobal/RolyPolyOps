@@ -26,6 +26,7 @@ LAB_STATE = Path("/var/lib/rolypolyops")
 PREVIEWS = Path("/var/lib/rolypolyops-control-previews")
 ACTIONS = {"backup", "verify", "restore-check", "restore-preview", "remove-preview", "set-schedule"}
 SNAPSHOT = re.compile(r"^[a-f0-9]{64}$")
+RESTORE_CHECKS = {"database-values", "file-sha256", "application-http", "app-version", "image-ids", "fresh-mounts", "runtime-restrictions"}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -326,7 +327,7 @@ class Agent:
                 base = PREVIEWS / job["id"]
                 if base.exists():
                     raise RuntimeError("preview_directory_exists")
-                env.update(RPO_STATE_DIR=str(base), RPO_RESTORE_PORT="18082")
+                env.update(RPO_STATE_DIR=str(base), RPO_RESTORE_PORT="18082", RPO_PREVIEW="1")
                 raw = self.command([LAB, "restore-standby", job["snapshotId"]], receipt, path, env=env)
                 private = read_json(base / "standby.json")
                 if not private or private.get("snapshot") != job["snapshotId"]:
@@ -340,6 +341,8 @@ class Agent:
                     raise RuntimeError("preview_missing")
                 if job["parameters"]["previewId"] != preview.get("id"):
                     raise RuntimeError("preview_ownership_invalid")
+                receipt["removingPreview"] = {k: preview[k] for k in ("id", "base", "root", "project")}
+                atomic(path, receipt)
                 base, root = Path(preview["base"]).resolve(), Path(preview["root"]).resolve()
                 if base.parent != PREVIEWS.resolve() or str(uuid.UUID(base.name)) != base.name or not root.is_relative_to(base):
                     raise RuntimeError("preview_ownership_invalid")
@@ -391,15 +394,42 @@ class Agent:
         lock = os.open("/run/lock/rolypolyops-lab.lock", os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            proofs = {"backup": "last-backup.json", "restore-check": "last-restore-check.json", "verify": "last-verify.json"}
-            evidence = read_json(LAB_STATE / proofs[job["action"]]) if job["action"] in proofs else None
-            if evidence and evidence.get("operationId") == job["id"]:
+            evidence = read_json(LAB_STATE / "operation-proofs" / (job["id"] + ".json"))
+            valid_proof = bool(evidence and evidence.get("operationId") == job["id"] and (
+                (job["action"] == "backup" and SNAPSHOT.fullmatch(str(evidence.get("snapshot", "")))) or
+                (job["action"] == "verify" and "repository-data" in evidence.get("checks", [])) or
+                (job["action"] == "restore-check" and evidence.get("snapshot") == job["snapshotId"] and RESTORE_CHECKS <= set(evidence.get("checks", [])))))
+            if valid_proof:
                 result = metadata(evidence) or {}
                 if job["action"] == "verify": result.update(verified=True, checks=["repository-data"])
                 receipt.update(status="succeeded", stage="completed", result=result)
+            elif job["action"] == "set-schedule" and (timer := timer_status("rolypolyops-backup.timer"))["enabled"] and timer.get("interval") == job["parameters"]["interval"]:
+                receipt.update(status="succeeded", stage="completed", result={"interval": timer["interval"], "enabled": True, "at": now()})
+            elif job["action"] == "restore-preview":
+                base = PREVIEWS / job["id"]
+                proof = read_json(base / "operation-proofs" / (job["id"] + ".json"))
+                private = read_json(base / "standby.json")
+                if proof and private and proof.get("operationId") == job["id"] and private.get("snapshot") == job["snapshotId"] and Path(private.get("root", "")).resolve().is_relative_to(base.resolve()):
+                    response = run(["docker", "inspect", private["project"] + "-web-1", private["project"] + "-db-1"])
+                    info = json.loads(response.stdout) if response.returncode == 0 else []
+                    if len(info) == 2 and all(i.get("State", {}).get("Health", {}).get("Status") == "healthy" for i in info):
+                        private.update(id=job["id"], base=str(base))
+                        atomic(self.state / "preview.json", private)
+                        receipt.update(status="succeeded", stage="completed", result=metadata(private) | {"preview": metadata(private) | {"id": job["id"], "createdAt": private.get("at")}})
+            elif job["action"] == "remove-preview" and (old := receipt.get("removingPreview")):
+                base = Path(old["base"]).resolve()
+                if base.parent == PREVIEWS.resolve() and not base.exists() and re.fullmatch(r"rpo-restore-[a-z0-9]+", old["project"]):
+                    live = run(["docker", "ps", "-aq", "--filter", "label=com.docker.compose.project=" + old["project"]])
+                    if live.returncode == 0 and not live.stdout.strip():
+                        current = read_json(self.state / "preview.json")
+                        if current and current.get("id") == old["id"]:
+                            (self.state / "preview.json").unlink()
+                        receipt.update(status="succeeded", stage="completed", result={"removed": True, "at": now()})
             else:
                 receipt.update(status="outcome_unknown", stage="interrupted", error="reconciliation_required")
             receipt.pop("acknowledged", None)
+            if receipt["status"] not in {"succeeded", "failed"}:
+                receipt.update(status="outcome_unknown", stage="interrupted", error="reconciliation_required")
             atomic(path, receipt)
         except BlockingIOError:
             pass

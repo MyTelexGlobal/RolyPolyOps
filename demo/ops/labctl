@@ -15,7 +15,20 @@ exec 9>/run/lock/rolypolyops-lab.lock
 flock -n 9 || { echo 'Another lab operation is running.' >&2; exit 1; }
 dc() { docker compose --project-directory "$root" -p "${RPO_PROJECT:-rolypoly-demo}" "$@"; }
 restic() { command restic --retry-lock 5m "$@"; }
-stage= work= project= paused=0 keep=0
+stage= work= project= proof_file= paused=0 keep=0
+save_proof() {
+  python3 - "$base" "$proof_file" <<'PY'
+import json,os,pathlib,tempfile,uuid,sys
+p=pathlib.Path(sys.argv[1]);value=json.loads((p/sys.argv[2]).read_text());identity=value.get('operationId')
+if identity:
+    assert str(uuid.UUID(identity))==identity
+    directory=p/'operation-proofs';directory.mkdir(exist_ok=True,mode=0o700)
+    with tempfile.NamedTemporaryFile(mode='w',dir=directory,delete=False) as f:
+        json.dump(value,f);f.flush();os.fsync(f.fileno());temporary=f.name
+    os.replace(temporary,directory/(identity+'.json'))
+    fd=os.open(directory,os.O_RDONLY);os.fsync(fd);os.close(fd)
+PY
+}
 cleanup() {
   rc=$?
   trap - EXIT
@@ -28,6 +41,7 @@ cleanup() {
   fi
   [[ -z $stage ]] || rm -rf -- "$stage"
   [[ -z $work || $keep == 1 ]] || rm -rf -- "$work"
+  if [[ $rc == 0 && -n $proof_file ]]; then save_proof || rc=1; fi
   exit "$rc"
 }
 trap cleanup EXIT
@@ -79,6 +93,7 @@ r={'status':'backup-created','snapshot':s['snapshot_id'],'at':datetime.datetime.
 (p/'last-backup.json.tmp').write_text(json.dumps(r)+'\n');(p/'last-backup.json.tmp').replace(p/'last-backup.json')
 print(json.dumps(r))
 PY
+    proof_file=last-backup.json
     ;;
   verify)
     restic check --read-data
@@ -88,6 +103,7 @@ p=pathlib.Path(sys.argv[1]);r={'status':'repository-verified','at':datetime.date
 (p/'last-verify.json.tmp').write_text(json.dumps(r)+'\n');(p/'last-verify.json.tmp').replace(p/'last-verify.json')
 print(json.dumps(r))
 PY
+    proof_file=last-verify.json
     ;;
   restore-check|restore-standby)
     snapshot=${2:-latest}
@@ -108,13 +124,14 @@ print(a[0].parent)
 PY
 )
     (cd "$capture"; sha256sum --quiet -c SHA256SUMS)
-    docker load -i "$capture/images.tar" >/dev/null
     cp -a "$capture/service" "$work/service"
     default_port=18080
     [[ $command != restore-check ]] || default_port=18081
     port=${RPO_RESTORE_PORT:-$default_port}
     [[ $port =~ ^[0-9]+$ && $port -ge 1024 && $port -le 65535 ]] || exit 1
-    printf 'SITE_LABEL=%s\nWEB_PORT=%s\n' "${RPO_TARGET_LABEL:-SITE B - RESTORED}" "$port" >> "$work/service/.env"
+    isolated=0
+    if [[ $command == restore-check || ${RPO_PREVIEW:-0} == 1 ]]; then isolated=1; fi
+    python3 /usr/local/lib/rolypolyops/restore-policy.py "$work/service" "$capture/capture.json" "$capture/images.tar" "$port" "${RPO_TARGET_LABEL:-SITE B - RESTORED}" "$isolated"
     project=rpo-restore-$(basename "$work" | cut -d. -f2 | tr '[:upper:]' '[:lower:]')
     docker compose --project-directory "$work/service" -p "$project" up -d --no-build --pull never db
     ready=0
@@ -129,11 +146,13 @@ PY
     docker compose --project-directory "$work/service" -p "$project" up -d --no-build --pull never web
     ready=0
     for i in $(seq 1 30); do
-      if curl -fsS --max-time 5 "http://127.0.0.1:$port/api/status" > "$work/actual.json"; then ready=1; break; fi
+      if [[ $isolated == 1 ]]; then
+        if docker compose --project-directory "$work/service" -p "$project" exec -T web node -e "fetch('http://127.0.0.1:8080/api/status').then(async r=>{if(!r.ok)process.exit(1);process.stdout.write(await r.text())}).catch(()=>process.exit(1))" > "$work/actual.json"; then ready=1; break; fi
+      elif curl -fsS --max-time 5 "http://127.0.0.1:$port/api/status" > "$work/actual.json"; then ready=1; break; fi
       sleep 2
     done
     [[ $ready == 1 ]] || { echo 'Restored application is unhealthy' >&2; exit 1; }
-    python3 - "$capture/expected.json" "$work/actual.json" "$capture/capture.json" "$project" "$work/service" <<'PY'
+    python3 - "$capture/expected.json" "$work/actual.json" "$capture/capture.json" "$project" "$work/service" "$isolated" <<'PY'
 import json,pathlib,subprocess,sys
 expected,actual,manifest=[json.load(open(p)) for p in sys.argv[1:4]]
 assert actual['healthy'] is True
@@ -152,6 +171,12 @@ for service,key in [('web','webImage'),('db','dbImage')]:
         assert 'ALL' in host['CapDrop']
         assert 'no-new-privileges:true' in host['SecurityOpt']
     else: assert not info['NetworkSettings']['Ports'].get('5432/tcp')
+    if sys.argv[6]=='1':
+        assert not any(info['NetworkSettings']['Ports'].values())
+        for network in info['NetworkSettings']['Networks']:
+            definition=json.loads(subprocess.check_output(['docker','network','inspect',network],text=True))[0]
+            assert definition['Internal'] is True
+            assert definition['Options']['com.docker.network.bridge.gateway_mode_ipv4']=='isolated'
 print('PASS: database values, attachment hash, app version, image IDs, fresh mounts and runtime restrictions')
 PY
     python3 - "$base" "$snapshot" "$work" "$project" "$command" "$port" <<'PY'
@@ -164,6 +189,7 @@ if sys.argv[5]=='restore-standby':
 print(json.dumps(r))
 PY
     if [[ $command == restore-standby ]]; then keep=1; fi
+    proof_file=last-restore-check.json
     ;;
   *) echo 'Usage: labctl init|status|backup|verify|restore-check [snapshot]|restore-standby [snapshot]' >&2; exit 2 ;;
 esac
