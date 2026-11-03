@@ -1731,7 +1731,7 @@ class ManagedEngine:
                     os.close(descriptor)
             intent.update(complete=True, completedAt=now())
             atomic(self._journal_path(identity), journal)
-        except (EngineError, StorageError, ArchiveError, OSError, ValueError, KeyError, TypeError, AttributeError):
+        except (EngineError, StorageError, ArchiveError, OSError, ValueError, KeyError, TypeError, AttributeError, IndexError, StopIteration, RecursionError):
             raise EngineError("payload_cleanup_unverified", unknown=True) from None
 
     def _backup(self, params):
