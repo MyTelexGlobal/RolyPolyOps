@@ -2,7 +2,7 @@
 
 [Русский](../ru/compose-services.md)
 
-This guide describes the 0.2 implementation candidate. A completed browser wizard is a per-service observation, not certification of every provider, application or operating system. Live two-host acceptance and release approval must be established separately.
+This guide describes the 0.2 preview. REST and S3 setup, backup, isolated recovery and scheduling have been exercised on two Linux amd64 Docker hosts. Wizard readiness applies to an individual service. Validate application data and storage behavior for your environment; support for every provider and operating system is not established.
 
 ## 1 Prepare hosts
 
@@ -18,7 +18,7 @@ Open **Own services**, then **Connect your service**. Select the source, its dis
 
 Confirm that only this project's containers write its data. The host detects overlapping running-container mounts, but cannot reliably discover native host writers. Capture stops all project containers while their persistent data is staged locally. The pause depends on data size and disk speed. The previously running set resumes before exact image export and encrypted upload. This is a cold capture, without a zero-downtime guarantee.
 
-Ordinary named volumes, local data/configuration binds, file configs/secrets and resolved environment are included. Persistent application state must be in these mounts. Changes made only in a container writable layer are not captured. Privileged containers, host namespaces, host control sockets, remote/external/shared resources, unsupported executable fields and unsafe archive metadata are refused. External routing and automation attached to application labels are not reproduced.
+The project must have one running container per enabled service. Compose files and local mount sources must be readable by the installed host service. Images must already be built and locally available; restore uses the archived image identities without building or pulling images. Image conversion between CPU architectures is not provided. An explicit service `platform` field is currently refused. Use locally available images native to both hosts without this field. Ordinary named volumes, local data/configuration binds, file configs/secrets and resolved environment are included. Persistent application state must be in these mounts. Changes made only in a container writable layer are not captured. Privileged containers, host namespaces, host control sockets, remote/external/shared resources, unsupported executable fields and unsafe archive metadata are refused. External routing and automation attached to application labels are not reproduced.
 
 ## 3 Connect storage securely
 
@@ -35,6 +35,8 @@ The browser receives a short-lived request, node public keys and binding generat
 Download the private recovery kit after the final namespace is displayed. It contains plaintext secrets for your local custody: store it securely and do not send it to the panel or post it publicly. Form secrets stay in memory, are cleared on completion/sign-out, and are not put in browser persistent storage. Closing or reloading the page loses the form secrets; durable jobs and service observations remain in the catalog.
 
 The enrolled hosts retain decrypted credentials and locally staged application data under root-only access. Repository encryption does not encrypt all host state. Protect those directories and their backups; see [secret storage](security.md#2-current-secret-storage). The kit contains repository credentials, not the control administrator password or catalog.
+
+Each service uses one selected repository. Connecting two hosts to it does not create a second independent copy or failure domain. Other storage entries are separate connections, not automatic mirrors. This version does not configure replication, object-lock protection or automatic retention pruning. The storage owner must manage capacity and deletion protection separately; credentials supplied to a host may permit deletion of repository data.
 
 ## 4 Complete the first recovery
 

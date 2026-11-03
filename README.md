@@ -2,13 +2,14 @@
 
 [Русский](README.ru.md)
 
-**0.2 candidate:** adds the own-Compose service and REST/S3 storage wizard. See the [service guide](docs/en/compose-services.md) for workflow, supported scope and limitations. Live two-host acceptance and release approval remain separate requirements. The demo sections below describe the preserved 0.1 mode.
+**0.2 preview:** connect a supported Compose service and REST/S3 repository through the wizard, create an encrypted backup and restore it on another host. Both storage routes have been exercised on two Linux amd64 Docker hosts. See the [service guide](docs/en/compose-services.md) for the supported model and limits. The bundled demo remains available.
 
-Service backups, verified recovery, and safe failover between independent hosting providers.
+Encrypted service backups, tested recovery and operator-confirmed moves between hosting providers.
 
-**Status: 0.2 implementation candidate. The existing 0.1 demo remains available.
-Own Compose services use the new guided storage/import/backup/restore/schedule flow.
-Automatic failover is unavailable; live acceptance is required before release.**
+**Status: 0.2 preview for compatible Linux Docker hosts.
+Guided storage connection, service import, backup, isolated recovery and scheduling are available.
+The wizard uses two enrolled hosts and one selected repository per service.
+Automatic failover, DNS switching and storage replication remain unimplemented.**
 
 Start with the [control guide](control/README.md). The separately versioned
 [recovery lab](demo/README.md) supplies the tested service package and backup mechanism.
@@ -22,7 +23,9 @@ Start with the [control guide](control/README.md). The separately versioned
 - Explicit data-loss policies and protection against two writable primary databases.
 - English and Russian product documentation with matching sections and contract identifiers.
 
-## Profiles
+## Planned profiles
+
+These profiles describe the target architecture. The [Compose guide](docs/en/compose-services.md) defines the current implementation.
 
 | Profile | Intended behavior |
 |---|---|
@@ -35,6 +38,8 @@ Server count alone does not establish independent failure domains or authorize a
 Storage replicas do not replace retained backup history.
 
 ## Documentation
+
+- [0.2 preview release notes](docs/en/release-0.2.md)
 
 - [Architecture](docs/en/architecture.md)
 - [Requirements and limits](docs/en/requirements.md)

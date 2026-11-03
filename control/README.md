@@ -2,7 +2,7 @@
 
 [Русский](README.ru.md)
 
-**0.2 candidate:** adds the own-Compose service and REST/S3 storage wizard. See the [service guide](../docs/en/compose-services.md) for workflow, supported scope and limitations. Live two-host acceptance and release approval remain separate requirements. The demo sections below describe the preserved 0.1 mode.
+**0.2 preview:** connect a supported Compose service and REST/S3 repository through the wizard, create an encrypted backup and restore it on another host. Both storage routes have been exercised on two Linux amd64 Docker hosts. See the [service guide](../docs/en/compose-services.md) for the supported model and limits. The bundled demo remains available.
 
 ## 1 Available functions
 
@@ -49,6 +49,12 @@ Use the optional `--configure-proxy` flag only when Caddy already includes the m
 
 Open `https://control.example.org/ops/` and check certificate validation from the browser and both hosts. The initial administrator password is in `/var/lib/rolypolyops-control/admin-password`, accessible through privileged server access. Change it on first login and save it separately in a password manager. The downloadable repository recovery kit does not include the administrator password or control catalog. There is no public administrator registration. Reinstalling preserves the catalog and existing credentials.
 
+### Updating an existing installation
+
+An existing agent can keep its registration for the same controller without a new enrollment code. Preserve its configuration, token, node identity and entire state directory; do not use replacement enrollment to update software.
+
+The installer replaces program files, compatibility helpers and service definitions and can install missing prerequisites. It is not a transactional updater. Resolve active and unknown operations first. Keep a protected recovery set containing the previous release and service definitions, host configurations and state, and a consistent SQLite backup of the controller catalog. The first new controller start can extend the schema. There is no automatic downgrade. Use a version-specific update and recovery procedure, especially where existing services or demo helpers must remain unchanged.
+
 ## 3 Connect hosts
 
 Choose **Servers**, then **Add server**, name the first host and select the primary role. Run the displayed enrollment command from its root-owned release directory. Repeat for a different host with the recovery role. These roles control the bundled demo; own-Compose services select their source and recovery hosts per service. The command installs the outbound host service. A code expires in 15 minutes and is single-use. It contains temporary authority: do not post it publicly. If it expires during prerequisite installation, create a fresh code and repeat the command.
@@ -79,7 +85,7 @@ The catalog contains sensitive operational state. Keep an off-host backup of `/v
 
 The controller has one active instance and no automatic high-availability replacement. Existing host timers can continue during its outage; new wizard operations and controlled moves require the controller to be available.
 
-Rollback removes the added Caddy route and stops only `rolypolyops-control.service` and `rolypolyops-agent.service`. Existing lab backup and recovery timers remain independent. Do not delete data directories to roll back the panel.
+Removing panel routing or stopping its services disables management; it does not roll back an application move or software update. Existing host schedules can continue independently. Resolve active and unknown work before stopping a host agent. Keep configuration and state directories. Reverting software requires a matching release/state recovery plan; it never authorizes starting a former source after the destination has accepted writes.
 
 ## 6 Checks and limits
 

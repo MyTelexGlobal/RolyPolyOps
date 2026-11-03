@@ -2,6 +2,8 @@
 
 [Русский](../ru/requirements.md)
 
+The numbered requirements below describe the wider product target, not implemented guarantees. The current Compose workflow uses two enrolled hosts, one selected repository per service and an operator-confirmed move with a reachable source. It does not configure replication, automatic failover, cluster authority or protection against deletion by a compromised host. See the [current service guide](compose-services.md).
+
 ## 1 Functional requirements
 
 | ID | Requirement |

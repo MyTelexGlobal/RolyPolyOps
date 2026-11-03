@@ -8,6 +8,8 @@ The initial contract is [service-package.schema.json](../../schemas/service-pack
 
 All examples are marked illustrative_only and use .invalid hosts. The schema validates declared structure and profile policy. It does not connect to a host or prove that fencing, snapshots, quorum, or recovery actually work.
 
+These manifests describe target policies; the 0.2 wizard does not import or execute them. For an existing Compose project, use the [service wizard](compose-services.md), not a hand-written profile file. The `pair_automatic`, `cluster`, replication and retention fields do not enable those features in the current runtime.
+
 ## 2 Fields
 
 | Field | Meaning |
