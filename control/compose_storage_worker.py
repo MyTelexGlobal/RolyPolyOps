@@ -4,6 +4,7 @@ import ctypes
 import fcntl
 import json
 import os
+import re
 from pathlib import Path
 import resource
 import select
@@ -53,6 +54,42 @@ def descriptor_kind(fd):
     raise WorkerError("worker_isolation_preflight_failed")
 
 
+MAX_NET_DEV_BYTES = 8192
+
+
+def network_interfaces():
+    """Read the current network namespace without requiring a netlink socket."""
+    try:
+        with open("/proc/self/net/dev", "rb") as stream:
+            raw = stream.read(MAX_NET_DEV_BYTES + 1)
+        if not raw or len(raw) > MAX_NET_DEV_BYTES or not raw.endswith(b"\n"):
+            raise ValueError()
+        text = raw.decode("ascii")
+        if any(ord(char) < 32 and char not in "\t\n" or ord(char) == 127 for char in text):
+            raise ValueError()
+        lines = text.splitlines()
+        if len(lines) < 3 or [part.strip() for part in lines[0].split("|")] != ["Inter-", "Receive", "Transmit"]:
+            raise ValueError()
+        columns = lines[1].split("|")
+        if (len(columns) != 3 or columns[0].strip() != "face"
+                or columns[1].split() != ["bytes", "packets", "errs", "drop", "fifo", "frame", "compressed", "multicast"]
+                or columns[2].split() != ["bytes", "packets", "errs", "drop", "fifo", "colls", "carrier", "compressed"]):
+            raise ValueError()
+        names = []
+        for line in lines[2:]:
+            if line.count(":") != 1:
+                raise ValueError()
+            name, counters = line.split(":")
+            name, counters = name.strip(), counters.split()
+            if (not re.fullmatch(r"[A-Za-z0-9_.@-]{1,15}", name) or name in names or len(counters) != 16
+                    or any(not value.isdecimal() for value in counters)):
+                raise ValueError()
+            names.append(name)
+        return names
+    except (OSError, UnicodeError, ValueError, TypeError):
+        raise WorkerError("worker_isolation_preflight_failed") from None
+
+
 def isolation_proof(request):
     expected_uid, expected_gid = request["uid"], request["gid"]
     if (type(expected_uid) is not int or type(expected_gid) is not int or expected_uid <= 0 or expected_gid <= 0
@@ -71,7 +108,7 @@ def isolation_proof(request):
     namespace = os.stat("/proc/self/ns/net")
     if [namespace.st_dev, namespace.st_ino] == request["hostNetns"]:
         raise WorkerError("worker_isolation_preflight_failed")
-    if cgroup() != request["cgroup"] or [name for _, name in socket.if_nameindex()] != ["lo"]:
+    if cgroup() != request["cgroup"] or network_interfaces() != ["lo"]:
         raise WorkerError("worker_isolation_preflight_failed")
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
