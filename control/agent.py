@@ -204,6 +204,8 @@ def validate_job(job):
 
 class Agent:
     def __init__(self, config, state, allow_http=False):
+        if "storageWorkerUser" in config and (not isinstance(config["storageWorkerUser"],str) or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,30}",config["storageWorkerUser"])):
+            raise ValueError("invalid_storage_worker")
         self.config, self.state = config, Path(state)
         self._engine = None
         parsed = urllib.parse.urlsplit(config["controller"])
@@ -320,20 +322,32 @@ class Agent:
                 raise ValueError("Response too large")
             return json.loads(body)
 
+    def observe_once(self):
+        status=observe(self.state)
+        try:
+            engine=self.engine()
+            try:
+                engine.recover()
+            except Exception:
+                local=engine.observe(local_only=True)
+                if not isinstance(local,dict):
+                    raise ValueError("invalid_local_observation")
+                status["compose"]=public_compose(dict(local,ready=False,error="compose_recovery_required"))
+            else:
+                status["compose"]=public_compose(engine.observe())
+        except Exception:
+            status["compose"]=public_compose({"ready":False,"error":"compose_observation_failed"})
+        return status
+
     def collect(self):
         while True:
             try:
-                status = observe(self.state)
-                try:
-                    self.engine().recover()
-                    status["compose"] = public_compose(self.engine().observe())
-                except Exception:
-                    status["compose"] = public_compose({"ready": False, "error": "compose_observation_failed"})
+                status=self.observe_once()
                 with self.lock:
-                    self.status = status
+                    self.status=status
             except Exception:
                 with self.lock:
-                    self.status = {"supported": False, "observedAt": now(), "error": "observation_failed"}
+                    self.status={"supported":False,"observedAt":now(),"error":"observation_failed"}
             time.sleep(15)
 
     def reports(self):

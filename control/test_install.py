@@ -1,10 +1,13 @@
 """Installer privilege-boundary checks without modifying the operating system."""
 import os
+import io
+import json
+from contextlib import ExitStack
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 from control import install
 
@@ -90,7 +93,7 @@ class GenericPrerequisiteTests(unittest.TestCase):
         raise AssertionError(args)
 
     def run_prerequisites(self,probe=None,which=None):
-        with patch.object(install.shutil,'which',side_effect=which or (lambda name:'/usr/bin/'+name)), patch.object(install,'output',side_effect=probe or self.probe), patch.object(install,'command',side_effect=lambda args:self.commands.append(args)), patch.object(install,'supported_packages',return_value=True):
+        with patch.object(install,'isolation_prerequisites'), patch.object(install.shutil,'which',side_effect=which or (lambda name:'/usr/bin/'+name)), patch.object(install,'output',side_effect=probe or self.probe), patch.object(install,'command',side_effect=lambda args:self.commands.append(args)), patch.object(install,'supported_packages',return_value=True):
             return install.agent_prerequisites()
 
     def test_working_runtime_never_installs_upgrades_or_restarts_docker(self):
@@ -143,7 +146,7 @@ class GenericPrerequisiteTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             base=Path(directory)
             source=base/'source';source.mkdir()
-            modules=('controller.py','agent.py','install.py','compose_control.py','compose_engine.py','compose_storage.py','compose_seal.py','compose_helper.py')
+            modules=('controller.py','agent.py','install.py','compose_control.py','compose_engine.py','compose_storage.py','compose_seal.py','compose_helper.py','compose_transport.py','compose_storage_worker.py','compose_storage_bridge.py')
             for name in modules:
                 (source/name).write_text('# '+name)
             (source/'web').mkdir()
@@ -155,6 +158,254 @@ class GenericPrerequisiteTests(unittest.TestCase):
                 self.assertEqual((destination/name).read_text(),'# '+name)
                 self.assertEqual((destination/name).stat().st_mode & 0o777,0o644)
             self.assertEqual((destination/'web'/'wizard.js').read_text(),'sealed form')
+
+
+class StorageIsolationPrerequisiteTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory()
+        self.base=Path(self.temp.name)
+        self.python=self.base/'python3';self.python.write_text('system interpreter');self.python.chmod(0o755)
+        self.controllers=self.base/'cgroup.controllers';self.controllers.write_text('cpu memory pids')
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def check(self,version='systemd 252 (252.39)',python='3.11.9',platform='linux',uid=0,which=None):
+        with patch.object(install.sys,'platform',platform),patch.object(install.os,'geteuid',return_value=uid),patch.object(install,'SYSTEM_PYTHON',self.python),patch.object(install,'CGROUP_CONTROLLERS',self.controllers),patch.object(install.shutil,'which',side_effect=which or (lambda name:'/usr/bin/'+name)),patch.object(install,'output',side_effect=lambda args:version if args[0]=='systemctl' else python):
+            install.isolation_prerequisites()
+
+    def test_supported_systemd_cgroup_and_system_python_pass(self):
+        self.check()
+
+    def test_missing_or_old_isolation_never_uses_a_fallback(self):
+        for options in ({'version':'systemd 251'},{'version':'unreadable'},{'python':'3.10.9'},{'platform':'darwin'},{'uid':1000},{'which':lambda name:None if name=='systemd-run' else '/usr/bin/'+name}):
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(ValueError,'Missing or unsupported prerequisite'):
+                    self.check(**options)
+        self.controllers.unlink()
+        with self.assertRaisesRegex(ValueError,'cgroup v2'):
+            self.check()
+
+
+class WorkerAccountTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory()
+        self.base=Path(self.temp.name)
+        self.config=self.base/'config';self.config.mkdir(mode=0o700)
+        self.accounts={};self.groups={};self.commands=[]
+        self.stack=ExitStack()
+        real_lstat=Path.lstat;real_fstat=os.fstat
+        def owned(value,uid=0):
+            fields=list(value);fields[4]=uid;return os.stat_result(fields)
+        self.stack.enter_context(patch.object(install,'CONFIG_DIR',self.config))
+        self.stack.enter_context(patch.object(Path,'lstat',lambda path:owned(real_lstat(path)) if path==self.config else real_lstat(path)))
+        self.stack.enter_context(patch.object(install.os,'fstat',side_effect=lambda fd:owned(real_fstat(fd))))
+        self.stack.enter_context(patch.object(install.pwd,'getpwnam',side_effect=lambda user:self.lookup(self.accounts,user)))
+        self.stack.enter_context(patch.object(install.pwd,'getpwall',side_effect=lambda:list(self.accounts.values())))
+        self.stack.enter_context(patch.object(install.grp,'getgrnam',side_effect=lambda name:self.lookup(self.groups,name)))
+        self.stack.enter_context(patch.object(install.grp,'getgrgid',side_effect=lambda gid:next(g for g in self.groups.values() if g.gr_gid==gid)))
+        self.stack.enter_context(patch.object(install.grp,'getgrall',side_effect=lambda:list(self.groups.values())))
+        self.stack.enter_context(patch.object(install.os,'getgrouplist',side_effect=lambda user,gid:[gid]))
+        self.stack.enter_context(patch.object(install,'command',side_effect=self.command))
+        self.addCleanup(self.stack.close);self.addCleanup(self.temp.cleanup)
+
+    @staticmethod
+    def lookup(mapping,key):
+        if key not in mapping:raise KeyError(key)
+        return mapping[key]
+
+    def add(self,user='rolypolyops-storage',uid=991,gid=992,**extra):
+        self.accounts[user]=SimpleNamespace(pw_name=user,pw_uid=uid,pw_gid=gid,pw_shell='/usr/sbin/nologin',pw_dir='/nonexistent',**extra)
+        self.groups[user]=SimpleNamespace(gr_name=user,gr_gid=gid,gr_mem=[])
+
+    def command(self,args):
+        self.commands.append(args)
+        self.assertEqual(args[0],'useradd')
+        self.add(args[-1])
+
+    def test_account_and_pin_creation_are_idempotent_without_other_config_changes(self):
+        (self.config/'control-installation.json').write_text('control sentinel')
+        (self.config/'lab.env').write_text('demo sentinel')
+        pin=install.ensure_storage_worker('rolypolyops-storage')
+        self.assertEqual(pin,{'user':'rolypolyops-storage','uid':991,'gid':992})
+        marker=self.config/'storage-worker.json';before=marker.read_bytes()
+        self.assertEqual(marker.stat().st_mode & 0o777,0o600)
+        self.assertEqual(install.ensure_storage_worker('rolypolyops-storage'),pin)
+        self.assertEqual(marker.read_bytes(),before)
+        self.assertEqual(len(self.commands),1)
+        self.assertEqual((self.config/'control-installation.json').read_text(),'control sentinel')
+        self.assertEqual((self.config/'lab.env').read_text(),'demo sentinel')
+        self.assertNotIn('docker',str(self.commands))
+
+    def test_unmarked_account_and_group_collisions_are_not_adopted(self):
+        self.add()
+        with self.assertRaisesRegex(ValueError,'collision'):
+            install.ensure_storage_worker('rolypolyops-storage')
+        self.accounts.clear()
+        with self.assertRaisesRegex(ValueError,'collision'):
+            install.ensure_storage_worker('rolypolyops-storage')
+        self.assertEqual(self.commands,[])
+        self.assertFalse((self.config/'storage-worker.json').exists())
+
+    def test_pin_uid_gid_and_exclusive_nonlogin_boundary_are_enforced(self):
+        install.ensure_storage_worker('rolypolyops-storage')
+        account=self.accounts['rolypolyops-storage']
+        for attribute,value in [('pw_uid',0),('pw_gid',0),('pw_uid',993),('pw_shell','/bin/bash'),('pw_dir','/home/worker')]:
+            before=getattr(account,attribute);setattr(account,attribute,value)
+            with self.subTest(attribute=attribute,value=value):
+                with self.assertRaises(ValueError):
+                    install.ensure_storage_worker('rolypolyops-storage')
+            setattr(account,attribute,before)
+        self.groups['rolypolyops-storage'].gr_mem=['foreign']
+        with self.assertRaisesRegex(ValueError,'exclusive'):
+            install.ensure_storage_worker('rolypolyops-storage')
+        self.groups['rolypolyops-storage'].gr_mem=[]
+        with patch.object(install.os,'getgrouplist',return_value=[992,999]):
+            with self.assertRaisesRegex(ValueError,'exclusive'):
+                install.ensure_storage_worker('rolypolyops-storage')
+        self.accounts['foreign']=SimpleNamespace(pw_name='foreign',pw_gid=992)
+        with self.assertRaisesRegex(ValueError,'exclusive'):
+            install.ensure_storage_worker('rolypolyops-storage')
+        self.assertEqual(len(self.commands),1)
+
+    def test_marker_permissions_owner_and_symlinks_fail_closed(self):
+        install.ensure_storage_worker('rolypolyops-storage')
+        marker=self.config/'storage-worker.json'
+        marker.chmod(0o644)
+        with self.assertRaisesRegex(ValueError,'Untrusted'):
+            install.ensure_storage_worker('rolypolyops-storage')
+        marker.chmod(0o600)
+        real_fstat=os.fstat
+        def foreign(fd):
+            value=list(real_fstat(fd));value[4]=123;return os.stat_result(value)
+        with patch.object(install.os,'fstat',side_effect=foreign):
+            with self.assertRaisesRegex(ValueError,'Untrusted'):
+                install.ensure_storage_worker('rolypolyops-storage')
+        marker.unlink();outside=self.base/'outside';outside.write_text('unchanged');marker.symlink_to(outside)
+        with self.assertRaises((OSError,ValueError)):
+            install.ensure_storage_worker('rolypolyops-storage')
+        self.assertEqual(outside.read_text(),'unchanged')
+
+
+class IsolatedAgentInstallationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.base=Path(self.temp.name)
+        self.config=self.base/'config';self.config.mkdir(mode=0o700)
+        self.units=self.base/'units';self.units.mkdir()
+        self.agent_config=self.config/'agent.json'
+        self.source=self.base/'source';self.source.mkdir()
+        self.events=[]
+        class TransportError(Exception):
+            def __init__(self,code,unknown=False):
+                self.code,self.unknown=code,unknown
+                super().__init__('RAW_PRIVATE_SECRET')
+        self.error=TransportError
+        self.module=SimpleNamespace(DEFAULT_WORKER_USER='rolypolyops-storage',TransportError=TransportError,probe_runtime=Mock(side_effect=self.probe))
+        self.stack=ExitStack()
+        self.stack.enter_context(patch.object(install,'AGENT_CONFIG',self.agent_config))
+        self.stack.enter_context(patch.object(install,'UNIT_DIR',self.units))
+        self.stack.enter_context(patch.object(install,'validate_source',side_effect=lambda:self.source))
+        self.stack.enter_context(patch.object(install,'trusted_config_directory'))
+        actual_json=install.read_json
+        self.stack.enter_context(patch.object(install,'trusted_json',side_effect=lambda path:actual_json(path)))
+        self.stack.enter_context(patch.object(install,'agent_prerequisites',return_value='/root/agent-venv/bin/python3'))
+        self.stack.enter_context(patch.object(install,'transport_module',return_value=self.module))
+        self.worker=self.stack.enter_context(patch.object(install,'ensure_storage_worker',side_effect=lambda user:self.events.append(('account',user))))
+        self.copy=self.stack.enter_context(patch.object(install,'copy_source',side_effect=lambda:self.events.append(('copy',))))
+        self.stack.enter_context(patch.object(install,'install_package_policy'))
+        self.stack.enter_context(patch.object(install,'command',side_effect=lambda args:self.events.append(('command',args))))
+        opener=SimpleNamespace(open=self.enroll)
+        self.open=self.stack.enter_context(patch.object(install.urllib.request,'build_opener',return_value=opener))
+        self.addCleanup(self.stack.close);self.addCleanup(self.temp.cleanup)
+
+    def probe(self,**kwargs):
+        self.events.append(('probe',kwargs));return {'ready':True}
+
+    def enroll(self,*args,**kwargs):
+        self.events.append(('enroll',))
+        return io.BytesIO(json.dumps({'nodeId':'00000000-0000-4000-8000-000000000001','token':'enrollment-result','role':'primary','storageWorkerUser':'root'}).encode())
+
+    def test_probe_precedes_enrollment_and_installed_source_replacement(self):
+        install.agent('https://control.example.test/ops','code')
+        names=[entry[0] for entry in self.events]
+        self.assertLess(names.index('account'),names.index('probe'))
+        self.assertLess(names.index('probe'),names.index('enroll'))
+        self.assertLess(names.index('probe'),names.index('copy'))
+        self.module.probe_runtime.assert_called_once_with(worker_user='rolypolyops-storage',source_dir=self.source,timeout=30)
+        self.assertEqual(json.loads(self.agent_config.read_text())['storageWorkerUser'],'rolypolyops-storage')
+        unit=(self.units/'rolypolyops-agent.service').read_text()
+        self.assertIn('Type=simple',unit)
+        self.assertIn('ExecStart=/root/agent-venv/bin/python3',unit)
+        self.assertNotIn('User=rolypolyops-storage',unit)
+        self.assertNotIn('PrivateNetwork',unit)
+        self.assertNotIn('enrollment-result',unit)
+
+    def test_failed_or_unverified_probe_does_not_consume_enrollment_or_replace_source(self):
+        for failure in (self.error('network_isolation_unavailable'),self.error('transport_cleanup_unverified',True),None):
+            with self.subTest(failure=type(failure).__name__):
+                self.events.clear()
+                self.module.probe_runtime.side_effect=failure
+                self.module.probe_runtime.return_value={'ready':False}
+                with self.assertRaisesRegex(ValueError,'storage isolation') as result:
+                    install.agent('https://control.example.test/ops','code')
+                self.assertNotIn('RAW_PRIVATE_SECRET',str(result.exception))
+                self.assertNotIn('enroll',[event[0] for event in self.events])
+                self.copy.assert_not_called()
+                self.assertFalse(self.agent_config.exists())
+                self.assertEqual(list(self.units.iterdir()),[])
+
+    def test_reinstall_preserves_registration_and_root_selected_worker(self):
+        existing={'controller':'https://control.example.test/ops','nodeId':'old-node','token':'old-token','role':'recovery','storageWorkerUser':'own-test-storage'}
+        self.agent_config.write_text(json.dumps(existing));self.agent_config.chmod(0o600)
+        install.agent('https://control.example.test/ops',None)
+        self.assertEqual(json.loads(self.agent_config.read_text()),existing)
+        self.assertNotIn('enroll',[event[0] for event in self.events])
+        self.module.probe_runtime.assert_called_once_with(worker_user='own-test-storage',source_dir=self.source,timeout=30)
+        self.worker.assert_called_once_with('own-test-storage')
+
+    def test_reenrollment_keeps_root_local_worker_selection(self):
+        existing={'controller':'https://control.example.test/ops','nodeId':'old-node','token':'old-token','role':'recovery','storageWorkerUser':'own-test-storage'}
+        self.agent_config.write_text(json.dumps(existing));self.agent_config.chmod(0o600)
+        install.agent('https://control.example.test/ops','new-code',replace=True)
+        current=json.loads(self.agent_config.read_text())
+        self.assertNotEqual(current['token'],existing['token'])
+        self.assertEqual(current['storageWorkerUser'],'own-test-storage')
+        self.module.probe_runtime.assert_called_once_with(worker_user='own-test-storage',source_dir=self.source,timeout=30)
+
+    def test_wrong_controller_or_missing_code_fails_before_probe(self):
+        with self.assertRaisesRegex(ValueError,'enrollment code'):
+            install.agent('https://control.example.test/ops',None)
+        self.agent_config.write_text(json.dumps({'controller':'https://other.example/ops'}))
+        with self.assertRaisesRegex(ValueError,'another controller'):
+            install.agent('https://control.example.test/ops','code')
+        self.module.probe_runtime.assert_not_called()
+        self.worker.assert_not_called()
+
+
+class StorageModulePackagingTests(unittest.TestCase):
+    def test_installed_worker_module_symlink_is_never_followed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base=Path(temporary);source=base/'source';source.mkdir()
+            for name in install.SOURCE_MODULES:(source/name).write_text('# '+name)
+            destination=base/'installed'/'control';destination.mkdir(parents=True)
+            outside=base/'outside';outside.write_text('unchanged')
+            (destination/'compose_storage_worker.py').symlink_to(outside)
+            with patch.object(install,'__file__',str(source/'install.py')),patch.object(install,'DEST',destination):
+                with self.assertRaisesRegex(ValueError,'Untrusted installed code file'):
+                    install.copy_source()
+            self.assertEqual(outside.read_text(),'unchanged')
+            self.assertFalse((destination/'controller.py').exists())
+
+    def test_missing_worker_module_is_rejected_before_destination_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source=Path(temporary)/'source';source.mkdir()
+            for name in install.SOURCE_MODULES:
+                if name!='compose_storage_worker.py':(source/name).write_text('# '+name)
+            destination=Path(temporary)/'absent'/'control'
+            with patch.object(install,'__file__',str(source/'install.py')),patch.object(install,'DEST',destination):
+                with self.assertRaisesRegex(ValueError,'complete trusted'):
+                    install.copy_source()
+            self.assertFalse(destination.parent.exists())
 
 
 if __name__ == "__main__":
