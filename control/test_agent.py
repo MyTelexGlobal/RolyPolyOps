@@ -378,5 +378,89 @@ class GenericAdapterTests(unittest.TestCase):
         self.engine.execute.assert_called_once()
 
 
+class StorageWorkerObservationTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import Mock
+        self.temp=tempfile.TemporaryDirectory()
+        self.state=Path(self.temp.name)
+        self.config={"controller":"https://control.example.test/ops","nodeId":str(uuid.uuid4()),"token":"t"*48,"role":"primary","storageWorkerUser":"own-test-storage"}
+        self.agent=agent.Agent(self.config,self.state)
+        self.engine=Mock();self.agent._engine=self.engine
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    @staticmethod
+    def public_key():
+        import base64,hashlib
+        raw=bytes.fromhex('308201a2300d06092a864886f70d01010105000382018f003082018a0282018100')+bytes([129])*384+bytes.fromhex('0203010001')
+        return {'id':hashlib.sha256(raw).hexdigest(),'publicKey':base64.b64encode(raw).decode(),'algorithm':'RSA-OAEP-256+A256GCM'}
+
+    def test_root_selected_worker_pin_is_passed_unchanged_to_lazy_engine(self):
+        from unittest.mock import Mock
+        module=Mock();module.ManagedEngine.return_value=self.engine
+        self.agent._engine=None
+        with patch.object(agent,'engine_module',return_value=module):
+            self.assertIs(self.agent.engine(),self.engine)
+            self.assertIs(self.agent.engine(),self.engine)
+        module.ManagedEngine.assert_called_once_with(self.config,self.state/'managed')
+        self.assertEqual(self.config['storageWorkerUser'],'own-test-storage')
+
+    def test_malformed_root_worker_option_is_rejected_before_state_creation(self):
+        for bad in (False,[],{},1,'root;id','a/b','has space'):
+            with self.subTest(bad=bad):
+                path=self.state/'not-created'
+                with self.assertRaisesRegex(ValueError,'invalid_storage_worker'):
+                    agent.Agent(dict(self.config,storageWorkerUser=bad),path)
+                self.assertFalse(path.exists())
+
+    def test_unavailable_isolation_remains_unready_with_safe_code_and_journal(self):
+        operation=str(uuid.uuid4())
+        self.engine.observe.return_value={'ready':False,'error':'transport_cleanup_unverified','key':self.public_key(),'operations':[{'id':operation,'status':'outcome_unknown','credentials':'PRIVATE_MARKER'}],'credentials':'PRIVATE_MARKER','storageWorkerUser':'PRIVATE_MARKER'}
+        with patch.object(agent,'observe',return_value={'supported':True,'observedAt':agent.now(),'serviceHealthy':True}):
+            result=self.agent.observe_once()
+        self.assertTrue(result['supported'])
+        self.assertFalse(result['compose']['ready'])
+        self.assertEqual(result['compose']['error'],'transport_cleanup_unverified')
+        self.assertEqual(result['compose']['operations'],[{'id':operation,'status':'outcome_unknown'}])
+        self.assertNotIn('PRIVATE_MARKER',json.dumps(result))
+        self.engine.recover.assert_called_once()
+        self.engine.execute.assert_not_called()
+
+    def test_failed_recovery_uses_only_local_observation_and_preserves_unknown_hold(self):
+        operation=str(uuid.uuid4())
+        self.engine.recover.side_effect=RuntimeError('PRIVATE_RECOVERY_MARKER')
+        self.engine.observe.return_value={'ready':True,'key':self.public_key(),'operations':[{'id':operation,'status':'outcome_unknown','parameters':{'password':'PRIVATE_MARKER'}}],'credentials':'PRIVATE_MARKER'}
+        with patch.object(agent,'observe',return_value={'supported':False,'observedAt':agent.now()}):
+            result=self.agent.observe_once()
+        self.engine.observe.assert_called_once_with(local_only=True)
+        self.assertFalse(result['compose']['ready'])
+        self.assertEqual(result['compose']['error'],'compose_recovery_required')
+        self.assertEqual(result['compose']['key'],self.public_key())
+        self.assertEqual(result['compose']['operations'],[{'id':operation,'status':'outcome_unknown'}])
+        self.assertNotIn('PRIVATE_',json.dumps(result))
+        self.assertEqual(self.agent.reports(),[])
+        self.engine.execute.assert_not_called()
+
+    def test_failed_local_recovery_read_stays_unavailable_without_exception_data(self):
+        self.engine.recover.side_effect=RuntimeError('PRIVATE_RECOVERY_MARKER')
+        self.engine.observe.side_effect=RuntimeError('PRIVATE_LOCAL_MARKER')
+        with patch.object(agent,'observe',return_value={'supported':False,'observedAt':agent.now()}):
+            result=self.agent.observe_once()
+        self.engine.observe.assert_called_once_with(local_only=True)
+        self.assertFalse(result['compose']['ready'])
+        self.assertNotIn('PRIVATE_',json.dumps(result))
+        self.engine.execute.assert_not_called()
+
+    def test_busy_snapshot_observation_is_not_a_fake_job_or_unknown_hold(self):
+        self.engine.observe.return_value={'ready':True,'error':'snapshot_inventory_unavailable','key':self.public_key(),'operations':[]}
+        with patch.object(agent,'observe',return_value={'supported':False,'observedAt':agent.now()}):
+            result=self.agent.observe_once()
+        self.assertEqual(result['compose']['error'],'snapshot_inventory_unavailable')
+        self.assertEqual(result['compose']['operations'],[])
+        self.assertEqual(self.agent.reports(),[])
+        self.engine.execute.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

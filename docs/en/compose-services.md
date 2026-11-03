@@ -8,7 +8,7 @@ This guide describes the 0.2 implementation candidate. A completed browser wizar
 
 Enroll two different Linux Docker hosts through **Servers** using the existing one-time installation command. That is the privileged installation step. Afterwards the own-service wizard uses the panel and enrolled host services; it does not require application-specific shell commands or hand-edited configuration files.
 
-The baseline is rootful Linux Docker 29+, Compose 2.24+ with canonical JSON, Python 3.11+, restic 0.16+, cryptography 41+ and PyYAML 6+ on hosts. The controller uses the Python standard library. Read the [behavior contract](../../control/contracts/compose-v2.md) for the exact supported model.
+The baseline is rootful Linux Docker 29+, Compose 2.24+ with canonical JSON, Python 3.11+, native restic 0.16+, systemd 252+, cgroup v2, cryptography 41+ and PyYAML 6+ on hosts. The controller uses the Python standard library. The installer creates the exclusive nonlogin account `rolypolyops-storage` and runs an isolation probe before consuming enrollment or replacing installed code. A missing prerequisite stops installation. Storage work has no host-network fallback; its worker uses system Python and the standard library. Read the [behavior contract](../../control/contracts/compose-v2.md) for the exact supported model.
 
 ## 2 Select the existing service
 

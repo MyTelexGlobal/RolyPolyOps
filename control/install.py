@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Install the control service or enroll a host from a trusted source checkout."""
 import argparse
+import grp
 import ipaddress
 import json
 import os
@@ -9,8 +10,10 @@ import pwd
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 import urllib.request
 
@@ -24,6 +27,9 @@ STATE = Path("/var/lib/rolypolyops-control")
 AGENT_CONFIG = Path("/etc/rolypolyops/agent.json")
 UNIT_DIR = Path("/etc/systemd/system")
 CONFIG_DIR = Path("/etc/rolypolyops")
+SYSTEM_PYTHON = Path("/usr/bin/python3")
+CGROUP_CONTROLLERS = Path("/sys/fs/cgroup/cgroup.controllers")
+SOURCE_MODULES = ("controller.py", "agent.py", "install.py", "compose_control.py", "compose_engine.py", "compose_storage.py", "compose_seal.py", "compose_helper.py", "compose_transport.py", "compose_storage_worker.py", "compose_storage_bridge.py")
 
 
 def checked_url(value, paths):
@@ -47,19 +53,41 @@ def command(args):
     subprocess.run(args, check=True, stdin=subprocess.DEVNULL)
 
 
-def copy_source():
-    source = Path(__file__).resolve().parent
-    DEST.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
-    DEST.parent.chmod(0o755)
-    DEST.mkdir(parents=True, exist_ok=True, mode=0o755)
-    DEST.chmod(0o755)
-    modules = ("controller.py", "agent.py", "install.py", "compose_control.py", "compose_engine.py", "compose_storage.py", "compose_seal.py", "compose_helper.py")
-    if not all((source / name).is_file() for name in modules):
+def validate_source():
+    source=Path(__file__).resolve().parent
+    if not all((source/name).is_file() and not (source/name).is_symlink() for name in SOURCE_MODULES):
         raise ValueError("A complete trusted control release checkout is required")
-    for name in modules:
-        if (source / name).is_file() and (source / name).resolve() != (DEST / name).resolve():
-            shutil.copyfile(source / name, DEST / name)
-            (DEST / name).chmod(0o644)
+    return source
+
+
+def copy_source():
+    source=validate_source()
+    for directory in (DEST.parent,DEST):
+        directory.mkdir(parents=True,exist_ok=True,mode=0o755)
+        actual=directory.lstat()
+        if not stat.S_ISDIR(actual.st_mode) or actual.st_uid!=os.geteuid() or actual.st_mode & 0o022:
+            raise ValueError("Untrusted installed code directory")
+        directory.chmod(0o755)
+    for name in SOURCE_MODULES:
+        target=DEST/name
+        if target.exists() or target.is_symlink():
+            actual=target.lstat()
+            if not stat.S_ISREG(actual.st_mode) or actual.st_uid!=os.geteuid() or actual.st_mode & 0o022:
+                raise ValueError("Untrusted installed code file")
+    for name in SOURCE_MODULES:
+        if (source/name).resolve() != (DEST/name).resolve():
+            temporary=None
+            try:
+                with tempfile.NamedTemporaryFile(dir=DEST,prefix=".install-",delete=False) as out:
+                    temporary=Path(out.name)
+                    with (source/name).open("rb") as incoming:
+                        shutil.copyfileobj(incoming,out)
+                    os.fchmod(out.fileno(),0o644)
+                    out.flush();os.fsync(out.fileno())
+                os.replace(temporary,DEST/name)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
     if (source / "web").is_dir() and (source / "web").resolve() != (DEST / "web").resolve():
         shutil.copytree(source / "web", DEST / "web", dirs_exist_ok=True)
         (DEST / "web").chmod(0o755)
@@ -133,8 +161,113 @@ def prerequisite_error(name):
     raise ValueError("Missing or unsupported prerequisite: " + name)
 
 
+def isolation_prerequisites():
+    if sys.platform != "linux" or os.geteuid() != 0:
+        prerequisite_error("rootful Linux storage isolation")
+    if not shutil.which("systemctl") or not shutil.which("systemd-run"):
+        prerequisite_error("systemd 252+ storage isolation")
+    match=re.search(r"\bsystemd\s+(\d+)\b",output(["systemctl","--version"]))
+    if not match or int(match.group(1)) < 252 or not CGROUP_CONTROLLERS.is_file():
+        prerequisite_error("systemd 252+ and cgroup v2 storage isolation")
+    if not SYSTEM_PYTHON.is_file() or not os.access(SYSTEM_PYTHON,os.X_OK) or version_tuple(output([str(SYSTEM_PYTHON),"-I","-S","-c","import sys; print('.'.join(map(str, sys.version_info[:3])))"])) < (3,11,0):
+        prerequisite_error("system Python 3.11+ for storage worker")
+
+
+def transport_module():
+    try:
+        from . import compose_transport
+    except ImportError:
+        import compose_transport
+    return compose_transport
+
+
+def trusted_config_directory():
+    CONFIG_DIR.mkdir(parents=True,exist_ok=True,mode=0o700)
+    actual=CONFIG_DIR.lstat()
+    if not stat.S_ISDIR(actual.st_mode) or actual.st_uid != 0 or actual.st_mode & 0o022:
+        raise ValueError("Untrusted installation configuration directory")
+
+
+def trusted_json(path):
+    try:
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    try:
+        actual=os.fstat(fd)
+        if not stat.S_ISREG(actual.st_mode) or actual.st_uid != 0 or stat.S_IMODE(actual.st_mode) != 0o600:
+            raise ValueError("Untrusted root configuration file")
+        raw=os.read(fd,65537)
+        if len(raw)>65536:
+            raise ValueError("Invalid root configuration file")
+        try:
+            value=json.loads(raw)
+        except (ValueError,UnicodeError):
+            raise ValueError("Invalid root configuration file") from None
+        if not isinstance(value,dict):
+            raise ValueError("Invalid root configuration file")
+        return value
+    finally:
+        os.close(fd)
+
+
+def ensure_storage_worker(user):
+    if not isinstance(user,str) or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,30}",user):
+        raise ValueError("Invalid storage worker account")
+    trusted_config_directory()
+    marker=CONFIG_DIR/"storage-worker.json"
+    pin=trusted_json(marker)
+    if pin is not None and (set(pin)!={"user","uid","gid"} or pin.get("user")!=user or type(pin.get("uid")) is not int or type(pin.get("gid")) is not int or pin["uid"]<=0 or pin["gid"]<=0):
+        raise ValueError("Storage worker account marker mismatch")
+    try:
+        account=pwd.getpwnam(user)
+    except KeyError:
+        if pin is not None:
+            raise ValueError("Pinned storage worker account is missing") from None
+        try:
+            grp.getgrnam(user)
+        except KeyError:
+            pass
+        else:
+            raise ValueError("Storage worker group collision")
+        command(["useradd","--system","--user-group","--home-dir","/nonexistent","--no-create-home","--shell","/usr/sbin/nologin",user])
+        account=pwd.getpwnam(user)
+    else:
+        if pin is None:
+            raise ValueError("Storage worker account collision")
+    if account.pw_uid<=0 or account.pw_gid<=0 or account.pw_name!=user or account.pw_shell not in ("/usr/sbin/nologin","/sbin/nologin") or account.pw_dir!="/nonexistent":
+        raise ValueError("Storage worker account must be exclusive and unprivileged")
+    try:
+        group=grp.getgrgid(account.pw_gid)
+        named=grp.getgrnam(user)
+    except KeyError:
+        raise ValueError("Storage worker account must have its exclusive group") from None
+    if (group.gr_name!=user or named.gr_gid!=account.pw_gid or group.gr_mem or named.gr_mem or {entry.pw_name for entry in pwd.getpwall() if entry.pw_gid==account.pw_gid}!={user} or set(os.getgrouplist(user,account.pw_gid))!={account.pw_gid} or any(user in entry.gr_mem for entry in grp.getgrall())):
+        raise ValueError("Storage worker account must be exclusive and unprivileged")
+    actual={"user":user,"uid":account.pw_uid,"gid":account.pw_gid}
+    if pin is not None and pin!=actual:
+        raise ValueError("Storage worker account marker mismatch")
+    if pin is None:
+        atomic(marker,actual)
+    return actual
+
+
+def probe_storage_runtime(module,user,source):
+    try:
+        result=module.probe_runtime(worker_user=user,source_dir=source,timeout=30)
+    except module.TransportError as error:
+        code=getattr(error,"code",None)
+        if not isinstance(code,str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}",code):
+            code="network_isolation_unavailable"
+        retained="; owned probe state retained" if getattr(error,"unknown",False) else ""
+        prerequisite_error("storage isolation: "+code+retained)
+    if not isinstance(result,dict) or result.get("ready") is not True:
+        prerequisite_error("storage isolation: network_isolation_unavailable")
+
+
 def agent_prerequisites():
     """Install only missing prerequisites; never replace a working Docker."""
+    isolation_prerequisites()
     if sys.version_info < (3, 11):
         prerequisite_error("Python 3.11+")
     missing_docker = shutil.which("docker") is None
@@ -294,25 +427,31 @@ WantedBy=multi-user.target
 
 
 def agent(controller_url, enrollment, replace=False):
-    parsed = checked_url(controller_url, {"/ops", "/ops/"})
-    runtime_python = agent_prerequisites()
-    existing = read_json(AGENT_CONFIG)
+    checked_url(controller_url,{"/ops","/ops/"})
+    source=validate_source()
+    trusted_config_directory()
+    existing=trusted_json(AGENT_CONFIG)
+    if existing and not replace and existing.get("controller")!=controller_url.rstrip("/"):
+        raise ValueError("Agent already belongs to another controller")
+    if (not existing or replace) and not enrollment:
+        raise ValueError("An enrollment code is required")
+    runtime_python=agent_prerequisites()
+    module=transport_module()
+    worker_user=(existing or {}).get("storageWorkerUser",module.DEFAULT_WORKER_USER)
+    ensure_storage_worker(worker_user)
+    probe_storage_runtime(module,worker_user,source)
     if existing and not replace:
-        if existing.get("controller") != controller_url.rstrip("/"):
-            raise ValueError("Agent already belongs to another controller")
-        config = existing
+        config=dict(existing,storageWorkerUser=worker_user)
     else:
-        if not enrollment:
-            raise ValueError("An enrollment code is required")
-        request = urllib.request.Request(controller_url.rstrip("/") + "/agent/enroll",
-            json.dumps({"code": enrollment, "hostname": socket.gethostname(), "version": VERSION}).encode(),
-            {"Content-Type": "application/json"}, method="POST")
-        with urllib.request.build_opener(NoRedirect()).open(request, timeout=20) as response:
-            enrolled = json.load(response)
-        if enrolled.get("role") not in {"primary", "recovery"} or not enrolled.get("token") or not enrolled.get("nodeId"):
+        request=urllib.request.Request(controller_url.rstrip("/")+"/agent/enroll",
+            json.dumps({"code":enrollment,"hostname":socket.gethostname(),"version":VERSION}).encode(),
+            {"Content-Type":"application/json"},method="POST")
+        with urllib.request.build_opener(NoRedirect()).open(request,timeout=20) as response:
+            enrolled=json.load(response)
+        if enrolled.get("role") not in {"primary","recovery"} or not enrolled.get("token") or not enrolled.get("nodeId"):
             raise ValueError("Invalid enrollment response; use a new code if registration reply was lost")
-        config = {"controller": controller_url.rstrip("/"), "nodeId": enrolled["nodeId"], "token": enrolled["token"], "role": enrolled["role"]}
-        atomic(AGENT_CONFIG, config)
+        config={"controller":controller_url.rstrip("/"),"nodeId":enrolled["nodeId"],"token":enrolled["token"],"role":enrolled["role"],"storageWorkerUser":worker_user}
+    atomic(AGENT_CONFIG,config)
     copy_source()
     install_package_policy()
     unit = f"""[Unit]
@@ -320,6 +459,7 @@ Description=RolyPolyOps outbound host service
 After=network-online.target docker.service
 Wants=network-online.target
 [Service]
+Type=simple
 ExecStart={runtime_python} {DEST}/agent.py --config {AGENT_CONFIG}
 Restart=always
 RestartSec=5

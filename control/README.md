@@ -36,6 +36,8 @@ Choose Add server in the wizard, name the host and select its role. The primary 
 
 Captured `COMPOSE_*` and `DOCKER_*` execution controls are rejected before recovery changes files or loads images. Accepted application settings are replaced with a closed environment for the bundled package.
 
+Own-Compose storage operations require systemd 252+, cgroup v2 and system Python 3.11+ for an isolated nonroot worker. The installer creates its exclusive account, keeps a root-only identity marker, and performs a bounded probe without repository credentials before consuming enrollment or replacing code. The main agent remains privileged for Docker and outbound control traffic. If isolation is unavailable, the host is not ready for storage operations.
+
 For the legacy demo, the host needs the initialized [supported recovery package](../demo/README.md), Docker/Compose, restic and its private repository configuration. This release recognizes that package; it does not configure unknown applications or silently overwrite existing deployments. On the supplied two-host lab these prerequisites are already configured.
 
 Agents use certificate-validated outgoing HTTPS. No agent port, SSH private key upload or Docker socket access from the control process is required. Tokens live in root-only host configuration; the catalog stores their digests. Reconnect rotates a token. Revocation is available after active operations have been resolved.
