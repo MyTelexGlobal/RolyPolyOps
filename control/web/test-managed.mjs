@@ -138,6 +138,25 @@ async function browserChecks() {
   assert.equal(service.setupState,'complete');assert.equal(restores.length,1);assert.equal(envelopes.length,2);
   assert(!JSON.stringify(await page.evaluate(()=>({...localStorage}))).includes(secret));assert(!JSON.stringify(await page.evaluate(()=>({...sessionStorage}))).includes(secret));assert.deepEqual(await page.evaluate(async()=>await indexedDB.databases()),[]);assert(!(await page.content()).includes(secret));assert.equal(await page.locator('script').count(),1);
   await page.getByRole('button',{name:'Закрыть',exact:true}).click();
+  // A known failed stopped copy exposes Remove only; normal ready-copy actions remain.
+  const readyCopies=[...restores];
+  for(const language of ['ru','en']){
+   const toggle=page.getByRole('button',{name:language==='en'?'Switch to English':'Переключить на русский',exact:true});if(await toggle.count())await toggle.click();
+   for(const width of [1440,390]){
+    await page.setViewportSize({width,height:900});
+    const stopped={id:randomUUID(),serviceId:service.id,nodeId:ids.target,snapshotId:snapshot,state:'failed',canRemoveStopped:true,ports:[],applicationHealthVerified:false,healthScope:'stopped',checks:['runtime-stopped','no-published-ports','owned-resources']};
+    restores=[...readyCopies,stopped];
+    const reloadStopped=async()=>{await page.goto(origin+'/ops/#services');await page.reload();const row=page.locator('.managed-restore').filter({hasText:stopped.id});await row.waitFor();return row;};
+    for(const eligibility of [undefined,false,'true']){if(eligibility===undefined)delete stopped.canRemoveStopped;else stopped.canRemoveStopped=eligibility;const row=await reloadStopped();assert.equal(await row.getByRole('button').count(),0,`no stopped authority ${language}/${width}/${eligibility}`);}
+    stopped.canRemoveStopped=true;reuseFault='stale';let row=await reloadStopped();assert.equal(await row.getByRole('button').count(),0,'stale node must hide stopped removal');reuseFault='';
+    row=await reloadStopped();assert.equal(await row.getByRole('button').count(),1);assert.equal(await row.getByRole('button',{name:language==='en'?'Remove stopped copy':'Удалить остановленную копию',exact:true}).count(),1);
+    const normal=page.locator('.managed-restore').filter({hasText:readyCopies[0].id});assert.equal(await normal.getByRole('button').count(),3,'normal Ready/Move/Remove remain');
+    if(process.env.UI_SCREENSHOT_DIR)await page.screenshot({path:process.env.UI_SCREENSHOT_DIR+`/stopped-remove-only-${width}-${language}.png`,fullPage:true});
+    const before=requests.length;await row.getByRole('button').click();await page.getByRole('button',{name:language==='en'?'Confirm':'Подтвердить',exact:true}).click();await row.waitFor({state:'detached'});
+    const planned=requests.slice(before).find(r=>r.path==='/api/plans');assert.equal(planned.body.action,'compose-remove');assert.equal(planned.body.nodeId,ids.target);assert.deepEqual(planned.body.parameters,{serviceId:service.id,restoreId:stopped.id});assert.equal(restores.some(r=>r.id===stopped.id),false);
+   }
+  }
+  restores=readyCopies;await page.getByRole('button',{name:'Переключить на русский',exact:true}).click();await page.reload();
   await page.getByRole('button',{name:'Перенести сюда'}).click();
   await page.getByLabel('web:8080',{exact:true}).check();await page.getByLabel('Порт сервера',{exact:true}).first().fill('18190');if(process.env.UI_SCREENSHOT_DIR)await page.screenshot({path:process.env.UI_SCREENSHOT_DIR+'/port-target8080-host18190-ru.png',fullPage:true});await page.getByLabel('Разрешаю исходящие подключения новой копии').check();await page.getByLabel('Принимаю потерю изменений после выбранного снимка').check();await page.getByRole('button',{name:'Подтвердить',exact:true}).click();
   await page.locator('[data-setup-state="active_unprotected"]').waitFor();assert.equal(service.sourceNodeId,ids.target);assert.deepEqual(requests.find(r=>r.path.endsWith('/activate')).body.ports,[{service:'web',target:8080,published:18190,hostIp:'0.0.0.0',protocol:'tcp'}]);
