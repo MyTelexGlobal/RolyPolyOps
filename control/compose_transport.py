@@ -135,12 +135,39 @@ def systemctl(unit, timeout=5):
         raise TransportError("transport_cleanup_unverified", True) from None
 
 
-def account(worker_user):
+def validate_marker_path(value=None):
+    value = str(ACCOUNT_MARKER) if value is None else value
+    try:
+        if (not isinstance(value, str) or not 1 <= len(value.encode("utf-8")) <= 4096 or not value.startswith("/")
+                or value.startswith("//") or not value.isprintable()
+                or any(part in {".", ".."} for part in value.split("/")) or str(Path(value)) != value):
+            raise ValueError()
+        return value
+    except (ValueError, TypeError, UnicodeError):
+        raise TransportError("network_isolation_unavailable") from None
+
+
+def marker_file(value=None):
+    path = Path(validate_marker_path(value))
+    for parent in reversed(path.parents):
+        trusted(parent, directory=True)
+    trusted(path, mode=0o600)
+    return path
+
+
+def valid_identity(value):
+    return (isinstance(value, dict) and set(value) == {"user", "uid", "gid"}
+            and isinstance(value["user"], str) and re.fullmatch(r"[a-z_][a-z0-9_-]{0,30}", value["user"]) is not None
+            and type(value["uid"]) is int and value["uid"] > 0 and type(value["gid"]) is int and value["gid"] > 0)
+
+
+def account(worker_user, marker_path=None):
     try:
         if not isinstance(worker_user, str) or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,30}", worker_user):
             raise ValueError()
-        trusted(ACCOUNT_MARKER.parent, directory=True)
-        marker = read_json(ACCOUNT_MARKER)
+        marker = read_json(marker_file(marker_path))
+        if not valid_identity(marker):
+            raise ValueError()
         user = pwd.getpwnam(worker_user)
         group = grp.getgrgid(user.pw_gid)
         expected = {"user": worker_user, "uid": user.pw_uid, "gid": user.pw_gid}
@@ -456,10 +483,12 @@ def verify_worker_fds(pid, proof, incoming, outgoing, launcher):
 
 
 class StorageTransport:
-    def __init__(self, state, worker_user=None, node_id=None):
+    def __init__(self, state, worker_user=None, node_id=None, marker_path=None):
         self.state = Path(state)
         self.node_id = node_id
         self.worker_user = worker_user
+        self.marker_path = marker_path
+        self._selected_marker = None
         self.directory = self.state / "transport"
         self.source_dir = Path(__file__).resolve().parent
         self._account = None
@@ -467,24 +496,42 @@ class StorageTransport:
         self._active = set()
         self._probe_until = 0
 
-    def settings(self):
+    def settings(self, *, recovery=False):
         path = self.state / "transport-settings.json"
         try:
             saved = read_json(path) if path.exists() or path.is_symlink() else None
-            if saved is not None and (not isinstance(saved, dict) or set(saved) != {"user", "uid", "gid"}):
+            if saved is not None:
+                if (not isinstance(saved, dict) or set(saved) not in ({"user", "uid", "gid"}, {"user", "uid", "gid", "markerPath"})
+                        or not valid_identity({key: saved[key] for key in ("user", "uid", "gid")})
+                        or ("markerPath" in saved and not isinstance(saved["markerPath"], str))):
+                    raise TransportError("network_isolation_unavailable")
+                pinned_marker = validate_marker_path(saved.get("markerPath"))
+            else:
+                if recovery or self.directory.exists() or self.directory.is_symlink():
+                    raise TransportError("transport_cleanup_unverified", True)
+                pinned_marker = None
+            if not recovery:
+                if self.worker_user is not None and (not isinstance(self.worker_user, str) or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,30}", self.worker_user)):
+                    raise TransportError("network_isolation_unavailable")
+                requested_marker = validate_marker_path(self.marker_path) if self.marker_path is not None else None
+                if saved is not None and ((self.worker_user is not None and self.worker_user != saved["user"])
+                                          or (requested_marker is not None and requested_marker != pinned_marker)):
+                    raise TransportError("network_isolation_unavailable")
+            else:
+                requested_marker = None  # Recovery uses the old durable authority, never changed caller options.
+            selected = saved["user"] if saved is not None else (self.worker_user or DEFAULT_WORKER_USER)
+            selected_marker = pinned_marker or requested_marker or validate_marker_path()
+            current = account(selected) if selected_marker == str(ACCOUNT_MARKER) else account(selected, marker_path=selected_marker)
+            if not valid_identity(current) or (saved is not None and any(saved[key] != current[key] for key in ("user", "uid", "gid"))):
                 raise TransportError("network_isolation_unavailable")
-            if self.worker_user is not None and (not isinstance(self.worker_user, str) or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,30}", self.worker_user)):
-                raise TransportError("network_isolation_unavailable")
-            selected = self.worker_user if self.worker_user is not None else ((saved or {}).get("user") or DEFAULT_WORKER_USER)
-            current = account(selected)
-            if saved is not None and saved != current:
-                raise TransportError("network_isolation_unavailable")
-            if saved is None:
+            pinned = {**current, "markerPath": selected_marker}
+            # A legacy pin can only reach here through the verified default marker with the same identity.
+            if saved != pinned:
                 trusted(self.state, directory=True, mode=0o700)
-                atomic(path, current)
-            self._account = current
+                atomic(path, pinned)
+            self._account, self._selected_marker = current, selected_marker
             return current
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError, KeyError):
             raise TransportError("network_isolation_unavailable") from None
 
     def _prerequisites(self, *, standalone=False):
@@ -535,7 +582,7 @@ class StorageTransport:
         unit = "rpo-storage-" + identifier + ".service"
         marker = "RolyPolyOps storage " + owner + " " + identifier
         intent = {"v": 1, "nodeId": self.node_id, "id": identifier, "owner": owner, "state": str(self.state.resolve()), "unit": unit,
-                  "marker": marker, "directory": str(directory), "account": identity, "caller": parent,
+                  "marker": marker, "directory": str(directory), "account": identity, "markerPath": self._selected_marker, "caller": parent,
                   "cgroup": "/system.slice/" + unit, "argv": ["/usr/bin/python3", str(code / "compose_storage_worker.py")],
                   "bootId": Path("/proc/sys/kernel/random/boot_id").read_text().strip(), "rootPid": os.getpid(),
                   "rootBirth": pid_birth(os.getpid()), "stage": "staging", "action": action,
@@ -564,6 +611,10 @@ class StorageTransport:
         owner = read_json(self.directory / "owner.json")["id"]
         identifier = intent.get("id", "")
         identity = intent.get("account", {})
+        pinned = self.settings(recovery=True)
+        if "markerPath" in intent and not isinstance(intent["markerPath"], str):
+            raise TransportError("transport_cleanup_unverified", True)
+        intent_marker = validate_marker_path(intent.get("markerPath"))
         expected_dir = RUN_ROOT / identifier
         expected_unit = "rpo-storage-" + identifier + ".service"
         if (not re.fullmatch(r"[a-f0-9]{32}", identifier) or path.name != identifier + ".json"
@@ -572,7 +623,7 @@ class StorageTransport:
                 or intent.get("cgroup") != "/system.slice/" + expected_unit
                 or intent.get("marker") != "RolyPolyOps storage " + owner + " " + identifier
                 or intent.get("argv") != ["/usr/bin/python3", str(expected_dir / "code" / "compose_storage_worker.py")]
-                or identity != self.settings()):
+                or not valid_identity(identity) or identity != pinned or intent_marker != self._selected_marker):
             raise TransportError("transport_cleanup_unverified", True)
         if expected_dir.exists() or expected_dir.is_symlink():
             value = trusted(expected_dir, directory=True, mode=0o710)
@@ -653,14 +704,17 @@ class StorageTransport:
 
     def recover(self):
         calls = self.directory / "calls"
-        if not calls.exists():
+        if not self.directory.exists() and not self.directory.is_symlink():
             return []
-        self.settings()
-        trusted(self.directory, directory=True, mode=0o700)
-        trusted(calls, directory=True, mode=0o700)
-        paths = sorted(calls.glob("*.json"))
-        if len(paths) > 1000:
-            raise TransportError("transport_cleanup_unverified", True)
+        try:
+            self.settings(recovery=True)
+            trusted(self.directory, directory=True, mode=0o700)
+            trusted(calls, directory=True, mode=0o700)
+            paths = sorted(calls.glob("*.json"))
+            if len(paths) > 1000:
+                raise TransportError("transport_cleanup_unverified", True)
+        except (OSError, ValueError, KeyError, TypeError, TransportError):
+            raise TransportError("transport_cleanup_unverified", True) from None
         recovered = []
         for path in paths:
             try:
@@ -958,21 +1012,22 @@ class StorageTransport:
         return bytes(result)
 
 
-def probe_runtime(worker_user=DEFAULT_WORKER_USER, source_dir=None, timeout=30):
+def probe_runtime(worker_user=DEFAULT_WORKER_USER, source_dir=None, timeout=30, marker_path=None):
     try:
-        return _probe_runtime(worker_user, source_dir, timeout)
+        return _probe_runtime(worker_user, source_dir, timeout, marker_path)
     except TransportError:
         raise
     except (OSError, ValueError, KeyError, TypeError, IndexError, RuntimeError):
         raise TransportError("transport_cleanup_unverified", True) from None
 
 
-def _probe_runtime(worker_user, source_dir, timeout):
+def _probe_runtime(worker_user, source_dir, timeout, marker_path=None):
     if type(timeout) not in {int, float} or not 1 <= timeout <= 120:
         raise TransportError("network_isolation_unavailable")
     # No credentials, no backend, no active-service prerequisite. Same isolation gate and cleanup.
+    chosen_marker = validate_marker_path(marker_path)
     prerequisites()
-    identity = account(worker_user)
+    identity = account(worker_user) if marker_path is None else account(worker_user, marker_path=chosen_marker)
     try:
         RUN_ROOT.mkdir(mode=0o711)
         os.chmod(RUN_ROOT, 0o711)
@@ -981,7 +1036,7 @@ def _probe_runtime(worker_user, source_dir, timeout):
     trusted(RUN_ROOT, directory=True, mode=0o711)
     state = RUN_ROOT / ("probe-" + uuid.uuid4().hex)
     state.mkdir(mode=0o700)
-    transport = StorageTransport(state, worker_user)
+    transport = StorageTransport(state, worker_user, marker_path=chosen_marker)
     if source_dir is not None:
         source = Path(source_dir)
         trusted(source, directory=True)

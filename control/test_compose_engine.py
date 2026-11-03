@@ -730,6 +730,20 @@ class EngineTests(unittest.TestCase):
         with self.assertRaisesRegex(engine.EngineError, "image_identity_unverified"):
             self.engine._image_archive(corrupt, identities)
 
+    def test_worker_marker_is_only_root_config_and_never_a_job_parameter(self):
+        marker = "/etc/isolated-instance/storage-worker.json"
+        with mock.patch.object(engine.StorageManager, "preflight") as probe:
+            isolated = engine.ManagedEngine({"nodeId": self.engine.node_id, "storageWorkerUser": "isolated-worker", "storageWorkerMarker": marker}, self.root / "isolated")
+        self.assertEqual(isolated.storage.transport.worker_user, "isolated-worker")
+        self.assertEqual(isolated.storage.transport.marker_path, marker)
+        self.assertFalse((isolated.state / "transport-settings.json").exists())
+        probe.assert_not_called()
+        for field in ("storageWorkerMarker", "storageWorkerUser", "marker_path"):
+            job = self.job()
+            job["parameters"][field] = marker
+            with self.assertRaises(engine.EngineError):
+                engine.validate_job(job)
+
     def test_storage_cleanup_failure_blocks_source_compensation_and_reconciliation(self):
         service, journal, container = self.source()
         self.engine._save_service(service)

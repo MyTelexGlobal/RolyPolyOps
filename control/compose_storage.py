@@ -224,9 +224,9 @@ def prove_empty(metadata, credentials, proxy):
 
 
 class StorageManager:
-    def __init__(self, state, sealer, worker_user=None):
+    def __init__(self, state, sealer, worker_user=None, marker_path=None):
         self.state, self.sealer = Path(state), sealer
-        self.transport = StorageTransport(self.state, worker_user, node_id=sealer.node_id)
+        self.transport = StorageTransport(self.state, worker_user, node_id=sealer.node_id, marker_path=marker_path)
         self.directory = self.state / "storages"
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
 

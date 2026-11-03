@@ -43,7 +43,7 @@ class StorageTests(unittest.TestCase):
         for endpoint in ("file:///tmp/repo", "https://user:pass@example.com/repo", "https://example.com/repo?q=x", "https://example.com/%2e%2e/root", "https://example.com/a\\b", "https://example.com/a\n"):
             with self.subTest(endpoint=endpoint), self.assertRaises(storage.StorageError):
                 storage.validate_metadata(self.metadata | {"endpoint": endpoint})
-        for key in ("command", "repoPassword", "credentials"):
+        for key in ("command", "repoPassword", "credentials", "storageWorkerMarker", "storageWorkerUser"):
             with self.assertRaises(storage.StorageError):
                 storage.validate_metadata(self.metadata | {key: "forbidden"})
 
