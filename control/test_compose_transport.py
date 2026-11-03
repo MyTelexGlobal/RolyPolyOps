@@ -806,5 +806,75 @@ class MarkerAuthorityTests(unittest.TestCase):
                 self.assertEqual(list(run_root.iterdir()), [])
 
 
+class InterfaceProofTests(unittest.TestCase):
+    HEADER = (b"Inter-|   Receive                                                |  Transmit\n"
+              b" face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n")
+
+    @classmethod
+    def row(cls, name="lo", counters=None):
+        return ("%6s: %s\n" % (name, " ".join(counters or ["0"] * 16))).encode("ascii")
+
+    def test_namespace_proc_format_has_sixteen_valid_counters_and_bounded_binary_read(self):
+        raw = self.HEADER + self.row(counters=[str(value) for value in range(16)])
+        source = mock.mock_open(read_data=raw)
+        with mock.patch("builtins.open", source), mock.patch.object(worker.socket, "if_nameindex", side_effect=OSError(97, "forbidden family")) as netlink:
+            self.assertEqual(worker.network_interfaces(), ["lo"])
+        source.assert_called_once_with("/proc/self/net/dev", "rb")
+        source.return_value.read.assert_called_once_with(worker.MAX_NET_DEV_BYTES + 1)
+        netlink.assert_not_called()
+
+    def test_proc_interface_parser_refuses_malformed_duplicate_nonascii_truncation_and_size(self):
+        good = self.HEADER + self.row()
+        invalid = [b"", self.HEADER, good[:-1], good.replace(b"Receive", b"Recv"), good.replace(b"multicast", b"multicasx"),
+                   good.replace(b"Inter-|", b"Inter-||"), self.HEADER + self.row() + self.row(),
+                   self.HEADER + b"lo: 0 0\n", self.HEADER + self.row(counters=["0"] * 15),
+                   self.HEADER + self.row(counters=["0"] * 17), self.HEADER + self.row(counters=["-1"] + ["0"] * 15),
+                   self.HEADER + self.row(counters=["1.0"] + ["0"] * 15), self.HEADER + self.row().replace(b"lo:", b"l:o:"),
+                   good + b"\n", good.replace(b"lo:", b"l\xff:"), good.replace(b"lo:", b"l\x00:"),
+                   good.replace(b"\n", b"\r\n"), good + b"x" * worker.MAX_NET_DEV_BYTES]
+        for raw in invalid:
+            with self.subTest(raw=raw[:80]), mock.patch("builtins.open", mock.mock_open(read_data=raw)):
+                with self.assertRaisesRegex(worker.WorkerError, "worker_isolation_preflight_failed"):
+                    worker.network_interfaces()
+        for failure in (PermissionError(), FileNotFoundError(), OSError("unreadable proc")):
+            with mock.patch("builtins.open", side_effect=failure), self.assertRaisesRegex(worker.WorkerError, "worker_isolation_preflight_failed"):
+                worker.network_interfaces()
+
+    @contextlib.contextmanager
+    def proof_fixture(self, raw=None, *, groups=None, cap="0", up=True, host_namespace=False, route=""):
+        request = {"uid": 1001, "gid": 1001, "hostNetns": [1, 1], "cgroup": "/system.slice/scoped.service"}
+        status = ("Uid:\t1001 1001 1001 1001\nGid:\t1001 1001 1001 1001\nNoNewPrivs:\t1\n"
+                  + "".join(name + ":\t" + (cap if name == "CapEff" else "0") + "\n" for name in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")))
+        values = {"/proc/self/status": status, "/proc/self/cgroup": "0::" + request["cgroup"] + "\n",
+                  "/proc/self/net/route": "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n" + route,
+                  "/proc/self/net/ipv6_route": ""}
+        source = mock.mock_open(read_data=self.HEADER + self.row() if raw is None else raw)
+        with mock.patch("builtins.open", source), mock.patch.object(worker.Path, "read_text", lambda path: values[str(path)]), mock.patch.object(worker.os, "getuid", return_value=1001), mock.patch.object(worker.os, "geteuid", return_value=1001), mock.patch.object(worker.os, "getgid", return_value=1001), mock.patch.object(worker.os, "getegid", return_value=1001), mock.patch.object(worker.os, "getgroups", return_value=[1001] if groups is None else groups), mock.patch.object(worker.os, "stat", return_value=types.SimpleNamespace(st_dev=1 if host_namespace else 2, st_ino=1 if host_namespace else 2)), mock.patch.object(worker, "LIBC", types.SimpleNamespace(prctl=mock.Mock(return_value=15))), mock.patch.object(worker.socket, "if_nameindex", side_effect=AssertionError("AF_NETLINK enumeration forbidden")) as netlink, mock.patch.object(worker.socket, "socket") as datagram, mock.patch.object(worker.fcntl, "ioctl", return_value=b"\0" * 16 + struct.pack("H", 1 if up else 0) + b"\0" * 14), mock.patch.object(worker, "descriptor_kind", side_effect=["file", "pipe", "devnull"]), mock.patch.object(worker, "pid_birth", return_value="native-birth"):
+            yield request, netlink, datagram
+
+    def test_actual_proof_uses_proc_only_and_preserves_loopback_up_socket(self):
+        with self.proof_fixture() as (request, netlink, datagram):
+            value = worker.isolation_proof(request)
+        self.assertEqual(value["uid"], 1001)
+        self.assertEqual(value["cgroup"], request["cgroup"])
+        self.assertEqual(value["fds"], ["file", "pipe", "devnull"])
+        netlink.assert_not_called()
+        datagram.assert_called_once_with(socket.AF_INET, socket.SOCK_DGRAM)
+        datagram.return_value.close.assert_called_once()
+
+    def test_proof_rejects_extra_duplicate_or_missing_loopback(self):
+        for raw in (self.HEADER + self.row() + self.row("eth0"), self.HEADER + self.row() + self.row(), self.HEADER + self.row("eth0"), self.HEADER):
+            with self.subTest(raw=raw), self.proof_fixture(raw) as (request, netlink, datagram):
+                with self.assertRaisesRegex(worker.WorkerError, "worker_isolation_preflight_failed"):
+                    worker.isolation_proof(request)
+                datagram.assert_not_called(); netlink.assert_not_called()
+
+    def test_existing_cap_group_namespace_loopback_up_and_route_guards_remain_active(self):
+        for options in ({"groups": [1001, 2002]}, {"cap": "1"}, {"host_namespace": True}, {"up": False}, {"route": "eth0 00000000 00000000 0001 0 0 0 00000000 0 0 0\n"}):
+            with self.subTest(options=options), self.proof_fixture(**options) as (request, _, _):
+                with self.assertRaisesRegex(worker.WorkerError, "worker_isolation_preflight_failed"):
+                    worker.isolation_proof(request)
+
+
 if __name__ == "__main__":
     unittest.main()
