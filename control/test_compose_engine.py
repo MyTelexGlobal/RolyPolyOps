@@ -337,6 +337,28 @@ class EngineTests(unittest.TestCase):
             self.engine._resume_capture(service, journal)
         self.assertEqual(docker.call_args_list, [mock.call("start", c["Id"]) for c in containers]);self.assertTrue(journal["resumeComplete"])
 
+    def test_inspection_binds_requested_filename_to_typed_inner_operation_before_any_effect(self):
+        for public in (False, True):
+            for status in ("outcome_unknown", "failed", "succeeded"):
+                service, journal, containers = self.capture_recovery_fixture()
+                original = self.engine._journal_path(journal["id"]);original.unlink()
+                requested = uid();path = self.engine._journal_path(requested)
+                journal["status"] = status;atomic(path, journal);before = path.read_bytes()
+                def start(*args, **kwargs):
+                    if args[0] == "start":next(c for c in containers if c["Id"] == args[1])["State"]["Running"] = True
+                with self.subTest(public=public, status=status), mock.patch.object(self.engine.storage, "recover") as storage, mock.patch.object(self.engine, "_terminate_helpers") as helpers, mock.patch.object(self.engine, "_save_service") as save, mock.patch.object(self.engine, "_check_other_writers"), mock.patch.object(self.engine, "_containers", return_value=containers), mock.patch.object(self.engine, "_inspect", side_effect=lambda ids: [c for c in containers if c["Id"] in ids]), mock.patch.object(self.engine, "docker", side_effect=start) as docker:
+                    result = self.engine.inspect_operation(requested) if public else self.engine._inspect_locked(requested)
+                self.assertEqual(result, {"status": "outcome_unknown", "error": "operation_identity_conflict"})
+                for effect in (storage, helpers, save, docker):effect.assert_not_called()
+                self.assertEqual(path.read_bytes(), before);self.assertFalse(original.exists())
+                self.assertEqual(self.engine._service(self.sid)["sourceState"], "unknown")
+                path.unlink()
+        for value in (None, {}, [], {"id": True}, {"id": None}, {"id": "invalid"}):
+            requested = uid();path = self.engine._journal_path(requested);atomic(path, value);before = path.read_bytes()
+            with self.subTest(value=value), mock.patch.object(self.engine, "_recover_locked") as recovery, mock.patch.object(self.engine.storage, "reconcile") as storage:
+                self.assertEqual(self.engine.inspect_operation(requested), {"status": "outcome_unknown", "error": "operation_identity_conflict"})
+            recovery.assert_not_called();storage.assert_not_called();self.assertEqual(path.read_bytes(), before);path.unlink()
+
     def test_unknown_capture_inspection_compensates_only_after_cleanup_and_settles_failed_without_replay(self):
         service, journal, containers = self.capture_recovery_fixture();effects = [];saved = []
         def start(*args, **kwargs):
