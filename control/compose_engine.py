@@ -2712,8 +2712,6 @@ class ManagedEngine:
             try:
                 record = self._restore(identity, params["serviceId"])
                 if record.get("state") == "isolated_ready":
-                    manifest = read(Path(record["directory"]) / "manifest.json")
-                    self._runtime_checks(record, manifest)
                     self._cleanup_payloads(value)
                     settled = {"status": "succeeded", "result": self._safe_restore(record)}
                 else:
