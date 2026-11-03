@@ -1333,6 +1333,166 @@ class ManagedEngine:
         except (KeyError, ValueError, TypeError, tarfile.TarError, OSError, RecursionError):
             raise EngineError("image_identity_unverified") from None
 
+    def _normalize_export_index(self, path, identities):
+        """Normalize only a fresh owned export; general/import validation remains strict."""
+        import io
+        import stat
+        path = Path(path)
+        operation = self.current.get("id") if isinstance(self.current, dict) else None
+        if (not is_uuid(operation) or self.current.get("action") != "compose-backup"
+                or path != self.state / "stages" / operation / "images.tar"):
+            raise EngineError("image_export_ownership_unverified")
+        for directory in (self.state, self.state / "stages", path.parent):
+            value = directory.lstat()
+            if not stat.S_ISDIR(value.st_mode) or value.st_uid != os.geteuid() or value.st_mode & 0o077:
+                raise EngineError("image_export_ownership_unverified")
+        original = path.lstat()
+        if not stat.S_ISREG(original.st_mode) or original.st_uid != os.geteuid() or original.st_mode & 0o022 or original.st_nlink != 1:
+            raise EngineError("image_export_ownership_unverified")
+        inspect_archive(path, data=False)
+        temporary = None
+        try:
+            with tarfile.open(path, "r:*") as archive:
+                names = archive.getnames()
+                if "index.json" not in names:
+                    return self._image_archive(path, identities)
+                visits = 0
+                def document(name):
+                    member = archive.getmember(name)
+                    if not member.isfile() or member.size > 4 * 1024 * 1024:
+                        raise ValueError()
+                    raw = archive.extractfile(member).read()
+                    return json.loads(raw), raw
+                def blob(value):
+                    nonlocal visits
+                    visits += 1
+                    if visits > 1000:
+                        raise ValueError()
+                    descriptor = self._descriptor(value)
+                    node, raw = document("blobs/sha256/" + descriptor["digest"][7:])
+                    if len(raw) != descriptor["size"] or "sha256:" + hashlib.sha256(raw).hexdigest() != descriptor["digest"]:
+                        raise ValueError()
+                    return node
+                index, _ = document("index.json")
+                roots = index.get("manifests")
+                if index.get("schemaVersion") != 2 or not isinstance(roots, list) or not 1 <= len(roots) <= 1000:
+                    raise ValueError()
+                aliases = {image["alias"] for image in identities.values()}
+                selected = {image["manifestDigest"] for image in identities.values() if image.get("proofKind") == "native-manifest" and image.get("selectedDescriptor", {}).get("digest") == image.get("manifestDigest")}
+                runtime, extra = [], []
+                for root in roots:
+                    descriptor = self._descriptor(root)
+                    annotations = root.get("annotations", {})
+                    if not isinstance(annotations, dict):
+                        raise ValueError()
+                    alias = annotations.get("io.containerd.image.name")
+                    alias = alias.removeprefix("docker.io/") if isinstance(alias, str) else alias
+                    if descriptor["digest"] in selected or alias in aliases:
+                        runtime.append(root)
+                    else:
+                        extra.append(root)
+                if not extra:
+                    return self._image_archive(path, identities)
+                runtime_targets = {root["digest"] for root in runtime} & selected
+                if not runtime_targets:
+                    raise ValueError()
+                visits = len(roots)
+                for root in extra:
+                    if root.get("mediaType") != "application/vnd.oci.image.manifest.v1+json":
+                        raise ValueError()
+                    annotations = root.get("annotations", {})
+                    if set(annotations) - {"vnd.docker.reference.type", "vnd.docker.reference.digest"}:
+                        raise ValueError()
+                    platform = root.get("platform")
+                    if platform is not None and (not isinstance(platform, dict) or platform.get("os") != "unknown" or platform.get("architecture") != "unknown" or platform.get("variant") not in {None, ""}):
+                        raise ValueError()
+                    native = blob(root)
+                    if (native.get("schemaVersion") != 2 or native.get("mediaType") != "application/vnd.oci.image.manifest.v1+json"
+                            or "artifactType" in native or "subject" in native):
+                        raise ValueError()
+                    config_descriptor = native["config"]
+                    if config_descriptor.get("mediaType") != "application/vnd.oci.image.config.v1+json":
+                        raise ValueError()
+                    config = blob(config_descriptor)
+                    if (set(config) != {"architecture", "config", "os", "rootfs"} or config.get("os") != "unknown"
+                            or config.get("architecture") != "unknown" or config.get("config") != {}):
+                        raise ValueError()
+                    layers, targets = native.get("layers"), set()
+                    if not isinstance(layers, list) or not 1 <= len(layers) <= 1000:
+                        raise ValueError()
+                    for layer in layers:
+                        if layer.get("mediaType") != "application/vnd.in-toto+json":
+                            raise ValueError()
+                        statement = blob(layer)
+                        if (not isinstance(statement, dict) or statement.get("_type") not in {"https://in-toto.io/Statement/v0.1", "https://in-toto.io/Statement/v1"}
+                                or not isinstance(statement.get("predicateType"), str) or not statement["predicateType"]
+                                or not isinstance(statement.get("predicate"), dict)
+                                or statement["predicateType"] != layer.get("annotations", {}).get("in-toto.io/predicate-type")):
+                            raise ValueError()
+                        subjects = statement.get("subject")
+                        if not isinstance(subjects, list) or not 1 <= len(subjects) <= 1000:
+                            raise ValueError()
+                        for subject in subjects:
+                            if not isinstance(subject, dict) or not isinstance(subject.get("name"), str) or not subject["name"] or len(subject["name"]) > 4096:
+                                raise ValueError()
+                            digest_map = subject.get("digest")
+                            if (not isinstance(digest_map, dict) or set(digest_map) != {"sha256"}
+                                    or not isinstance(digest_map["sha256"], str) or not HEX.fullmatch(digest_map["sha256"])):
+                                raise ValueError()
+                            targets.add("sha256:" + digest_map["sha256"])
+                    rootfs = config.get("rootfs")
+                    if (not isinstance(rootfs, dict) or rootfs.get("type") != "layers" or rootfs.get("diff_ids") != [layer["digest"] for layer in layers]
+                            or len(targets) != 1 or not targets <= runtime_targets):
+                        raise ValueError()
+                    if (annotations.get("vnd.docker.reference.type", "attestation-manifest") != "attestation-manifest"
+                            or annotations.get("vnd.docker.reference.digest", next(iter(targets))) != next(iter(targets))):
+                        raise ValueError()
+                index["manifests"] = runtime
+                replacement = canonical(index)
+                if len(replacement) > 4 * 1024 * 1024 or shutil.disk_usage(path.parent).free < original.st_size + 4 * 1024 * 1024 + tarfile.RECORDSIZE:
+                    raise EngineError("insufficient_staging_space")
+                temporary = path.with_name(".images-normalized-" + uuid.uuid4().hex + ".tar")
+                descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(descriptor, "wb") as stream:
+                    os.fchmod(stream.fileno(), 0o600)
+                    with tarfile.open(fileobj=stream, mode="w", format=tarfile.PAX_FORMAT) as output:
+                        for member in archive.getmembers():
+                            copied = copy.copy(member)
+                            copied.pax_headers = dict(member.pax_headers)
+                            if member.name == "index.json":
+                                copied.size = len(replacement)
+                                if "size" in copied.pax_headers:
+                                    copied.pax_headers["size"] = str(copied.size)
+                                output.addfile(copied, io.BytesIO(replacement))
+                            else:
+                                output.addfile(copied, archive.extractfile(member) if member.isfile() else None)
+            measured = self._image_archive(temporary, identities)
+            current = path.lstat()
+            if (current.st_ino, current.st_dev, current.st_size, current.st_mtime_ns) != (original.st_ino, original.st_dev, original.st_size, original.st_mtime_ns):
+                raise EngineError("image_export_ownership_unverified")
+            descriptor = os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(temporary, path)
+            temporary = None
+            try:
+                descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            except OSError:
+                # Publication occurred, but durability is unverified. Caller must not upload.
+                raise EngineError("image_export_commit_unverified") from None
+            return measured
+        except (KeyError, ValueError, TypeError, AttributeError, tarfile.TarError, OSError, RecursionError):
+            raise EngineError("image_identity_unverified") from None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
     def _export_images(self, stage, images):
         descriptors = copy.deepcopy(images)
         for identity, item in descriptors.items():
@@ -1347,7 +1507,7 @@ class ManagedEngine:
         platform = "/".join(x for x in (next(iter(descriptors.values()))["os"], next(iter(descriptors.values()))["architecture"], next(iter(descriptors.values())).get("variant", "")) if x)
         args = ["image", "save", "--platform", platform, "--output", str(image_path), *[item["alias"] for item in descriptors.values()]]
         self.docker(*args, timeout=3600)
-        measured = self._image_archive(image_path, descriptors)
+        measured = self._normalize_export_index(image_path, descriptors)
         for identity, item in descriptors.items():
             item["size"] = max(item.get("size", 0), measured[identity]["requiredBytes"])
             item["measuredImage"] = measured[identity]

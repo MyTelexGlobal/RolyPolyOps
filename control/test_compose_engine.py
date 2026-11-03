@@ -1,4 +1,5 @@
 import copy
+import contextlib
 import hashlib
 import io
 import json
@@ -836,8 +837,9 @@ class EngineTests(unittest.TestCase):
 
     def test_capture_export_records_measured_conservative_image_budget(self):
         data = self.docker29_images()
-        stage = self.root / "export"
-        stage.mkdir()
+        self.engine.current = {"id": uid(), "action": "compose-backup"}
+        stage = self.engine.state / "stages" / self.engine.current["id"]
+        stage.mkdir(mode=0o700)
         def command(*args, **kwargs):
             if args[:2] == ("image", "save") and args[-1] == data["alias"]:
                 Path(args[args.index("--output") + 1]).write_bytes(data["archive"].read_bytes())
@@ -852,6 +854,163 @@ class EngineTests(unittest.TestCase):
         with mock.patch.object(engine.shutil, "disk_usage", return_value=mock.Mock(free=required * 3 + 512 * 1024 ** 2 - 1)):
             with self.assertRaisesRegex(engine.EngineError, "insufficient_staging_space"):
                 self.engine._reserve(0, required, 1)
+
+    def detached_export(self, *, change=None, version="v0.1", attestation=True):
+        files = {};images = {};runtime_roots = [];manifest = []
+        def blob(raw):
+            identity = "sha256:" + hashlib.sha256(raw).hexdigest();files["blobs/sha256/" + identity[7:]] = raw
+            return {"digest": identity, "size": len(raw)}
+        def document(value):return blob(helper.canonical(value))
+        layers = []
+        for i in range(5):
+            buffer = io.BytesIO()
+            with tarfile.open(fileobj=buffer, mode="w") as archive:tar_entry(archive, "bin/fixture-" + str(i), b"image-layer", mode=0o4755)
+            layers.append(blob(buffer.getvalue()) | {"mediaType": "application/vnd.oci.image.layer.v1.tar"})
+        for i, count in enumerate((5, 4)):
+            config = document({"os": "linux", "architecture": "amd64", "config": {}, "created": "fixture-" + str(i), "rootfs": {"type": "layers", "diff_ids": [v["digest"] for v in layers[:count]]}})
+            native = document({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json", "config": config | {"mediaType": "application/vnd.oci.image.config.v1+json"}, "layers": layers[:count]})
+            alias = "rolypolyops-reserved/sha256-" + config["digest"][7:] + ":bundle"
+            descriptor = native | {"mediaType": "application/vnd.oci.image.manifest.v1+json", "platform": {"os": "linux", "architecture": "amd64"}}
+            runtime_roots.append(descriptor | {"annotations": {"io.containerd.image.name": "docker.io/" + alias, "org.opencontainers.image.ref.name": "bundle"}})
+            images[config["digest"]] = {"id": config["digest"], "dockerRef": native["digest"], "alias": alias, "os": "linux", "architecture": "amd64", "variant": "", "proofKind": "native-manifest", "manifestDigest": native["digest"], "selectedDescriptor": descriptor, "size": 1}
+            manifest.append({"Config": "blobs/sha256/" + config["digest"][7:], "RepoTags": [alias], "Layers": ["blobs/sha256/" + v["digest"][7:] for v in layers[:count]]})
+        target = runtime_roots[-1]["digest"]
+        state = {"config": {"architecture": "unknown", "os": "unknown", "config": {}}, "root": {"annotations": {}}, "statements": [{"_type": "https://in-toto.io/Statement/" + version, "predicateType": kind, "subject": [{"name": "fixture-" + str(i), "digest": {"sha256": target[7:]}} for i in range(5)], "predicate": {"fixture": True}} for kind in ("https://spdx.dev/Document", "https://slsa.dev/provenance/v0.2")], "media": ["application/vnd.in-toto+json"] * 2, "runtime": runtime_roots}
+        if change:change(state)
+        roots = list(runtime_roots)
+        if attestation:
+            statements = [document(v) | {"mediaType": state["media"][i], "annotations": {"in-toto.io/predicate-type": v["predicateType"]}} for i, v in enumerate(state["statements"])]
+            if state.get("annotationMismatch"):statements[0]["annotations"]["in-toto.io/predicate-type"] = "different"
+            config_value = state["config"] | {"rootfs": {"type": "layers", "diff_ids": state.get("diffIds", [v["digest"] for v in statements])}}
+            config = document(config_value)
+            native = document({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json", "config": config | {"mediaType": "application/vnd.oci.image.config.v1+json"}, "layers": statements} | state.get("manifestFields", {}))
+            root = native | {"mediaType": "application/vnd.oci.image.manifest.v1+json"} | state["root"]
+            if state.get("wrongSize"):root["size"] += 1
+            roots.append(root)
+            if state.get("corruptHash"):files["blobs/sha256/" + native["digest"][7:]] += b" "
+        if state.get("nested"):
+            nested = document({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": [roots.pop()]})
+            roots.append(nested | {"mediaType": "application/vnd.oci.image.index.v1+json"})
+        if state.get("tooManyRoots"):roots = roots * 1001
+        files["manifest.json"] = helper.canonical(manifest)
+        files["index.json"] = helper.canonical({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": roots})
+        files["oci-layout"] = b'{"imageLayoutVersion":"1.0.0"}'
+        self.engine.current = {"id": uid(), "action": "compose-backup"}
+        stage = self.engine.state / "stages" / self.engine.current["id"];stage.mkdir(mode=0o700)
+        path = stage / "images.tar"
+        with tarfile.open(path, "w") as archive:
+            tar_entry(archive, "blobs", kind=tarfile.DIRTYPE, mode=0o755)
+            tar_entry(archive, "blobs/sha256", kind=tarfile.DIRTYPE, mode=0o755)
+            for name, raw in files.items():tar_entry(archive, name, raw)
+        return path, images
+
+    def test_fresh_export_normalizes_only_top_attestation_descriptor_and_preserves_all18_members(self):
+        for version in ("v0.1", "v1"):
+            path, images = self.detached_export(version=version)
+            before = helper.inspect_archive(path, data=False)
+            with tarfile.open(path) as archive:old = {m.name: archive.extractfile(m).read() for m in archive if m.isfile()}
+            with self.assertRaisesRegex(engine.EngineError, "image_identity_unverified"):self.engine._image_archive(path, images)
+            strict = self.engine._image_archive;validated = []
+            def validate(temp, identities):
+                self.assertNotEqual(temp, path);self.assertEqual(temp.stat().st_mode & 0o777, 0o600);validated.append(temp)
+                return strict(temp, identities)
+            with mock.patch.object(self.engine, "docker") as docker, mock.patch.object(self.engine, "_image_archive", side_effect=validate):measured = self.engine._normalize_export_index(path, images)
+            docker.assert_not_called();self.assertEqual(len(validated), 1)
+            self.assertEqual(measured, strict(path, images))
+            after = helper.inspect_archive(path, data=False);self.assertEqual(before["files"], 18);self.assertEqual(after["files"], 18)
+            self.assertEqual([v for v in before["entries"] if v["path"] != "index.json"], [v for v in after["entries"] if v["path"] != "index.json"])
+            with tarfile.open(path) as archive:
+                for member in archive:
+                    if member.isfile() and member.name != "index.json":self.assertEqual(archive.extractfile(member).read(), old[member.name])
+                index = json.load(archive.extractfile("index.json"));self.assertEqual(len(index["manifests"]), 2)
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_normalizer_without_attestation_is_byte_identical_and_exact_owned_path_only(self):
+        path, images = self.detached_export(attestation=False);raw = path.read_bytes()
+        result = self.engine._normalize_export_index(path, images)
+        self.assertEqual(result, self.engine._image_archive(path, images));self.assertEqual(path.read_bytes(), raw)
+        outside = self.root / "images.tar";outside.write_bytes(raw)
+        with self.assertRaisesRegex(engine.EngineError, "image_export_ownership_unverified"):self.engine._normalize_export_index(outside, images)
+        self.engine.current = None
+        with self.assertRaisesRegex(engine.EngineError, "image_export_ownership_unverified"):self.engine._normalize_export_index(path, images)
+        self.assertEqual(path.read_bytes(), raw)
+
+    def test_export_pipeline_uses_normalized_strict_measurements_without_second_validation(self):
+        path, images = self.detached_export();raw = path.read_bytes()
+        def command(*args, **kwargs):
+            if args[:2] == ("image", "save"):Path(args[args.index("--output") + 1]).write_bytes(raw)
+            return b""
+        with mock.patch.object(self.engine, "docker", side_effect=command), mock.patch.object(self.engine, "_image_archive", wraps=self.engine._image_archive) as validate:
+            result = self.engine._export_images(path.parent, images)
+        self.assertEqual(validate.call_count, 1)
+        for identity, item in result.items():self.assertEqual(item["size"], item["measuredImage"]["requiredBytes"])
+
+    def test_detached_export_unknown_foreign_and_semantically_changed_roots_are_not_removed(self):
+        cases = {
+            "foreign-subject": lambda s:s["statements"][0]["subject"][0].update(digest={"sha256": "0" * 64}),
+            "missing-subject": lambda s:s["statements"][0].update(subject=[]),
+            "missing-digest": lambda s:s["statements"][0]["subject"][0].pop("digest"),
+            "missing-name": lambda s:s["statements"][0]["subject"][0].pop("name"),
+            "name-type": lambda s:s["statements"][0]["subject"][0].update(name=True),
+            "malformed-subject": lambda s:s["statements"][0].update(subject=[None]),
+            "too-many-subjects": lambda s:s["statements"][0].update(subject=s["statements"][0]["subject"] * 201),
+            "empty-layers": lambda s:s.update(statements=[], media=[]),
+            "empty-predicate-type": lambda s:s["statements"][0].update(predicateType=""),
+            "wrong-algorithm": lambda s:s["statements"][0]["subject"][0].update(digest={"sha512": "0" * 128}),
+            "multiple-targets": lambda s:s["statements"][0]["subject"][0].update(digest={"sha256": s["runtime"][0]["digest"][7:]}),
+            "cmd": lambda s:s["config"].update(config={"Cmd": ["/runnable"]}),
+            "entrypoint": lambda s:s["config"].update(config={"Entrypoint": ["/runnable"]}),
+            "config-os": lambda s:s["config"].update(os="linux"),
+            "platform": lambda s:s["root"].update(platform={"os": "linux", "architecture": "amd64"}),
+            "alias": lambda s:s["root"].update(annotations={"io.containerd.image.name": "foreign:latest"}),
+            "tar-layer": lambda s:s["media"].__setitem__(0, "application/vnd.oci.image.layer.v1.tar"),
+            "unknown-media": lambda s:s["media"].__setitem__(0, "unknown"),
+            "hash": lambda s:s.update(corruptHash=True),
+            "size": lambda s:s.update(wrongSize=True),
+            "diff-id": lambda s:s.update(diffIds=["sha256:" + "0" * 64] * 2),
+            "statement": lambda s:s["statements"][0].update(_type="unknown"),
+            "predicate-annotation": lambda s:s.update(annotationMismatch=True),
+            "reference-type": lambda s:s["root"].update(annotations={"vnd.docker.reference.type": "unknown"}),
+            "reference-digest": lambda s:s["root"].update(annotations={"vnd.docker.reference.digest": "sha256:" + "0" * 64}),
+            "artifact-type": lambda s:s.update(manifestFields={"artifactType": "unknown"}),
+            "nested-index": lambda s:s.update(nested=True),
+            "too-many-roots": lambda s:s.update(tooManyRoots=True),
+            "metadata-size": lambda s:s["statements"][0]["predicate"].update(large="x" * (4 * 1024 * 1024)),
+        }
+        for case, change in cases.items():
+            path, images = self.detached_export(change=change);before = path.read_bytes()
+            with self.subTest(case=case), self.assertRaises(engine.EngineError):self.engine._normalize_export_index(path, images)
+            self.assertEqual(path.read_bytes(), before, case);self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_export_normalizer_never_hides_foreign_runtime_or_forged_runtime_alias(self):
+        changes = (lambda s:s["config"].update(os="linux", architecture="amd64", config={"Cmd": ["/foreign"]}), lambda s:s["runtime"][0]["annotations"].update({"io.containerd.image.name": "foreign:latest"}))
+        for change in changes:
+            path, images = self.detached_export(change=change);before = path.read_bytes()
+            with self.assertRaisesRegex(engine.EngineError, "image_identity_unverified"):self.engine._image_archive(path, images)
+            with self.assertRaisesRegex(engine.EngineError, "image_identity_unverified"):self.engine._normalize_export_index(path, images)
+            self.assertEqual(path.read_bytes(), before);self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_normalizer_strict_validation_and_prepublication_failures_preserve_original(self):
+        for failure in ("validation", "replace", "space", "file-fsync"):
+            path, images = self.detached_export();before = path.read_bytes()
+            with self.subTest(failure=failure), contextlib.ExitStack() as stack:
+                if failure == "validation":stack.enter_context(mock.patch.object(self.engine, "_image_archive", side_effect=engine.EngineError("strict-control")))
+                elif failure == "replace":stack.enter_context(mock.patch.object(engine.os, "replace", side_effect=OSError("replace")))
+                elif failure == "space":stack.enter_context(mock.patch.object(engine.shutil, "disk_usage", return_value=mock.Mock(free=0)))
+                else:stack.enter_context(mock.patch.object(engine.os, "fsync", side_effect=OSError("sync")))
+                with self.assertRaises(engine.EngineError):self.engine._normalize_export_index(path, images)
+            self.assertEqual(path.read_bytes(), before);self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_postpublication_directory_sync_failure_reports_unverified_commit_without_upload(self):
+        path, images = self.detached_export();before = path.read_bytes();real = engine.os.fsync;calls = []
+        def sync(fd):
+            calls.append(fd)
+            if len(calls) == 2:raise OSError("directory sync")
+            return real(fd)
+        with mock.patch.object(engine.os, "fsync", side_effect=sync), mock.patch.object(self.engine.storage, "run") as upload:
+            with self.assertRaisesRegex(engine.EngineError, "image_export_commit_unverified") as caught:self.engine._normalize_export_index(path, images)
+        self.assertFalse(caught.exception.unknown);upload.assert_not_called();self.assertNotEqual(path.read_bytes(), before)
+        self.assertEqual(set(self.engine._image_archive(path, images)), set(images));self.assertEqual(list(path.parent.iterdir()), [path])
 
     def test_oci_or_legacy_secondary_tags_cannot_overwrite_other_images(self):
         for name, document in (("index.json", {"manifests": [{"annotations": {"io.containerd.image.name": "production:latest", "org.opencontainers.image.ref.name": "latest"}}]}), ("repositories", {"production": {"latest": "a" * 64}})):
