@@ -4,28 +4,25 @@ import contextlib
 import datetime as dt
 import hashlib
 import hmac
-import http.server
-import ipaddress
 import json
 import os
 from pathlib import Path
 import re
-import select
 import socket
-import socketserver
 import ssl
-import subprocess
-import threading
-import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+try:
+    from .compose_transport import StorageTransport, TransportError, public_addresses as _public_addresses
+except ImportError:
+    from compose_transport import StorageTransport, TransportError, public_addresses as _public_addresses
 
 
 class StorageError(Exception):
@@ -111,100 +108,18 @@ def validate_metadata(metadata):
 
 def public_addresses(host, port):
     try:
-        answers = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        values = sorted({item[4][0] for item in answers})
-        # Refuse mixed public/private answers rather than selecting a convenient address.
-        def allowed(value):
-            address = ipaddress.ip_address(value)
-            return address.is_global and not (address.is_multicast or address.is_unspecified or address.is_reserved or address.is_loopback or address.is_link_local or address.is_private)
-        if not values or any(not allowed(value) for value in values):
-            raise StorageError("storage_address_forbidden")
-        return values
-    except (socket.gaierror, ValueError):
-        raise StorageError("storage_dns_failed") from None
-
-
-class _Proxy(socketserver.ThreadingTCPServer):
-    allow_reuse_address = False
-    daemon_threads = True
-
-
-class _Connect(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *_):
-        pass
-
-    def do_CONNECT(self):
-        proxy = self.server
-        if self.path.lower() != proxy.authority.lower() or self.headers.get("Proxy-Authorization") != proxy.auth:
-            self.send_error(403)
-            return
-        remote = None
-        try:
-            addresses = public_addresses(proxy.host, proxy.port)
-            # Numeric connect pins this connection; TLS retains the original authority/SNI.
-            for address in addresses:
-                try:
-                    remote = socket.create_connection((address, proxy.port), timeout=10)
-                    break
-                except OSError:
-                    continue
-            if remote is None:
-                raise OSError()
-            self.send_response(200, "Connection Established")
-            self.end_headers()
-            self.connection.settimeout(60)
-            deadline = time.monotonic() + 7200
-            while time.monotonic() < deadline:
-                readable, _, _ = select.select([self.connection, remote], [], [], 30)
-                for source in readable:
-                    data = source.recv(65536)
-                    if not data:
-                        return
-                    (remote if source is self.connection else self.connection).sendall(data)
-        except (OSError, StorageError):
-            return
-        finally:
-            if remote:
-                remote.close()
-
-    def do_GET(self):
-        self.send_error(403)
-
-    do_POST = do_PUT = do_DELETE = do_HEAD = do_GET
-
-
-@contextlib.contextmanager
-def transport(metadata):
-    host, port = validate_metadata(metadata)
-    public_addresses(host, port)
-    token = uuid.uuid4().hex + uuid.uuid4().hex
-    server = _Proxy(("127.0.0.1", 0), _Connect)
-    server.host, server.port = host, port
-    server.authority = ("[" + host + "]" if ":" in host else host) + ":" + str(port)
-    server.auth = "Basic " + base64.b64encode(("rpo:" + token).encode()).decode()
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield "http://rpo:" + token + "@127.0.0.1:" + str(server.server_address[1])
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *_):
-        raise StorageError("storage_redirect_forbidden")
+        return _public_addresses(host, port)
+    except TransportError as error:
+        raise StorageError(error.code, error.unknown) from None
 
 
 def _request(url, headers, proxy, *, allow_missing=False):
-    # ProxyHandler observes process no_proxy. Explicitly use the HTTPS tunnel to avoid that bypass.
-    parsed = urllib.parse.urlsplit(proxy)
     origin = urllib.parse.urlsplit(url)
     import http.client
-    connection = http.client.HTTPSConnection(parsed.hostname, parsed.port, timeout=30, context=ssl.create_default_context())
-    auth = "Basic " + base64.b64encode((parsed.username + ":" + parsed.password).encode()).decode()
-    connection.set_tunnel(origin.hostname, origin.port or 443, headers={"Proxy-Authorization": auth})
+    try:
+        connection = proxy.connection(origin.hostname, origin.port if origin.port is not None else 443)
+    except TransportError as error:
+        raise StorageError(error.code, error.unknown) from None
     try:
         path = urllib.parse.urlunsplit(("", "", origin.path or "/", origin.query, ""))
         connection.request("GET", path, headers=headers)
@@ -232,7 +147,6 @@ def _s3_headers(url, credentials, region, moment=None):
     if credentials.get("sessionToken"):
         headers["x-amz-security-token"] = credentials["sessionToken"]
     names = ";".join(sorted(headers))
-    query = "&".join(k + "=" + v for k, v in sorted(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)))
     # parse_qsl decodes; AWS requires re-encoding each key/value separately.
     query = "&".join(urllib.parse.quote(k, safe="-_.~") + "=" + urllib.parse.quote(v, safe="-_.~")
                      for k, v in sorted(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)))
@@ -278,7 +192,11 @@ def prove_empty(metadata, credentials, proxy):
             url = metadata["endpoint"].rstrip("/") + "/" + metadata["bucket"] + "?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
             raw = _request(url, _s3_headers(url, credentials, metadata.get("region", "us-east-1")), proxy)
             try:
-                root = ET.fromstring(raw)
+                # Only UTF-8 S3 XML is accepted; alternate encodings must not hide declarations.
+                text = raw.decode("utf-8-sig")
+                if re.search(r"<!\s*(?:DOCTYPE|ENTITY)\b", text, re.IGNORECASE):
+                    raise ValueError()
+                root = ET.fromstring(text)
                 # Only the documented response root counts as a successful listing.
                 if root.tag.rsplit("}", 1)[-1] != "ListBucketResult":
                     raise ValueError()
@@ -298,7 +216,7 @@ def prove_empty(metadata, credentials, proxy):
                 if not token or token in seen:
                     raise ValueError()
                 seen.add(token)
-            except (ET.ParseError, ValueError):
+            except (ET.ParseError, ValueError, UnicodeError):
                 raise StorageError("storage_listing_incomplete") from None
         else:
             raise StorageError("storage_listing_incomplete")
@@ -306,8 +224,9 @@ def prove_empty(metadata, credentials, proxy):
 
 
 class StorageManager:
-    def __init__(self, state, sealer):
+    def __init__(self, state, sealer, worker_user=None):
         self.state, self.sealer = Path(state), sealer
+        self.transport = StorageTransport(self.state, worker_user, node_id=sealer.node_id)
         self.directory = self.state / "storages"
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
 
@@ -322,19 +241,26 @@ class StorageManager:
     @contextlib.contextmanager
     def session(self, binding):
         metadata, credentials = binding["metadata"], binding["credentials"]
-        with transport(metadata) as proxy:
-            env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME": str(self.state),
-                   "HTTPS_PROXY": proxy, "HTTP_PROXY": proxy, "https_proxy": proxy, "http_proxy": proxy,
-                   "NO_PROXY": "", "no_proxy": "", "RESTIC_PASSWORD_FILE": str(self.directory / (metadata["id"] + ".password"))}
-            if metadata["kind"] == "rest":
-                env.update(RESTIC_REPOSITORY="rest:" + metadata["endpoint"], RESTIC_REST_USERNAME=credentials["username"], RESTIC_REST_PASSWORD=credentials["password"])
-            else:
-                env.update(RESTIC_REPOSITORY="s3:" + metadata["endpoint"].rstrip("/") + "/" + metadata["bucket"] + "/" + metadata["prefix"],
-                           AWS_ACCESS_KEY_ID=credentials["accessKeyId"], AWS_SECRET_ACCESS_KEY=credentials["secretAccessKey"],
-                           AWS_DEFAULT_REGION=metadata.get("region", "us-east-1"))
-                if credentials.get("sessionToken"):
-                    env["AWS_SESSION_TOKEN"] = credentials["sessionToken"]
-            yield env, proxy
+        try:
+            context = self.transport.session(metadata)
+            with context as proxy:
+                yield self._environment(binding), proxy
+        except TransportError as error:
+            raise StorageError(error.code, error.unknown) from None
+
+    def _environment(self, binding):
+        metadata, credentials = binding["metadata"], binding["credentials"]
+        env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME": str(self.state),
+               "RESTIC_PASSWORD_FILE": str(self.directory / (metadata["id"] + ".password"))}
+        if metadata["kind"] == "rest":
+            env.update(RESTIC_REPOSITORY="rest:" + metadata["endpoint"], RESTIC_REST_USERNAME=credentials["username"], RESTIC_REST_PASSWORD=credentials["password"])
+        else:
+            env.update(RESTIC_REPOSITORY="s3:" + metadata["endpoint"].rstrip("/") + "/" + metadata["bucket"] + "/" + metadata["prefix"],
+                       AWS_ACCESS_KEY_ID=credentials["accessKeyId"], AWS_SECRET_ACCESS_KEY=credentials["secretAccessKey"],
+                       AWS_DEFAULT_REGION=metadata.get("region", "us-east-1"))
+            if credentials.get("sessionToken"):
+                env["AWS_SESSION_TOKEN"] = credentials["sessionToken"]
+        return env
 
     def _password(self, storage_id, password):
         path = self.directory / (storage_id + ".password")
@@ -355,41 +281,27 @@ class StorageManager:
             os.close(d)
 
     def run(self, binding, args, *, timeout=7200, cwd=None, init=False, input_file=None, output_file=None, output_limit=None):
-        with self.session(binding) as (env, _):
-            return self._run(env, args, timeout=timeout, cwd=cwd, init=init, input_file=input_file, output_file=output_file, output_limit=output_limit)
+        return self._run(self._environment(binding), args, timeout=timeout, cwd=cwd, init=init, input_file=input_file, output_file=output_file, output_limit=output_limit)
 
     def _run(self, env, args, *, timeout=7200, cwd=None, init=False, input_file=None, output_file=None, output_limit=None):
-        incoming = open(input_file, "rb") if input_file else None
-        outgoing = None
+        if cwd is not None:
+            raise StorageError("invalid_storage_stream")
         try:
-            if output_file:
-                outgoing = os.fdopen(os.open(output_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb")
-            def limits():
-                if output_limit:
-                    import resource
-                    resource.setrlimit(resource.RLIMIT_FSIZE, (output_limit, output_limit))
-            completed = subprocess.run(["restic", "--no-cache", *args], env=env, cwd=cwd, stdin=incoming or subprocess.DEVNULL,
-                                       stdout=outgoing or subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout, check=False,
-                                       preexec_fn=limits if output_limit else None)
-            if outgoing:
-                outgoing.flush()
-                os.fsync(outgoing.fileno())
-        except subprocess.TimeoutExpired:
-            raise StorageError("repository_timeout", unknown=init or args[0] == "backup") from None
-        except OSError:
-            raise StorageError("restic_unavailable") from None
-        finally:
-            if incoming:
-                incoming.close()
-            if outgoing:
-                outgoing.close()
-        if completed.returncode:
-            raise StorageError("repository_access_failed", unknown=False)
-        if output_file:
-            return b""
-        if len(completed.stdout) > 16 * 1024 * 1024:
-            raise StorageError("repository_result_limit")
-        return completed.stdout
+            return self.transport.execute(env, args, timeout=timeout, input_file=input_file, output_file=output_file, output_limit=output_limit)
+        except TransportError as error:
+            raise StorageError(error.code, error.unknown) from None
+
+    def preflight(self, *, timeout=30):
+        try:
+            return self.transport.preflight(timeout=timeout)
+        except TransportError as error:
+            raise StorageError(error.code, error.unknown) from None
+
+    def recover(self):
+        try:
+            return self.transport.recover()
+        except TransportError as error:
+            raise StorageError(error.code, error.unknown) from None
 
     def _config(self, env):
         try:
@@ -440,6 +352,7 @@ class StorageManager:
                 raise StorageError("expected_repository_required")
             if authoritative and expected != authoritative:
                 raise StorageError("repository_identity_mismatch")
+        self.preflight()
         self._password(storage_id, inner["repoPassword"])
         salt = os.urandom(32)
         binding = {"metadata": metadata, "credentials": credentials, "bindingGeneration": generation, "requestId": request_id,

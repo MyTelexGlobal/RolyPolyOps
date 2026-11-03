@@ -143,7 +143,7 @@ class ManagedEngine:
         for name in ("operations", "services", "restores", "stages"):
             (self.state / name).mkdir(mode=0o700, exist_ok=True)
         self.sealer = Sealer(self.state, self.node_id)
-        self.storage = StorageManager(self.state, self.sealer)
+        self.storage = StorageManager(self.state, self.sealer, worker_user=config.get("storageWorkerUser"))
         self.current = None
         self._local = threading.local()
 
@@ -1253,12 +1253,31 @@ class ManagedEngine:
             item["measuredImage"] = measured[identity]
         return descriptors
 
+    @staticmethod
+    def _capture_observations(containers, expected):
+        if len(containers) != len(expected) or {c.get("Id") for c in containers} != expected:
+            raise EngineError("capture_source_changed")
+        result = {}
+        for container in containers:
+            state = container.get("State", {})
+            started, count, running = state.get("StartedAt"), container.get("RestartCount"), state.get("Running")
+            if (not isinstance(started, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z", started)
+                    or type(count) is not int or count < 0 or type(running) is not bool):
+                raise EngineError("capture_source_changed")
+            try:
+                dt.datetime.fromisoformat(started[:-1] + "+00:00")
+            except ValueError:
+                raise EngineError("capture_source_changed") from None
+            result[container["Id"]] = {"startedAt": started, "restartCount": count, "running": running}
+        return result
+
     def _backup(self, params):
         service = self._service(params["serviceId"])
         self._source_guard(service)
         if service["storageId"] != params["storageId"]:
             raise EngineError("service_storage_mismatch")
         binding = self.storage.binding(service["storageId"])
+        self.storage.preflight()
         project = self._project(service["projectId"], owned_service=service["id"] if service.get("adopted") else None)
         if project["fingerprint"] != service["fingerprint"]:
             raise EngineError("source_drift")
@@ -1269,13 +1288,15 @@ class ManagedEngine:
         stage = self.state / "stages" / op
         stage.mkdir(mode=0o700)
         actual = self._inspect([c["id"] for c in project["containers"]])
+        quiescence = self._capture_observations(actual, {c["id"] for c in project["containers"]})
         stopped = [{"id": c["Id"], "imageId": c["Image"], "mountSignature": [[m.get("Type"), m.get("Name") if m.get("Type") == "volume" else m.get("Source"), m.get("Destination"), m.get("RW")] for m in c.get("Mounts", [])]} for c in actual if c.get("State", {}).get("Running")]
         self._journal(stage="capture-intent", reserve=reserve, resume={"serviceId": service["id"], "containers": stopped}, sourceResumed=False)
         service.update(sourceState="capture_stopped", captureOperation=op)
         self._save_service(service)
         archives = []
         try:
-            self.docker("stop", "--time", "60", *[c["id"] for c in stopped], timeout=120)
+            if stopped:
+                self.docker("stop", "--time", "60", *[c["id"] for c in stopped], timeout=120)
             if any(c.get("State", {}).get("Running") for c in self._inspect([c["id"] for c in stopped])):
                 raise EngineError("source_stop_failed")
             self._journal(stage="source-stopped")
@@ -1284,6 +1305,10 @@ class ManagedEngine:
                 self._helper(helper["dockerRef"], service["id"], ["pack", "/data/payload", "/stage/" + filename], source=mount, stage=stage)
                 metadata = inspect_archive(stage / filename)
                 archives.append({"key": key, "filename": filename, "kind": mount["kind"], "file": mount["file"], "sha256": metadata["sha256"], "files": metadata["files"], "bytes": metadata["bytes"], "metadataDigest": hashlib.sha256(canonical(metadata["entries"])).hexdigest()})
+            final_containers = [c for c in self._containers() if c.get("Config", {}).get("Labels", {}).get("com.docker.compose.project") == service["projectId"]]
+            final = self._capture_observations(final_containers, set(quiescence))
+            if any(value["running"] or value["startedAt"] != quiescence[identity]["startedAt"] or value["restartCount"] != quiescence[identity]["restartCount"] for identity, value in final.items()):
+                raise EngineError("capture_source_restarted")
             self._journal(stage="data-archived")
         finally:
             # Termination is positively proven even when copying or stop failed.
@@ -1758,7 +1783,7 @@ class ManagedEngine:
             return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
         script = Path(__file__).resolve()
         command = " ".join([quoted(sys.executable), quoted(script), "backup", "--state", quoted(self.state), "--node-id", self.node_id, "--service-id", service["id"]])
-        text = header + "[Unit]\nDescription=Compose service encrypted backup\nAfter=docker.service network-online.target\n\n[Service]\nType=oneshot\nUser=root\nUMask=0077\nExecStart=" + command + "\nTimeoutStartSec=4h\nRestart=on-failure\nRestartSec=60\nRestartPreventExitStatus=1\n"
+        text = header + "[Unit]\nDescription=Compose service encrypted backup\nAfter=docker.service network-online.target\n\n[Service]\nType=exec\nUser=root\nUMask=0077\nExecStart=" + command + "\nRuntimeMaxSec=4h\nTimeoutStopSec=15\nRestart=on-failure\nRestartSec=60\nRestartPreventExitStatus=1\n"
         timer = header + "[Unit]\nDescription=Compose service backup schedule\n\n[Timer]\nOnCalendar=" + INTERVALS[params["interval"]] + "\nPersistent=true\nRandomizedDelaySec=30\n\n[Install]\nWantedBy=timers.target\n"
         self._journal(stage="schedule-intent")
         self._unit_text(unit_dir / (name + ".service"), text)
@@ -2017,6 +2042,8 @@ class ManagedEngine:
         return {"serviceId": params["serviceId"], "restoreId": record["id"], "removed": True}
 
     def _recover_locked(self):
+        # An orphan storage writer must be proved dead before any source/helper compensation.
+        self.storage.recover()
         results = []
         for path in sorted((self.state / "services").glob("*.json")):
             service = read(path)
@@ -2082,6 +2109,7 @@ class ManagedEngine:
         request_digest = hashlib.sha256(canonical(job)).hexdigest()
         try:
             with self.lock():
+                self.storage.recover()
                 previous = read(self._journal_path(identity))
                 if previous:
                     if previous.get("requestDigest") != request_digest:
@@ -2337,7 +2365,60 @@ class ManagedEngine:
         self._local.addresses_partial = partial
         return sorted(addresses)[:20]
 
-    def observe(self):
+    def _observe_operations(self, output):
+        journals = []
+        for index, path in enumerate((self.state / "operations").glob("*.json")):
+            if index >= 10000:
+                output["operationOverflow"] = True
+                break
+            journals.append(read(path))
+        pending = sorted([v for v in journals if v.get("status") in {"running", "outcome_unknown"}], key=lambda value: (value.get("status") != "outcome_unknown", value.get("at", ""), value.get("id", "")))
+        terminal = sorted([v for v in journals if v not in pending], key=lambda v: v.get("at", ""), reverse=True)
+        if len(pending) > 200:
+            output["operationOverflow"] = True
+        active_lock = False
+        try:
+            with self.lock():
+                pass
+        except EngineError as error:
+            active_lock = error.code == "operation_busy"
+        for value in (pending + terminal)[:200]:
+            safe = self._safe_operation(value)
+            if value.get("status") == "running" and active_lock:
+                safe["status"] = "running"
+            output["operations"].append({"id": value["id"], "action": value["action"], "origin": value.get("origin", "controller"), **safe})
+
+    def _observe_local(self):
+        output = {"ready": False, "error": "compose_recovery_required", "projects": [], "storages": [], "services": [], "restores": [], "addresses": [], "operations": []}
+        try:
+            # Never create a new key while recovery is unresolved.
+            if self.sealer.path.exists() and not self.sealer.path.is_symlink():
+                output["key"] = self.sealer.public()
+            for path in sorted(self.storage.directory.glob("*.json"))[:8]:
+                binding = read(path)
+                safe = {key: binding[key] for key in ("repositoryId", "bindingGeneration", "requestId") if key in binding}
+                safe.update(id=binding["metadata"]["id"], storageId=binding["metadata"]["id"], connected=binding.get("status") == "connected")
+                if not safe["connected"]:
+                    safe["error"] = "binding_outcome_unknown" if binding.get("status") == "init_pending" else "storage_not_connected"
+                output["storages"].append(safe)
+            for path in sorted((self.state / "services").glob("*.json"))[:20]:
+                service = read(path)
+                safe = {key: service[key] for key in ("id", "projectId", "fingerprint", "storageId", "backupInterval", "sourceState", "latestBackup", "setupState", "activeRestoreId") if key in service}
+                safe.update(serviceId=service["id"], snapshots=[], snapshotError="snapshot_inventory_unavailable")
+                output["services"].append(safe)
+            for path in sorted((self.state / "restores").glob("*.json"))[-100:]:
+                record = read(path)
+                if record.get("state") != "removed":
+                    output["restores"].append(self._safe_restore(record) | {"id": record["id"]})
+            self._observe_operations(output)
+        except (EngineError, StorageError, SealError, OSError, ValueError, KeyError, TypeError):
+            # Keep the conservative error and every already-read safe field.
+            pass
+        return output
+
+    def observe(self, *, local_only=False):
+        if local_only:
+            return self._observe_local()
         self._local.observation_deadline = time.monotonic() + 25
         output = {"ready": False, "projects": [], "storages": [], "services": [], "restores": [], "addresses": [], "operations": []}
         try:
@@ -2372,7 +2453,8 @@ class ManagedEngine:
                     if key in service:
                         safe[key] = service[key]
                 try:
-                    safe["snapshots"] = self._snapshots(self.storage.binding(service["storageId"]), service["id"])
+                    with self.lock():
+                        safe["snapshots"] = self._snapshots(self.storage.binding(service["storageId"]), service["id"])
                 except (StorageError, EngineError):
                     safe["snapshotError"] = "snapshot_inventory_unavailable"
                 output["services"].append(safe)
@@ -2380,27 +2462,13 @@ class ManagedEngine:
                 record = read(path)
                 if record.get("state") != "removed":
                     output["restores"].append(self._safe_restore(record) | {"id": record["id"]})
-            journals = []
-            for index, path in enumerate((self.state / "operations").glob("*.json")):
-                if index >= 10000:
-                    output["operationOverflow"] = True
-                    break
-                journals.append(read(path))
-            pending = [v for v in journals if v.get("status") in {"running", "outcome_unknown"}]
-            terminal = sorted([v for v in journals if v not in pending], key=lambda v: v.get("at", ""), reverse=True)
-            if len(pending) > 200:
-                output["operationOverflow"] = True
-            active_lock = False
+            self._observe_operations(output)
             try:
                 with self.lock():
-                    pass
+                    self.storage.preflight(timeout=max(1, self._local.observation_deadline - time.monotonic()))
             except EngineError as error:
-                active_lock = error.code == "operation_busy"
-            for value in (pending + terminal)[:200]:
-                safe = self._safe_operation(value)
-                if value.get("status") == "running" and active_lock:
-                    safe["status"] = "running"
-                output["operations"].append({"id": value["id"], "action": value["action"], "origin": value.get("origin", "controller"), **safe})
+                if error.code != "operation_busy":
+                    raise
             output["ready"] = True
         except (EngineError, StorageError, SealError, ArchiveError) as error:
             output["error"] = error.code

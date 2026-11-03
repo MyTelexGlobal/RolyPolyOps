@@ -55,7 +55,7 @@ class EngineTests(unittest.TestCase):
     def source(self):
         config = self.root / "compose.json"
         config.write_text("{}")
-        c = {"Id": "a" * 64, "Image": "sha256:" + "b" * 64, "State": {"Running": False}, "Mounts": [], "Config": {"Labels": {"com.docker.compose.project": "ordinary"}}}
+        c = {"Id": "a" * 64, "Image": "sha256:" + "b" * 64, "State": {"Running": False, "StartedAt": "2026-11-01T12:00:00.000000000Z"}, "RestartCount": 0, "Mounts": [], "Config": {"Labels": {"com.docker.compose.project": "ordinary"}}}
         service = {"id": self.sid, "projectId": "ordinary", "fingerprint": "c" * 64, "storageId": self.storage, "sourceState": "capture_stopped", "captureOperation": uid(), "backupInterval": "hourly", "project": {"inputs": {str(config): helper.digest(config)}}}
         journal = {"id": service["captureOperation"], "action": "compose-backup", "status": "running", "stage": "source-stopped", "parameters": {"serviceId": self.sid, "storageId": self.storage}, "resume": {"serviceId": self.sid, "containers": [{"id": c["Id"], "imageId": c["Image"], "mountSignature": []}]}}
         return service, journal, c
@@ -316,7 +316,7 @@ class EngineTests(unittest.TestCase):
             if args[0] == "stop":
                 container["State"]["Running"] = False
             return b""
-        with mock.patch.object(self.engine.storage, "binding", return_value={"repositoryId": "a" * 64}), mock.patch.object(self.engine, "_project", return_value=project), mock.patch.object(self.engine, "_helper_image", return_value={"id": "helper", "dockerRef": "helper", "size": 1}), mock.patch.object(self.engine, "_helper", side_effect=helper_call), mock.patch.object(self.engine, "_reserve", return_value={}), mock.patch.object(self.engine, "_inspect", side_effect=lambda ids: [container]), mock.patch.object(self.engine, "docker", side_effect=docker), mock.patch.object(self.engine, "_resume_capture", side_effect=resume), mock.patch.object(self.engine.storage, "run") as upload:
+        with mock.patch.object(self.engine.storage, "preflight"), mock.patch.object(self.engine.storage, "binding", return_value={"repositoryId": "a" * 64}), mock.patch.object(self.engine, "_project", return_value=project), mock.patch.object(self.engine, "_helper_image", return_value={"id": "helper", "dockerRef": "helper", "size": 1}), mock.patch.object(self.engine, "_helper", side_effect=helper_call), mock.patch.object(self.engine, "_reserve", return_value={}), mock.patch.object(self.engine, "_inspect", side_effect=lambda ids: [container]), mock.patch.object(self.engine, "docker", side_effect=docker), mock.patch.object(self.engine, "_resume_capture", side_effect=resume), mock.patch.object(self.engine.storage, "run") as upload:
             with self.assertRaisesRegex(engine.EngineError, "archive_capture_failed"):
                 self.engine._backup({"serviceId": self.sid, "storageId": self.storage})
         self.assertEqual(effects, ["inspect", "stop", "pack", "resume"])
@@ -729,6 +729,116 @@ class EngineTests(unittest.TestCase):
         corrupt, identities = self.image_archive(corrupt=True)
         with self.assertRaisesRegex(engine.EngineError, "image_identity_unverified"):
             self.engine._image_archive(corrupt, identities)
+
+    def test_storage_cleanup_failure_blocks_source_compensation_and_reconciliation(self):
+        service, journal, container = self.source()
+        self.engine._save_service(service)
+        atomic(self.engine._journal_path(journal["id"]), journal)
+        with mock.patch.object(self.engine.storage, "recover", side_effect=engine.StorageError("transport_cleanup_unverified", True)), mock.patch.object(self.engine, "_resume_capture") as resume, mock.patch.object(self.engine, "_terminate_helpers") as helpers, mock.patch.object(self.engine.storage, "reconcile") as reconcile:
+            with self.assertRaisesRegex(engine.StorageError, "transport_cleanup_unverified"):
+                self.engine.recover()
+        resume.assert_not_called(); helpers.assert_not_called(); reconcile.assert_not_called()
+        self.assertEqual(self.engine._service(self.sid)["sourceState"], "capture_stopped")
+
+    def test_local_only_observation_preserves_key_and_unknown_without_external_calls(self):
+        self.engine.sealer.path.write_text("existing key")
+        os.chmod(self.engine.sealer.path, 0o600)
+        operation = uid()
+        atomic(self.engine._journal_path(operation), {"id": operation, "action": "compose-backup", "origin": "timer", "status": "running", "stage": "repository-write-intent", "parameters": {"sentinel": "private"}})
+        with mock.patch.object(self.engine.sealer, "public", return_value={"keyId": "existing"}), mock.patch.object(self.engine, "docker") as docker, mock.patch.object(self.engine, "_timer") as timer, mock.patch.object(self.engine.storage, "preflight") as probe, mock.patch.object(self.engine.storage, "run") as run, mock.patch.object(self.engine.storage, "recover") as recover:
+            result = self.engine.observe(local_only=True)
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["error"], "compose_recovery_required")
+        self.assertEqual(result["key"], {"keyId": "existing"})
+        self.assertEqual(result["operations"][0]["status"], "outcome_unknown")
+        self.assertEqual(result["operations"][0]["origin"], "timer")
+        self.assertNotIn("sentinel", json.dumps(result))
+        for call in (docker, timer, probe, run, recover):
+            call.assert_not_called()
+
+    def test_local_only_observation_never_creates_missing_key(self):
+        with mock.patch.object(self.engine.sealer, "public") as public:
+            result = self.engine.observe(local_only=True)
+        public.assert_not_called()
+        self.assertNotIn("key", result)
+        self.assertFalse(self.engine.sealer.path.exists())
+
+    def test_busy_observation_skips_network_without_orphan_or_probe(self):
+        service, _, _ = self.source()
+        service["sourceState"] = "running"
+        self.engine._save_service(service)
+        with self.engine.lock(), mock.patch.object(self.engine, "_observe_addresses", return_value=[]), mock.patch.object(self.engine.sealer, "public", return_value={"keyId": "key"}), mock.patch.object(self.engine, "_containers", return_value=[]), mock.patch.object(self.engine, "_timer", return_value={}), mock.patch.object(self.engine, "_snapshots") as snapshots, mock.patch.object(self.engine.storage, "preflight") as probe:
+            self.engine._local.addresses_partial = False
+            result = self.engine.observe()
+        snapshots.assert_not_called(); probe.assert_not_called()
+        self.assertEqual(result["services"][0]["snapshotError"], "snapshot_inventory_unavailable")
+        self.assertEqual(result["operations"], [])
+
+    def test_backup_preflight_fails_before_cold_pause_or_helper(self):
+        service, _, _ = self.source()
+        service["sourceState"] = "running"
+        self.engine._save_service(service)
+        with mock.patch.object(self.engine.storage, "binding", return_value={}), mock.patch.object(self.engine.storage, "preflight", side_effect=engine.StorageError("network_isolation_unavailable")), mock.patch.object(self.engine, "_helper") as helper_call, mock.patch.object(self.engine, "docker") as docker:
+            with self.assertRaisesRegex(engine.StorageError, "network_isolation_unavailable"):
+                self.engine._backup({"serviceId": self.sid, "storageId": self.storage})
+        helper_call.assert_not_called(); docker.assert_not_called()
+        self.assertEqual(self.engine._service(self.sid)["sourceState"], "running")
+
+    def test_capture_final_quiescence_rejects_running_restart_and_restart_then_stop(self):
+        for mode in ("running", "stopped-again", "unchanged", "all-stopped", "missing", "extra"):
+            with self.subTest(mode=mode):
+                service, _, first = self.source()
+                service["sourceState"] = "running"
+                second = copy.deepcopy(first)
+                second["Id"] = "d" * 64
+                first["State"]["Running"] = mode != "all-stopped"
+                containers = [first, second]
+                project = {"fingerprint": service["fingerprint"], "platform": ["linux", "amd64", ""], "mounts": {"volume:data": {"kind": "volume", "source": "data", "file": False}}, "images": {}, "containers": [{"id": c["Id"]} for c in containers]}
+                service["project"].update(project)
+                self.engine._save_service(service)
+                self.engine.current = {"id": uid(), "action": "compose-backup", "status": "running"}
+                effects = []
+                def helper_call(image, sid, args, **kwargs):
+                    if args[0] == "inspect":
+                        return {"files": 1, "bytes": 3}
+                    if mode in {"running", "stopped-again"}:
+                        first["State"].update(Running=mode == "running", StartedAt="2026-11-02T13:00:00.000000001Z")
+                        first["RestartCount"] = 1
+                    elif mode == "missing":
+                        first["State"].pop("StartedAt")
+                    return {}
+                def docker(*args, **kwargs):
+                    effects.append(args)
+                    if args[0] == "stop":
+                        for c in containers:
+                            c["State"]["Running"] = False
+                    elif args[0] == "start":
+                        next(c for c in containers if c["Id"] == args[1])["State"]["Running"] = True
+                    return b""
+                def inspect(ids):
+                    return [c for c in containers if c["Id"] in ids]
+                final = lambda: containers + ([copy.deepcopy(second) | {"Id": "e" * 64}] if mode == "extra" else [])
+                with mock.patch.object(self.engine.storage, "preflight"), mock.patch.object(self.engine.storage, "binding", return_value={"repositoryId": "a" * 64}), mock.patch.object(self.engine, "_project", return_value=project), mock.patch.object(self.engine, "_helper_image", return_value={"id": "helper", "dockerRef": "helper", "size": 1}), mock.patch.object(self.engine, "_helper", side_effect=helper_call), mock.patch.object(self.engine, "_reserve", return_value={}), mock.patch.object(self.engine, "_inspect", side_effect=inspect), mock.patch.object(self.engine, "_containers", side_effect=final), mock.patch.object(self.engine, "docker", side_effect=docker), mock.patch.object(self.engine, "_terminate_helpers", side_effect=lambda journal: effects.append(("helpers-dead",))), mock.patch.object(engine, "inspect_archive", return_value={"sha256": "a" * 64, "files": 1, "bytes": 3, "entries": []}), mock.patch.object(self.engine, "_export_images", side_effect=engine.EngineError("export-reached")) as export, mock.patch.object(self.engine.storage, "run") as upload:
+                    expected = "export-reached" if mode in {"unchanged", "all-stopped"} else "capture_source_restarted" if mode in {"running", "stopped-again"} else "capture_source_changed"
+                    with self.assertRaisesRegex(engine.EngineError, expected):
+                        self.engine._backup({"serviceId": self.sid, "storageId": self.storage})
+                self.assertEqual(export.call_count, 1 if mode in {"unchanged", "all-stopped"} else 0)
+                upload.assert_not_called()
+                starts = [args for args in effects if args[0] == "start"]
+                self.assertEqual(starts, [] if mode in {"running", "all-stopped"} else [("start", first["Id"])])
+                if mode == "all-stopped":
+                    self.assertFalse(any(args[0] == "stop" for args in effects))
+                self.assertFalse(second["State"]["Running"])
+                if starts:
+                    self.assertLess(effects.index(("helpers-dead",)), effects.index(starts[0]))
+
+    def test_missing_native_capture_fields_fail_before_stop(self):
+        base = {"Id": "a" * 64, "State": {"Running": False, "StartedAt": "2026-11-01T12:00:00Z"}, "RestartCount": 0}
+        for change in ({"RestartCount": True}, {"RestartCount": -1}, {"State": {"Running": False}}, {"State": {"Running": False, "StartedAt": "invented"}}):
+            with self.assertRaisesRegex(engine.EngineError, "capture_source_changed"):
+                self.engine._capture_observations([base | change], {base["Id"]})
+        self.assertEqual(self.engine._capture_observations([base], {base["Id"]})[base["Id"]]["restartCount"], 0)
+
 
 
 if __name__ == "__main__":
