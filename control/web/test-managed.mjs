@@ -66,6 +66,8 @@ if(process.argv.includes('--browser')) {
  function job(action,nodeId,parameters,result={},error){const j={id:randomUUID(),action,nodeId,serviceId:parameters?.serviceId,storageId:parameters?.storageId,restoreId:parameters?.restoreId,status:action.startsWith('compose-')||action==='storage-configure'?'queued':error?'failed':'succeeded',error,createdAt:new Date().toISOString(),result};outcomes.set(j.id,error?'failed':'succeeded');jobs.push(j);return j;}
  const server=createServer(async(req,res)=>{try{
   const url=new URL(req.url,'http://localhost');const path=url.pathname.replace(/^\/ops/,'');
+  // Chromium may request the optional icon after every navigation.
+  if(path==='/favicon.ico'){res.statusCode=404;res.end();return;}
   let body;if(req.method==='POST'){let raw='';for await(const chunk of req)raw+=chunk;body=JSON.parse(raw);requests.push({path,body});if(path.includes('/connect'))assert(!raw.includes(secret));}
   let data;const repeatKey=body?.idempotencyKey?path+'/'+body.idempotencyKey:null;if(repeatKey&&replies.has(repeatKey)){assert.deepEqual(body,replies.get(repeatKey).body);res.setHeader('Content-Type','application/json');res.end(JSON.stringify(replies.get(repeatKey).data));return;}
   if(req.method==='POST'){assert.equal(req.headers['x-csrf-token'],'test-csrf');assert.equal(req.headers.origin,`http://127.0.0.1:${server.address().port}`);}
