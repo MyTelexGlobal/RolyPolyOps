@@ -178,7 +178,7 @@ def sanitize_status(value):
         if not identity(sid):
             continue
         item = {'serviceId': sid, 'schedule': schedule(s.get('schedule')), 'snapshots': points(s.get('snapshots'))}
-        for name in ('storageId',):
+        for name in ('storageId','activeRestoreId'):
             if identity(s.get(name)):
                 item[name] = s[name]
         for name in ('fingerprint', 'repositoryId'):
@@ -203,6 +203,8 @@ def sanitize_status(value):
         if r['state'] == 'stopped' and (r.get('applicationHealthVerified') is not False or r.get('healthScope') != 'stopped' or r.get('id',rid) != rid):
             continue
         item = {'id': rid, 'serviceId': r['serviceId'], 'state': r['state']}
+        if isinstance(r.get('projectId'),str) and NAME.fullmatch(r['projectId']):
+            item['projectId'] = r['projectId']
         for name in ('snapshotId', 'repositoryId', 'manifestDigest', 'sourceFingerprint'):
             if isinstance(r.get(name, r.get('snapshot') if name == 'snapshotId' else None), str) and HEX.fullmatch(r.get(name, r.get('snapshot') if name == 'snapshotId' else None)):
                 item[name] = r.get(name, r.get('snapshot') if name == 'snapshotId' else None)
@@ -436,26 +438,35 @@ class ComposeControl:
     def stopped_catalog_scope(self, db, restore, service):
         """Bind a stopped removal to its known failed job and immutable point."""
         try:
-            if restore['state'] != 'failed' or restore['service_id'] != service['id'] or restore['node_id'] == service['sourceNodeId']:
+            if restore['state'] != 'failed' or restore['service_id'] != service['id']:
                 return None
-            repository = self.storage(db, service['storageId'])['repository_id']
-            if not repository or restore['repository_id'] != repository:
+            repository = restore['repository_id']
+            if not isinstance(repository,str) or not HEX.fullmatch(repository):
                 return None
             job = db.execute('SELECT j.*,c.service_id AS owner_service,c.storage_id AS owner_storage FROM jobs j JOIN compose_jobs c ON c.job_id=j.id WHERE j.id=?',(restore['id'],)).fetchone()
-            if not job or job['action'] != 'compose-restore' or job['status'] != 'failed' or job['error'] != 'restore_interrupted' or job['node_id'] != restore['node_id'] or not job['nonce'] or not job['dispatch_instance'] or job['owner_service'] != service['id'] or job['owner_storage'] != service['storageId']:
+            if not job or job['action'] != 'compose-restore' or job['status'] != 'failed' or job['error'] != 'restore_interrupted' or job['node_id'] != restore['node_id'] or not job['nonce'] or not job['dispatch_instance'] or job['owner_service'] != service['id']:
                 return None
             params = json.loads(job['parameters'])
-            if params != {'serviceId':service['id'],'storageId':service['storageId'],'snapshotId':restore['snapshot_id']} or job['snapshot'] != restore['snapshot_id']:
+            if not identity(job['owner_storage']) or params != {'serviceId':service['id'],'storageId':job['owner_storage'],'snapshotId':restore['snapshot_id']} or job['snapshot'] != restore['snapshot_id']:
                 return None
-            if db.execute("SELECT 1 FROM jobs WHERE action='compose-activate' AND status IN ('queued','dispatched','running','outcome_unknown','succeeded') AND json_extract(parameters,'$.restoreId')=?",(restore['id'],)).fetchone():
+            if db.execute("SELECT 1 FROM jobs WHERE action='compose-activate' AND status IN ('queued','dispatched','running','outcome_unknown') AND json_extract(parameters,'$.restoreId')=?",(restore['id'],)).fetchone():
                 return None
             point = db.execute('SELECT point FROM compose_points WHERE service_id=? AND repository_id=? AND snapshot_id=?',(service['id'],repository,restore['snapshot_id'])).fetchone()
             if not point:
                 return None
             point = json.loads(point['point'])
+            if not all(isinstance(point.get(name),str) and HEX.fullmatch(point[name]) for name in ('manifestDigest','sourceFingerprint')):
+                return None
             return {'restoreId':restore['id'],'serviceId':service['id'],'nodeId':restore['node_id'],'snapshotId':restore['snapshot_id'],'repositoryId':repository,'manifestDigest':point['manifestDigest'],'sourceFingerprint':point['sourceFingerprint']}
         except (self.error, KeyError, TypeError, ValueError):
             return None
+
+    def stopped_source_protected(self, db, scope):
+        for row in db.execute('SELECT config FROM compose_services'):
+            current = json.loads(row['config'])
+            if current.get('activeRestoreId') == scope['restoreId'] or (current.get('sourceNodeId') == scope['nodeId'] and current.get('projectId') == scope['projectId']):
+                return True
+        return False
 
     def stopped_removal_scope(self, db, restore, service):
         """Fresh authenticated stopped proof; a UI flag never grants authority."""
@@ -468,6 +479,11 @@ class ComposeControl:
             if len(matches) != 1:
                 return None
             proof = matches[0]
+            if not isinstance(proof.get('projectId'),str) or not NAME.fullmatch(proof['projectId']):
+                return None
+            scope['projectId'] = proof['projectId']
+            if self.stopped_source_protected(db,scope) or any(s.get('activeRestoreId') == scope['restoreId'] for s in report['services']):
+                return None
             if any(proof.get(k) != scope[k] for k in ('serviceId','snapshotId','repositoryId','manifestDigest','sourceFingerprint')) or proof.get('state') != 'stopped' or proof.get('ports') != [] or proof.get('applicationHealthVerified') is not False or proof.get('healthScope') != 'stopped' or not STOPPED_CHECKS <= set(proof.get('checks',[])):
                 return None
             return scope
@@ -699,7 +715,13 @@ class ComposeControl:
                 self.fail('invalid_schedule',400)
         elif action == 'compose-remove':
             self.fields(params,('serviceId','restoreId'))
-            restore = self.restore(db,params['restoreId'],service)
+            if not identity(params['restoreId']):
+                self.fail('invalid_restore',400)
+            restore = db.execute('SELECT * FROM compose_restores WHERE id=?',(params['restoreId'],)).fetchone()
+            if not restore or restore['service_id'] != service['id']:
+                self.fail('restore_scope_mismatch')
+            if restore['state'] != 'failed':
+                restore = self.restore(db,params['restoreId'],service)
             if restore['node_id'] != node['id'] or (restore['state'] != 'isolated_ready' and not self.stopped_removal_scope(db,restore,service)):
                 self.fail('restore_not_removable')
         if action in ('compose-backup','compose-schedule') and node['id'] != service['sourceNodeId']:
@@ -860,7 +882,8 @@ class ComposeControl:
                 elif restore and restore['state'] == 'failed':
                     scope = intent.get('stoppedRemoval')
                     _, service = self.service(db,params['serviceId'])
-                    if scope is not None and scope == self.stopped_catalog_scope(db,restore,service):
+                    catalog = {k:v for k,v in scope.items() if k != 'projectId'} if isinstance(scope,dict) else None
+                    if catalog is not None and catalog == self.stopped_catalog_scope(db,restore,service) and isinstance(scope.get('projectId'),str) and not self.stopped_source_protected(db,scope):
                         db.execute('DELETE FROM compose_restores WHERE id=? AND state=\'failed\'',(restore['id'],))
             elif action == 'compose-activate':
                 if success:
