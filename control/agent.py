@@ -12,6 +12,7 @@ import queue
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import threading
 import time
@@ -202,10 +203,61 @@ def validate_job(job):
         raise ValueError("invalid_parameters")
 
 
+def storage_worker_marker_path(value):
+    if not isinstance(value,str) or not value or not value.startswith("/") or not value.isprintable():
+        raise ValueError("invalid_storage_worker_marker")
+    try:
+        if len(value.encode("utf-8"))>4096:
+            raise ValueError("invalid_storage_worker_marker")
+    except UnicodeError:
+        raise ValueError("invalid_storage_worker_marker") from None
+    path=Path(value)
+    if path.anchor!="/" or len(path.parts)<2 or str(path)!=value or any(part in (".","..") for part in value.split("/")):
+        raise ValueError("invalid_storage_worker_marker")
+    return path
+
+
+def validate_storage_marker_parents(parent, *, create=False):
+    if parent.anchor!="/":
+        raise ValueError("untrusted_storage_worker_marker")
+    current=Path("/")
+    for part in (None,)+tuple(parent.parts[1:]):
+        if part is not None:
+            current=current/part
+        try:
+            actual=current.lstat()
+        except FileNotFoundError:
+            if not create:
+                raise ValueError("untrusted_storage_worker_marker") from None
+            try:
+                current.mkdir(mode=0o700)
+                actual=current.lstat()
+            except OSError:
+                raise ValueError("untrusted_storage_worker_marker") from None
+        except OSError:
+            raise ValueError("untrusted_storage_worker_marker") from None
+        if not stat.S_ISDIR(actual.st_mode) or actual.st_uid!=0 or actual.st_mode & 0o022:
+            raise ValueError("untrusted_storage_worker_marker")
+
+
+def validate_storage_worker_marker(value):
+    path=storage_worker_marker_path(value)
+    validate_storage_marker_parents(path.parent)
+    try:
+        actual=path.lstat()
+    except OSError:
+        raise ValueError("untrusted_storage_worker_marker") from None
+    if not stat.S_ISREG(actual.st_mode) or actual.st_uid!=0 or stat.S_IMODE(actual.st_mode)!=0o600:
+        raise ValueError("untrusted_storage_worker_marker")
+    return path
+
+
 class Agent:
     def __init__(self, config, state, allow_http=False):
         if "storageWorkerUser" in config and (not isinstance(config["storageWorkerUser"],str) or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,30}",config["storageWorkerUser"])):
             raise ValueError("invalid_storage_worker")
+        if "storageWorkerMarker" in config:
+            storage_worker_marker_path(config["storageWorkerMarker"])
         self.config, self.state = config, Path(state)
         self._engine = None
         parsed = urllib.parse.urlsplit(config["controller"])

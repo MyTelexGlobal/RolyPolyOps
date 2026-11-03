@@ -442,6 +442,20 @@ class StorageWorkerObservationTests(unittest.TestCase):
         self.assertEqual(self.agent.reports(),[])
         self.engine.execute.assert_not_called()
 
+    def test_unavailable_valid_marker_does_not_hide_existing_recovery_reports(self):
+        config=dict(self.config,storageWorkerMarker='/trusted-unavailable/storage-worker.json')
+        instance=agent.Agent(config,self.state/'restart')
+        instance._engine=self.engine
+        operation=str(uuid.uuid4())
+        self.engine.recover.side_effect=RuntimeError('PRIVATE_MARKER_FAILURE')
+        self.engine.observe.return_value={'ready':False,'key':self.public_key(),'operations':[{'id':operation,'status':'outcome_unknown'}]}
+        with patch.object(agent,'observe',return_value={'supported':False,'observedAt':agent.now()}):
+            report=instance.observe_once()
+        self.assertEqual(report['compose']['operations'],[{'id':operation,'status':'outcome_unknown'}])
+        self.assertEqual(report['compose']['error'],'compose_recovery_required')
+        self.engine.observe.assert_called_once_with(local_only=True)
+        self.engine.execute.assert_not_called()
+
     def test_failed_local_recovery_read_stays_unavailable_without_exception_data(self):
         self.engine.recover.side_effect=RuntimeError('PRIVATE_RECOVERY_MARKER')
         self.engine.observe.side_effect=RuntimeError('PRIVATE_LOCAL_MARKER')
@@ -460,6 +474,78 @@ class StorageWorkerObservationTests(unittest.TestCase):
         self.assertEqual(result['compose']['operations'],[])
         self.assertEqual(self.agent.reports(),[])
         self.engine.execute.assert_not_called()
+
+
+class StorageWorkerMarkerTrustTests(unittest.TestCase):
+    @staticmethod
+    def metadata(directory=True,uid=0,permissions=0o755,symlink=False):
+        import stat
+        kind=stat.S_IFLNK if symlink else stat.S_IFDIR if directory else stat.S_IFREG
+        return os.stat_result([kind|permissions,1,1,1,uid,0,0,0,0,0])
+
+    def hierarchy(self):
+        return {Path('/'):self.metadata(),Path('/trusted'):self.metadata(),Path('/trusted/instance'):self.metadata(permissions=0o700),Path('/trusted/instance/storage-worker.json'):self.metadata(directory=False,permissions=0o600)}
+
+    def inspect(self,records):
+        def read(path):
+            if path not in records:raise FileNotFoundError()
+            value=records[path]
+            if isinstance(value,Exception):raise value
+            return value
+        return read
+
+    def test_marker_syntax_rejects_type_controls_aliases_and_traversal_before_state(self):
+        config={'controller':'https://control.example.test/ops','nodeId':str(uuid.uuid4()),'token':'t'*48,'role':'primary'}
+        invalid=(None,True,1,[],{},'relative','https://example/x','file:///x','/','//etc/x','/etc//x','/etc/./x','/etc/../x','/etc/x/','/etc/x\n','/etc/x\x00','/etc/x\x85','/etc/'+('x'*4097),'/etc/x\ud800')
+        with tempfile.TemporaryDirectory() as temporary:
+            state=Path(temporary)/'must-not-exist'
+            for value in invalid:
+                with self.subTest(value_type=type(value).__name__):
+                    with self.assertRaisesRegex(ValueError,'invalid_storage_worker_marker'):
+                        agent.Agent(dict(config,storageWorkerMarker=value),state)
+                    self.assertFalse(state.exists())
+
+    def test_every_parent_must_be_root_owned_nonwritable_and_not_a_symlink(self):
+        marker='/trusted/instance/storage-worker.json'
+        for parent in (Path('/'),Path('/trusted'),Path('/trusted/instance')):
+            for bad in (self.metadata(uid=1000),self.metadata(permissions=0o777),self.metadata(symlink=True),PermissionError('PRIVATE_PATH')):
+                records=self.hierarchy();records[parent]=bad
+                with self.subTest(parent=str(parent),bad_type=type(bad).__name__),patch.object(Path,'lstat',new=self.inspect(records)):
+                    with self.assertRaisesRegex(ValueError,'untrusted_storage_worker_marker'):
+                        agent.validate_storage_worker_marker(marker)
+        records=self.hierarchy();del records[Path('/trusted/instance')]
+        with patch.object(Path,'lstat',new=self.inspect(records)):
+            with self.assertRaisesRegex(ValueError,'untrusted_storage_worker_marker'):
+                agent.validate_storage_worker_marker(marker)
+
+    def test_directory_creation_is_limited_to_the_selected_trusted_chain(self):
+        records={Path('/'):self.metadata(),Path('/trusted'):self.metadata()};created=[]
+        def make(path,mode=0o777):
+            created.append((path,mode));records[path]=self.metadata(permissions=mode)
+        with patch.object(Path,'lstat',new=self.inspect(records)),patch.object(Path,'mkdir',new=make):
+            agent.validate_storage_marker_parents(Path('/trusted/new-instance'),create=True)
+        self.assertEqual(created,[(Path('/trusted/new-instance'),0o700)])
+        created.clear();records[Path('/trusted')]=self.metadata(permissions=0o777)
+        with patch.object(Path,'lstat',new=self.inspect(records)),patch.object(Path,'mkdir',new=make):
+            with self.assertRaisesRegex(ValueError,'untrusted_storage_worker_marker'):
+                agent.validate_storage_marker_parents(Path('/trusted/other-instance'),create=True)
+        self.assertEqual(created,[])
+
+    def test_marker_itself_requires_regular_root0600(self):
+        marker=Path('/trusted/instance/storage-worker.json')
+        with patch.object(Path,'lstat',new=self.inspect(self.hierarchy())):
+            self.assertEqual(agent.validate_storage_worker_marker(str(marker)),marker)
+        for bad in (self.metadata(directory=False,uid=1000,permissions=0o600),self.metadata(directory=False,permissions=0o640),self.metadata(directory=False,permissions=0o644),self.metadata(directory=False,permissions=0o600,symlink=True),self.metadata(permissions=0o600),FileNotFoundError()):
+            records=self.hierarchy();records[marker]=bad
+            with self.subTest(bad_type=type(bad).__name__),patch.object(Path,'lstat',new=self.inspect(records)):
+                with self.assertRaisesRegex(ValueError,'untrusted_storage_worker_marker'):
+                    agent.validate_storage_worker_marker(str(marker))
+
+    def test_missing_optional_field_never_reads_default_marker(self):
+        config={'controller':'https://control.example.test/ops','nodeId':str(uuid.uuid4()),'token':'t'*48,'role':'primary'}
+        with tempfile.TemporaryDirectory() as temporary,patch.object(agent,'storage_worker_marker_path',side_effect=AssertionError('marker selection not requested')):
+            instance=agent.Agent(config,temporary)
+        self.assertNotIn('storageWorkerMarker',instance.config)
 
 
 if __name__ == "__main__":

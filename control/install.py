@@ -18,9 +18,9 @@ import urllib.parse
 import urllib.request
 
 try:
-    from .agent import NoRedirect, VERSION, atomic, read_json
+    from .agent import NoRedirect, VERSION, atomic, read_json, storage_worker_marker_path, validate_storage_marker_parents, validate_storage_worker_marker
 except ImportError:
-    from agent import NoRedirect, VERSION, atomic, read_json
+    from agent import NoRedirect, VERSION, atomic, read_json, storage_worker_marker_path, validate_storage_marker_parents, validate_storage_worker_marker
 
 DEST = Path("/opt/rolypolyops/control")
 STATE = Path("/var/lib/rolypolyops-control")
@@ -211,11 +211,11 @@ def trusted_json(path):
         os.close(fd)
 
 
-def ensure_storage_worker(user):
+def ensure_storage_worker(user, marker_path=None):
     if not isinstance(user,str) or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,30}",user):
         raise ValueError("Invalid storage worker account")
-    trusted_config_directory()
-    marker=CONFIG_DIR/"storage-worker.json"
+    marker=storage_worker_marker_path(str(CONFIG_DIR/"storage-worker.json") if marker_path is None else marker_path)
+    validate_storage_marker_parents(marker.parent,create=True)
     pin=trusted_json(marker)
     if pin is not None and (set(pin)!={"user","uid","gid"} or pin.get("user")!=user or type(pin.get("uid")) is not int or type(pin.get("gid")) is not int or pin["uid"]<=0 or pin["gid"]<=0):
         raise ValueError("Storage worker account marker mismatch")
@@ -252,9 +252,12 @@ def ensure_storage_worker(user):
     return actual
 
 
-def probe_storage_runtime(module,user,source):
+def probe_storage_runtime(module,user,source,marker_path=None):
+    arguments={"worker_user":user,"source_dir":source,"timeout":30}
+    if marker_path is not None:
+        arguments["marker_path"]=str(validate_storage_worker_marker(marker_path))
     try:
-        result=module.probe_runtime(worker_user=user,source_dir=source,timeout=30)
+        result=module.probe_runtime(**arguments)
     except module.TransportError as error:
         code=getattr(error,"code",None)
         if not isinstance(code,str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}",code):
@@ -429,8 +432,12 @@ WantedBy=multi-user.target
 def agent(controller_url, enrollment, replace=False):
     checked_url(controller_url,{"/ops","/ops/"})
     source=validate_source()
-    trusted_config_directory()
+    if AGENT_CONFIG.exists() or AGENT_CONFIG.is_symlink():
+        validate_storage_marker_parents(AGENT_CONFIG.parent)
     existing=trusted_json(AGENT_CONFIG)
+    worker_marker=None
+    if "storageWorkerMarker" in (existing or {}):
+        worker_marker=str(storage_worker_marker_path(existing["storageWorkerMarker"]))
     if existing and not replace and existing.get("controller")!=controller_url.rstrip("/"):
         raise ValueError("Agent already belongs to another controller")
     if (not existing or replace) and not enrollment:
@@ -438,8 +445,12 @@ def agent(controller_url, enrollment, replace=False):
     runtime_python=agent_prerequisites()
     module=transport_module()
     worker_user=(existing or {}).get("storageWorkerUser",module.DEFAULT_WORKER_USER)
-    ensure_storage_worker(worker_user)
-    probe_storage_runtime(module,worker_user,source)
+    if worker_marker is None:
+        ensure_storage_worker(worker_user)
+        probe_storage_runtime(module,worker_user,source)
+    else:
+        ensure_storage_worker(worker_user,marker_path=worker_marker)
+        probe_storage_runtime(module,worker_user,source,marker_path=worker_marker)
     if existing and not replace:
         config=dict(existing,storageWorkerUser=worker_user)
     else:
@@ -450,7 +461,11 @@ def agent(controller_url, enrollment, replace=False):
             enrolled=json.load(response)
         if enrolled.get("role") not in {"primary","recovery"} or not enrolled.get("token") or not enrolled.get("nodeId"):
             raise ValueError("Invalid enrollment response; use a new code if registration reply was lost")
-        config={"controller":controller_url.rstrip("/"),"nodeId":enrolled["nodeId"],"token":enrolled["token"],"role":enrolled["role"],"storageWorkerUser":worker_user}
+        config=dict(existing or {})
+        config.update(controller=controller_url.rstrip("/"),nodeId=enrolled["nodeId"],token=enrolled["token"],role=enrolled["role"],storageWorkerUser=worker_user)
+    if worker_marker is not None:
+        config["storageWorkerMarker"]=worker_marker
+    validate_storage_marker_parents(AGENT_CONFIG.parent,create=True)
     atomic(AGENT_CONFIG,config)
     copy_source()
     install_package_policy()
