@@ -2286,9 +2286,21 @@ class ManagedEngine:
                 result[key] = value[key]
         return result
 
+    def _inspection_journal(self, identity):
+        missing = object()
+        value = read(self._journal_path(identity), missing)
+        if value is missing:
+            return None
+        if not isinstance(value, dict) or not is_uuid(value.get("id")) or value["id"] != identity:
+            raise EngineError("operation_identity_conflict", unknown=True)
+        return value
+
     def _inspect_locked(self, identity):
-        value = read(self._journal_path(identity))
-        if not value:
+        try:
+            value = self._inspection_journal(identity)
+        except EngineError as error:
+            return {"status": "outcome_unknown", "error": error.code}
+        if value is None:
             return None
         if value.get("status") in {"succeeded", "failed"}:
             return self._safe_operation(value)
@@ -2421,6 +2433,11 @@ class ManagedEngine:
             return None
         try:
             with self.lock():
+                # Reject misplaced journals before recovery can perform any unrelated compensation.
+                try:
+                    self._inspection_journal(identity)
+                except EngineError as error:
+                    return {"status": "outcome_unknown", "error": error.code}
                 self._recover_locked()
                 return self._inspect_locked(identity)
         except (StorageError, SealError, ArchiveError) as error:
