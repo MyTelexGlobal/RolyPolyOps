@@ -56,8 +56,8 @@ class EngineTests(unittest.TestCase):
         config = self.root / "compose.json"
         config.write_text("{}")
         c = {"Id": "a" * 64, "Image": "sha256:" + "b" * 64, "State": {"Running": False, "StartedAt": "2026-11-01T12:00:00.000000000Z"}, "RestartCount": 0, "Mounts": [], "Config": {"Labels": {"com.docker.compose.project": "ordinary"}}}
-        service = {"id": self.sid, "projectId": "ordinary", "fingerprint": "c" * 64, "storageId": self.storage, "sourceState": "capture_stopped", "captureOperation": uid(), "backupInterval": "hourly", "project": {"inputs": {str(config): helper.digest(config)}}}
-        journal = {"id": service["captureOperation"], "action": "compose-backup", "status": "running", "stage": "source-stopped", "parameters": {"serviceId": self.sid, "storageId": self.storage}, "resume": {"serviceId": self.sid, "containers": [{"id": c["Id"], "imageId": c["Image"], "mountSignature": []}]}}
+        service = {"id": self.sid, "projectId": "ordinary", "fingerprint": "c" * 64, "storageId": self.storage, "sourceState": "capture_stopped", "captureOperation": uid(), "backupInterval": "hourly", "exclusiveWriters": True, "sourceNodeId": self.engine.node_id, "project": {"inputs": {str(config): helper.digest(config)}, "mounts": {}, "containers": [{"id": c["Id"], "dockerImageRef": c["Image"], "mounts": []}]}}
+        journal = {"id": service["captureOperation"], "action": "compose-backup", "status": "running", "stage": "source-stopped", "requestDigest": "e" * 64, "sourceResumed": False, "parameters": {"serviceId": self.sid, "storageId": self.storage}, "resume": {"serviceId": self.sid, "containers": [{"id": c["Id"], "imageId": c["Image"], "mountSignature": []}]}}
         return service, journal, c
 
     def test_job_snapshot_scope_and_no_shell_parameters(self):
@@ -240,7 +240,7 @@ class EngineTests(unittest.TestCase):
             if args[0] == "start":
                 container["State"]["Running"] = True
             return b""
-        with mock.patch.object(self.engine, "_terminate_helpers", side_effect=lambda j: effects.append(("kill-and-wait-helper",))), mock.patch.object(self.engine, "_inspect", side_effect=inspect), mock.patch.object(self.engine, "docker", side_effect=docker):
+        with mock.patch.object(self.engine, "_containers", return_value=[container]), mock.patch.object(self.engine, "_check_other_writers"), mock.patch.object(self.engine, "_terminate_helpers", side_effect=lambda j: effects.append(("kill-and-wait-helper",))), mock.patch.object(self.engine, "_inspect", side_effect=inspect), mock.patch.object(self.engine, "docker", side_effect=docker):
             result = self.engine.recover()
         self.assertEqual(effects, [("kill-and-wait-helper",), ("start", container["Id"])])
         self.assertEqual(result[0]["status"], "failed")
@@ -292,6 +292,125 @@ class EngineTests(unittest.TestCase):
             result = self.engine.reconcile({"id": job["id"]})
         backup.assert_not_called()
         self.assertEqual(result["status"], "outcome_unknown")
+
+    def capture_recovery_fixture(self):
+        service, journal, first = self.source()
+        service["sourceState"] = "unknown"
+        service["projectId"] = "fixture-project"
+        journal.update(status="outcome_unknown", stage="data-archived", error="capture_source_changed")
+        journal["helpers"] = [{"name": "rpo-helper-" + journal["id"].replace("-", "")[:24] + "-12345678", "labels": self.engine._owned_labels(journal["id"], service["id"], "capture-helper")}]
+        signatures = [["volume", "fixture-data", "/data", True], ["bind", "/fixture/config", "/config", False], ["bind", "/fixture/secret", "/run/secret", False], ["bind", "/fixture/env", "/environment", False]]
+        second = copy.deepcopy(first);second["Id"] = "d" * 64
+        containers = [first, second]
+        service["project"]["mounts"] = {str(i): {"kind": v[0], "source": v[1]} for i, v in enumerate(signatures)}
+        service["project"]["containers"] = []
+        journal["resume"]["containers"] = []
+        # These preserve the two native four-entry array permutations, using synthetic paths/IDs.
+        for c, before, after in ((first, [0, 1, 2, 3], [3, 0, 1, 2]), (second, [1, 2, 3, 0], [0, 1, 2, 3])):
+            c["Config"]["Labels"]["com.docker.compose.project"] = service["projectId"]
+            c["Mounts"] = [{"Type": signatures[i][0], ("Name" if signatures[i][0] == "volume" else "Source"): signatures[i][1], "Destination": signatures[i][2], "RW": signatures[i][3]} for i in after]
+            service["project"]["containers"].append({"id": c["Id"], "dockerImageRef": c["Image"], "mounts": [{"key": str(i), "target": signatures[i][2], "readOnly": not signatures[i][3]} for i in before]})
+            journal["resume"]["containers"].append({"id": c["Id"], "imageId": c["Image"], "mountSignature": [signatures[i] for i in before]})
+        self.engine._save_service(service);atomic(self.engine._journal_path(journal["id"]), journal)
+        return service, journal, containers
+
+    def test_capture_signatures_native_permutations_preserve_typed_semantics_and_multiplicity(self):
+        service, journal, containers = self.capture_recovery_fixture()
+        for item, c in zip(journal["resume"]["containers"], containers):
+            self.assertNotEqual(item["mountSignature"], [[m["Type"], m.get("Name", m.get("Source")), m["Destination"], m["RW"]] for m in c["Mounts"]])
+            self.assertEqual(self.engine._capture_mounts(item["mountSignature"]), self.engine._capture_container_mounts(c))
+        base = journal["resume"]["containers"][0]["mountSignature"]
+        for index, value in ((0, "tmpfs"), (0, []), (1, True), (1, ""), (2, "relative"), (3, 1), (3, None)):
+            changed = copy.deepcopy(base);changed[0][index] = value
+            with self.subTest(index=index, value=value), self.assertRaisesRegex(engine.EngineError, "capture_source_changed"):
+                self.engine._capture_mounts(changed)
+        for changed in (base[:-1], base + [["bind", "/new", "/extra", True]]):
+            self.assertNotEqual(self.engine._capture_mounts(base), self.engine._capture_mounts(changed))
+        with self.assertRaisesRegex(engine.EngineError, "capture_source_changed"):
+            self.engine._capture_mounts(base + [base[0]])
+
+    def test_normal_capture_resume_accepts_native_mount_permutations(self):
+        service, journal, containers = self.capture_recovery_fixture();service["sourceState"] = "capture_stopped"
+        self.engine._save_service(service)
+        def start(*args, **kwargs):next(c for c in containers if c["Id"] == args[1])["State"]["Running"] = True
+        with mock.patch.object(self.engine, "_terminate_helpers"), mock.patch.object(self.engine, "_check_other_writers"), mock.patch.object(self.engine, "_inspect", side_effect=lambda ids: [c for c in containers if c["Id"] in ids]), mock.patch.object(self.engine, "docker", side_effect=start) as docker:
+            self.engine._resume_capture(service, journal)
+        self.assertEqual(docker.call_args_list, [mock.call("start", c["Id"]) for c in containers]);self.assertTrue(journal["resumeComplete"])
+
+    def test_unknown_capture_inspection_compensates_only_after_cleanup_and_settles_failed_without_replay(self):
+        service, journal, containers = self.capture_recovery_fixture();effects = [];saved = []
+        def start(*args, **kwargs):
+            self.assertEqual(self.engine._service(self.sid)["sourceState"], "unknown")
+            effects.append(args);self.assertEqual(args[0], "start")
+            next(c for c in containers if c["Id"] == args[1])["State"]["Running"] = True
+        save = self.engine._save_service
+        def persist(value):saved.append(value["sourceState"]);save(value)
+        with mock.patch.object(self.engine, "_containers", side_effect=lambda: containers), mock.patch.object(self.engine.storage, "recover", side_effect=lambda: effects.append(("storage-dead",))), mock.patch.object(self.engine, "_terminate_helpers", side_effect=lambda value: effects.append(("helpers-dead",))), mock.patch.object(self.engine, "_check_other_writers", side_effect=lambda *a: effects.append(("writers-checked",))), mock.patch.object(self.engine, "_inspect", side_effect=lambda ids: [c for c in containers if c["Id"] in ids]), mock.patch.object(self.engine, "docker", side_effect=start), mock.patch.object(self.engine, "_save_service", side_effect=persist), mock.patch.object(self.engine, "_backup") as backup, mock.patch.object(self.engine, "_export_images") as export, mock.patch.object(self.engine.storage, "run") as upload:
+            result = self.engine.reconcile({"id": journal["id"]})
+            again = self.engine.reconcile({"id": journal["id"]})
+        self.assertEqual(result, again);self.assertEqual(result["status"], "failed");self.assertEqual(result["error"], "capture_interrupted")
+        self.assertEqual(saved, ["running"])
+        self.assertLess(effects.index(("storage-dead",)), effects.index(("helpers-dead",)))
+        self.assertLess(effects.index(("helpers-dead",)), effects.index(("writers-checked",)))
+        self.assertLess(effects.index(("writers-checked",)), next(i for i, v in enumerate(effects) if v[0] == "start"))
+        self.assertEqual([v for v in effects if v[0] == "start"], [("start", c["Id"]) for c in containers])
+        for action in (backup, export, upload):action.assert_not_called()
+        stored = read(self.engine._journal_path(journal["id"]));self.assertEqual(stored["requestDigest"], journal["requestDigest"]);self.assertEqual(stored["resume"], journal["resume"])
+        self.assertEqual(stored["captureCompensation"]["prior"]["error"], "capture_source_changed");self.assertEqual(stored["captureCompensation"]["prior"]["stage"], "data-archived")
+        self.assertTrue(stored["sourceResumed"]);self.assertEqual(self.engine._service(self.sid)["sourceState"], "running")
+
+    def test_background_recovery_never_resumes_unknown_and_prior_stopped_set_is_not_started(self):
+        service, journal, containers = self.capture_recovery_fixture()
+        with mock.patch.object(self.engine, "docker") as docker, mock.patch.object(self.engine, "_terminate_helpers") as cleanup:
+            self.engine.recover()
+        docker.assert_not_called();cleanup.assert_not_called()
+        journal["resume"]["containers"] = journal["resume"]["containers"][:1]
+        atomic(self.engine._journal_path(journal["id"]), journal)
+        def start(*args, **kwargs):containers[0]["State"]["Running"] = True
+        with mock.patch.object(self.engine, "_containers", side_effect=lambda: containers), mock.patch.object(self.engine, "_terminate_helpers"), mock.patch.object(self.engine, "_check_other_writers"), mock.patch.object(self.engine, "_inspect", side_effect=lambda ids: [c for c in containers if c["Id"] in ids]), mock.patch.object(self.engine, "docker", side_effect=start) as docker:
+            result = self.engine.reconcile({"id": journal["id"]})
+        self.assertEqual(result["status"], "failed");docker.assert_called_once_with("start", containers[0]["Id"])
+        self.assertFalse(containers[1]["State"]["Running"])
+
+    def test_unknown_capture_refuses_storage_helper_and_external_writer_uncertainty(self):
+        for method, code in (("storage", "transport_cleanup_unverified"), ("helper", "helper_termination_unverified"), ("writer", "external_docker_writer")):
+            service, journal, containers = self.capture_recovery_fixture()
+            with self.subTest(method=method), mock.patch.object(self.engine, "_containers", return_value=containers), mock.patch.object(self.engine.storage, "recover", side_effect=engine.StorageError(code, True) if method == "storage" else None), mock.patch.object(self.engine, "_terminate_helpers", side_effect=engine.EngineError(code, True) if method == "helper" else None) as helpers, mock.patch.object(self.engine, "_check_other_writers", side_effect=engine.EngineError(code) if method == "writer" else None), mock.patch.object(self.engine, "_inspect", return_value=containers), mock.patch.object(self.engine, "docker") as docker:
+                if method == "storage":
+                    with self.assertRaisesRegex(engine.EngineError, code):self.engine.reconcile({"id": journal["id"]})
+                    helpers.assert_not_called()
+                else:self.assertEqual(self.engine.reconcile({"id": journal["id"]})["status"], "outcome_unknown")
+            docker.assert_not_called();self.assertEqual(self.engine._service(self.sid)["sourceState"], "unknown")
+
+    def test_unknown_capture_semantic_input_and_postwrite_changes_stay_held(self):
+        cases = ("image", "project", "mount-source", "mount-target", "mount-rw", "mount-duplicate", "missing-container", "extra-container", "input", "stage", "manifest", "repository", "source-resumed", "request-type", "owner", "service-node", "fence", "resume-service", "resume-duplicate", "helper-owner")
+        for case in cases:
+            service, journal, containers = self.capture_recovery_fixture()
+            if case == "image":containers[0]["Image"] = "sha256:" + "f" * 64
+            elif case == "project":containers[0]["Config"]["Labels"]["com.docker.compose.project"] = "foreign"
+            elif case == "mount-source":containers[0]["Mounts"][0]["Source"] = "/changed"
+            elif case == "mount-target":containers[0]["Mounts"][0]["Destination"] = "/changed"
+            elif case == "mount-rw":containers[0]["Mounts"][0]["RW"] = True
+            elif case == "mount-duplicate":containers[0]["Mounts"].append(copy.deepcopy(containers[0]["Mounts"][0]))
+            elif case == "missing-container":containers.pop()
+            elif case == "extra-container":containers.append(copy.deepcopy(containers[0]) | {"Id": "f" * 64})
+            elif case == "input":Path(next(iter(service["project"]["inputs"]))).write_text("changed")
+            elif case == "stage":journal["stage"] = "repository-write-intent"
+            elif case == "manifest":journal["manifestDigest"] = "f" * 64
+            elif case == "repository":journal["repositoryId"] = "f" * 64
+            elif case == "source-resumed":journal["sourceResumed"] = True
+            elif case == "request-type":journal["requestDigest"] = True
+            elif case == "owner":service["captureOperation"] = uid()
+            elif case == "service-node":service["sourceNodeId"] = uid()
+            elif case == "fence":service["fence"] = {"operation": uid()}
+            elif case == "resume-service":journal["resume"]["serviceId"] = uid()
+            elif case == "resume-duplicate":journal["resume"]["containers"].append(copy.deepcopy(journal["resume"]["containers"][0]))
+            elif case == "helper-owner":journal["helpers"] = [{"name": "foreign", "labels": {}}]
+            self.engine._save_service(service);atomic(self.engine._journal_path(journal["id"]), journal)
+            with self.subTest(case=case), mock.patch.object(self.engine, "_containers", return_value=containers), mock.patch.object(self.engine, "_terminate_helpers"), mock.patch.object(self.engine, "_check_other_writers"), mock.patch.object(self.engine, "_inspect", return_value=containers), mock.patch.object(self.engine, "docker") as docker, mock.patch.object(self.engine.storage, "run") as upload:
+                result = self.engine.reconcile({"id": journal["id"]})
+            self.assertEqual(result["status"], "outcome_unknown", case);docker.assert_not_called();upload.assert_not_called()
+            self.assertEqual(self.engine._service(self.sid)["sourceState"], "unknown")
 
     def test_capture_copy_failure_resumes_source_before_returning_failed(self):
         service, journal, container = self.source()
