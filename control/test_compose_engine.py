@@ -925,6 +925,12 @@ class EngineTests(unittest.TestCase):
                 index = json.load(archive.extractfile("index.json"));self.assertEqual(len(index["manifests"]), 2)
             self.assertEqual(list(path.parent.iterdir()), [path])
 
+    def test_detached_containerd_subject_annotation_is_bound_to_the_same_retained_target(self):
+        path, images = self.detached_export(change=lambda s:s["root"].update(annotations={"io.containerd.manifest.subject": s["runtime"][-1]["digest"]}))
+        with self.assertRaisesRegex(engine.EngineError, "image_identity_unverified"):self.engine._image_archive(path, images)
+        self.engine._normalize_export_index(path, images)
+        self.assertEqual(set(self.engine._image_archive(path, images)), set(images))
+
     def test_normalizer_without_attestation_is_byte_identical_and_exact_owned_path_only(self):
         path, images = self.detached_export(attestation=False);raw = path.read_bytes()
         result = self.engine._normalize_export_index(path, images)
@@ -970,6 +976,9 @@ class EngineTests(unittest.TestCase):
             "diff-id": lambda s:s.update(diffIds=["sha256:" + "0" * 64] * 2),
             "statement": lambda s:s["statements"][0].update(_type="unknown"),
             "predicate-annotation": lambda s:s.update(annotationMismatch=True),
+            "containerd-subject": lambda s:s["root"].update(annotations={"io.containerd.manifest.subject": "sha256:" + "0" * 64}),
+            "conflicting-subject": lambda s:s["root"].update(annotations={"io.containerd.manifest.subject": s["runtime"][-1]["digest"], "vnd.docker.reference.digest": s["runtime"][0]["digest"]}),
+            "unknown-annotation": lambda s:s["root"].update(annotations={"unrecognized": "metadata"}),
             "reference-type": lambda s:s["root"].update(annotations={"vnd.docker.reference.type": "unknown"}),
             "reference-digest": lambda s:s["root"].update(annotations={"vnd.docker.reference.digest": "sha256:" + "0" * 64}),
             "artifact-type": lambda s:s.update(manifestFields={"artifactType": "unknown"}),
@@ -1011,6 +1020,196 @@ class EngineTests(unittest.TestCase):
             with self.assertRaisesRegex(engine.EngineError, "image_export_commit_unverified") as caught:self.engine._normalize_export_index(path, images)
         self.assertFalse(caught.exception.unknown);upload.assert_not_called();self.assertNotEqual(path.read_bytes(), before)
         self.assertEqual(set(self.engine._image_archive(path, images)), set(images));self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def cleanup_fixture(self, *, restore=False):
+        identity, repository, snapshot = uid(), "a" * 64, "b" * 64
+        directory = self.engine.state / "stages" / identity;directory.mkdir(mode=0o700)
+        image, images = self.image_archive();(directory / "images.tar").write_bytes(image.read_bytes())
+        data = self.archive([{"name": "payload", "kind": tarfile.DIRTYPE}, {"name": "payload/file", "content": b"application data"}])
+        (directory / "data-0.tar").write_bytes(data.read_bytes())
+        manifest = {"format": "rolypolyops-compose-v1", "serviceId": self.sid, "repositoryId": repository, "operationId": uid() if restore else identity,
+                    "sourceFingerprint": "c" * 64, "imagesSha256": helper.digest(image), "images": images, "platform": ["linux", "amd64", ""],
+                    "runtime": {"services": {"app": {"image": next(iter(images.values()))["alias"]}}},
+                    "archives": [{"filename": "data-0.tar", "sha256": helper.digest(data), "kind": "bind", "key": "bind:fixture", "file": False}]}
+        atomic(directory / "manifest.json", manifest);manifest_digest = helper.digest(directory / "manifest.json")
+        with tarfile.open(directory / "bundle.tar", "w") as out:
+            for name in ("manifest.json", "images.tar", "data-0.tar"):tar_entry(out, name, (directory / name).read_bytes())
+        params = {"serviceId": self.sid, "storageId": self.storage}
+        journal = {"id": identity, "requestDigest": "d" * 64, "action": "compose-restore" if restore else "compose-backup", "parameters": params, "status": "running", "stage": "restore-start-intent" if restore else "repository-write-intent", "helpers": []}
+        record = None
+        if restore:
+            params["snapshotId"] = snapshot;journal["restoreId"] = identity
+            mount = directory / "mount-0";mount.mkdir(mode=0o700);(mount / "archive.tar").write_bytes(data.read_bytes())
+            payload = mount / "extracted/payload";payload.mkdir(mode=0o750, parents=True);(payload / "file").write_bytes(b"live bind data")
+            atomic(directory / "runtime.json", {"fixture": "runtime"})
+            record = {"id": identity, "restoreId": identity, "serviceId": self.sid, "storageId": self.storage, "repositoryId": repository, "snapshot": snapshot,
+                      "sourceFingerprint": manifest["sourceFingerprint"], "manifestDigest": manifest_digest, "directory": str(directory), "state": "isolated_ready", "projectId": "isolated-fixture", "resources": [],
+                      "mappings": {"bind:fixture": {"kind": "bind", "source": str(payload)}}, "containerIds": {"app": "f" * 64}, "runtimeDigest": helper.digest(directory / "runtime.json")}
+            atomic(self.engine._restore_path(identity), record)
+        else:
+            config = self.root / (identity + ".json");config.write_bytes(b"original source input")
+            result = {"serviceId": self.sid, "repositoryId": repository, "snapshot": snapshot, "manifestDigest": manifest_digest, "sourceFingerprint": manifest["sourceFingerprint"], "sourceResumed": True, "at": "fixture", "checks": []}
+            self.engine._save_service({"id": self.sid, "sourceState": "running", "sourceNodeId": self.engine.node_id, "fingerprint": manifest["sourceFingerprint"], "storageId": self.storage, "latestBackup": result, "project": {"inputs": {str(config): helper.digest(config)}}})
+            journal.update(sourceResumed=True, manifestDigest=manifest_digest, repositoryId=repository)
+        atomic(self.engine._journal_path(identity), journal)
+        self.engine.current = journal
+        point = {"id": snapshot, "time": "fixture", "manifestDigest": manifest_digest, "sourceFingerprint": manifest["sourceFingerprint"], "operationId": manifest["operationId"]}
+        return {"journal": journal, "directory": directory, "record": record, "point": point, "binding": {"repositoryId": repository}}
+
+    @contextlib.contextmanager
+    def cleanup_native(self, fixture):
+        with contextlib.ExitStack() as stack:
+            for obj, name, value in ((self.engine.storage, "recover", None), (self.engine.storage, "binding", fixture["binding"]),
+                    (self.engine, "_snapshots", [fixture["point"]]), (self.engine, "_terminate_helpers", None),
+                    (self.engine, "_check_other_writers", None), (self.engine, "_runtime_checks", {"app": {"Id": "f" * 64}})):
+                stack.enter_context(mock.patch.object(obj, name, return_value=value))
+            yield
+
+    def test_successful_backup_payload_cleanup_preserves_manifest_history_and_foreign_file(self):
+        fixture = self.cleanup_fixture();directory = fixture["directory"];journal = fixture["journal"]
+        manifest = (directory / "manifest.json").read_bytes();(directory / "foreign.txt").write_bytes(b"keep")
+        with self.cleanup_native(fixture), self.engine.lock():self.engine._cleanup_payloads(journal)
+        self.assertEqual(sorted(p.name for p in directory.iterdir()), ["foreign.txt", "manifest.json"])
+        self.assertEqual((directory / "manifest.json").read_bytes(), manifest)
+        saved = read(self.engine._journal_path(journal["id"]));self.assertTrue(saved["payloadCleanup"]["complete"])
+        self.assertEqual({v["path"] for v in saved["payloadCleanup"]["files"]}, {"bundle.tar", "images.tar", "data-0.tar"})
+        self.assertTrue(self.engine._service(self.sid)["latestBackup"])
+        with self.cleanup_native(fixture), self.engine.lock():self.engine._cleanup_payloads(saved)
+        self.assertEqual((directory / "foreign.txt").read_bytes(), b"keep")
+
+    def test_internal_activation_first_backup_cleanup_uses_exact_parent_authority(self):
+        for valid in (True, False):
+            fixture = self.cleanup_fixture();journal = fixture["journal"];journal.pop("requestDigest");parent_id = uid()
+            journal.update(origin="activation", parentId=parent_id)
+            atomic(self.engine._journal_path(parent_id), {"id": parent_id, "action": "compose-activate", "parameters": {"serviceId": self.sid if valid else uid()}})
+            atomic(self.engine._journal_path(journal["id"]), journal)
+            with self.cleanup_native(fixture), self.engine.lock():
+                if valid:self.engine._cleanup_payloads(journal)
+                else:
+                    with self.assertRaisesRegex(engine.EngineError, "payload_cleanup_unverified"):self.engine._cleanup_payloads(journal)
+            self.assertEqual((fixture["directory"] / "bundle.tar").exists(), not valid)
+
+    def test_restore_payload_cleanup_keeps_live_bind_metadata_runtime_and_explicit_removal_usable(self):
+        fixture = self.cleanup_fixture(restore=True);directory = fixture["directory"];journal = fixture["journal"]
+        keep = [directory / "manifest.json", directory / "runtime.json", directory / "mount-0/extracted/payload/file"]
+        before = {str(p): (p.read_bytes(), p.stat().st_mode, p.stat().st_uid, p.stat().st_gid, p.stat().st_mtime_ns) for p in keep}
+        with self.cleanup_native(fixture), self.engine.lock():self.engine._cleanup_payloads(journal)
+        self.assertEqual(before, {str(p): (p.read_bytes(), p.stat().st_mode, p.stat().st_uid, p.stat().st_gid, p.stat().st_mtime_ns) for p in keep})
+        for name in ("bundle.tar", "images.tar", "data-0.tar", "mount-0/archive.tar"):self.assertFalse((directory / name).exists())
+        self.assertEqual(read(self.engine._restore_path(journal["id"]))["mappings"], fixture["record"]["mappings"])
+        with mock.patch.object(self.engine, "_restore_containers", return_value=[{"Id": "f" * 64}]), mock.patch.object(self.engine, "docker", return_value=b""), mock.patch.object(self.engine, "_remove_runtime_only") as stop:
+            self.engine.current = {"id": uid()};result = self.engine._remove({"serviceId": self.sid, "restoreId": journal["id"]})
+        self.assertTrue(result["removed"]);stop.assert_called_once()
+
+    def test_failed_and_unproven_unknown_payloads_are_unchanged_and_not_adopted(self):
+        for status in ("failed", "outcome_unknown"):
+            fixture = self.cleanup_fixture();journal = fixture["journal"];journal["status"] = status
+            atomic(self.engine._journal_path(journal["id"]), journal)
+            before = {p.name: p.read_bytes() for p in fixture["directory"].iterdir()}
+            with self.cleanup_native(fixture), mock.patch.object(self.engine, "_snapshots", return_value=[]), mock.patch.object(self.engine, "_backup") as upload:
+                result = self.engine.reconcile({"id": journal["id"]})
+            self.assertNotEqual(result["status"], "succeeded");upload.assert_not_called()
+            self.assertEqual(before, {p.name: p.read_bytes() for p in fixture["directory"].iterdir()})
+            self.assertNotIn("payloadCleanup", read(self.engine._journal_path(journal["id"])))
+
+    def test_partial_cleanup_is_durable_held_then_explicitly_reconciled_without_replay(self):
+        for restore in (False, True):
+            fixture = self.cleanup_fixture(restore=restore);journal = fixture["journal"];directory = fixture["directory"];real = Path.unlink;deleted = []
+            def unlink(path, *args, **kwargs):
+                if path.parent == directory and path.name == "images.tar":raise OSError("interrupted")
+                deleted.append(path);return real(path, *args, **kwargs)
+            with self.cleanup_native(fixture), self.engine.lock(), mock.patch.object(Path, "unlink", new=unlink):
+                with self.assertRaisesRegex(engine.EngineError, "payload_cleanup_unverified"):self.engine._cleanup_payloads(journal)
+            self.assertFalse((directory / "bundle.tar").exists());self.assertTrue((directory / "images.tar").exists())
+            saved = read(self.engine._journal_path(journal["id"]));self.assertFalse(saved["payloadCleanup"]["complete"])
+            saved.update(status="succeeded", result={"mustNotBeGreen": True});atomic(self.engine._journal_path(journal["id"]), saved)
+            self.assertEqual(self.engine._safe_operation(saved)["status"], "outcome_unknown")
+            with self.cleanup_native(fixture), mock.patch.object(self.engine, "_backup") as backup, mock.patch.object(self.engine, "_restore_snapshot") as extract, mock.patch.object(self.engine, "_compose") as start, mock.patch.object(self.engine.storage, "run") as upload:
+                result = self.engine.reconcile({"id": journal["id"]})
+            self.assertEqual(result["status"], "succeeded")
+            for action in (backup, extract, start, upload):action.assert_not_called()
+            self.assertTrue(read(self.engine._journal_path(journal["id"]))["payloadCleanup"]["complete"])
+
+    def test_cleanup_requires_lock_scope_manifest_and_closed_writers_before_deletion(self):
+        for bad in ("lock", "manifest", "service", "journal", "writer", "storage", "helper"):
+            fixture = self.cleanup_fixture();journal = fixture["journal"];directory = fixture["directory"]
+            if bad == "manifest":(directory / "manifest.json").write_bytes(b'{}')
+            elif bad == "service":journal["parameters"]["serviceId"] = uid();atomic(self.engine._journal_path(journal["id"]), journal)
+            elif bad == "journal":journal = copy.deepcopy(journal);journal["id"] = uid()
+            before = {p.name: p.read_bytes() for p in directory.iterdir()}
+            with self.cleanup_native(fixture), contextlib.ExitStack() as stack:
+                if bad != "lock":stack.enter_context(self.engine.lock())
+                if bad == "writer":stack.enter_context(mock.patch.object(self.engine, "_check_other_writers", side_effect=engine.EngineError("external_docker_writer")))
+                elif bad == "storage":stack.enter_context(mock.patch.object(self.engine.storage, "recover", side_effect=engine.StorageError("transport_cleanup_unverified", True)))
+                elif bad == "helper":stack.enter_context(mock.patch.object(self.engine, "_terminate_helpers", side_effect=engine.EngineError("helper_termination_unverified", True)))
+                with self.assertRaisesRegex(engine.EngineError, "payload_cleanup_unverified"):self.engine._cleanup_payloads(journal)
+            self.assertEqual(before, {p.name: p.read_bytes() for p in directory.iterdir()})
+
+    def test_cleanup_refuses_link_owner_content_missing_or_unexpected_intent_paths(self):
+        for bad in ("symlink", "hardlink", "content", "missing", "owner", "intent"):
+            fixture = self.cleanup_fixture();journal = fixture["journal"];directory = fixture["directory"];path = directory / "images.tar"
+            foreign = self.root / uid();foreign.write_bytes(b"protected foreign")
+            if bad == "symlink":path.unlink();path.symlink_to(foreign)
+            elif bad == "hardlink":path.unlink();os.link(foreign, path)
+            elif bad == "content":path.write_bytes(b"changed")
+            elif bad == "missing":path.unlink()
+            elif bad == "intent":journal["payloadCleanup"] = {"version": 1, "operationId": journal["id"], "serviceId": self.sid, "action": journal["action"], "manifestDigest": journal["manifestDigest"], "files": [{"path": "../foreign", "bytes": 1, "sha256": "0" * 64}] * 3, "complete": False};atomic(self.engine._journal_path(journal["id"]), journal)
+            with self.cleanup_native(fixture), self.engine.lock(), contextlib.ExitStack() as stack:
+                if bad == "owner":stack.enter_context(mock.patch.object(engine.os, "geteuid", return_value=os.geteuid() + 100))
+                with self.assertRaisesRegex(engine.EngineError, "payload_cleanup_unverified"):self.engine._cleanup_payloads(journal)
+            self.assertEqual(foreign.read_bytes(), b"protected foreign")
+            self.assertTrue((directory / "bundle.tar").exists());self.assertTrue((directory / "data-0.tar").exists())
+
+    def test_cleanup_intent_and_completion_write_failures_never_return_green(self):
+        for completion in (False, True):
+            fixture = self.cleanup_fixture();journal = fixture["journal"];directory = fixture["directory"];real = engine.atomic
+            before = {p.name: p.read_bytes() for p in directory.iterdir()}
+            def persist(path, value):
+                intent = value.get("payloadCleanup", {})
+                if intent.get("complete") is completion:raise OSError("journal commit")
+                return real(path, value)
+            with self.cleanup_native(fixture), self.engine.lock(), mock.patch.object(engine, "atomic", side_effect=persist):
+                with self.assertRaisesRegex(engine.EngineError, "payload_cleanup_unverified"):self.engine._cleanup_payloads(journal)
+            saved = read(self.engine._journal_path(journal["id"]))
+            if completion:
+                self.assertFalse(saved["payloadCleanup"]["complete"]);self.assertEqual(self.engine._safe_operation(saved)["status"], "outcome_unknown")
+                with self.cleanup_native(fixture):self.assertEqual(self.engine.reconcile({"id": journal["id"]})["status"], "succeeded")
+            else:
+                self.assertNotIn("payloadCleanup", saved);self.assertEqual(before, {p.name: p.read_bytes() for p in directory.iterdir()})
+
+    def test_restore_cleanup_rejects_changed_runtime_or_mount_parent_and_backup_source_input(self):
+        for bad in ("runtime", "parent-link", "source-input"):
+            fixture = self.cleanup_fixture(restore=bad != "source-input");directory = fixture["directory"];journal = fixture["journal"]
+            if bad == "runtime":(directory / "runtime.json").write_bytes(b"changed runtime")
+            elif bad == "parent-link":
+                mount = directory / "mount-0";target = directory / "kept-mount";mount.rename(target);mount.symlink_to(target, target_is_directory=True)
+            else:
+                service = self.engine._service(self.sid);service["project"]["inputs"] = {str(directory / "images.tar"): helper.digest(directory / "images.tar")};self.engine._save_service(service)
+            before = (directory / "bundle.tar").read_bytes()
+            with self.cleanup_native(fixture), self.engine.lock():
+                with self.assertRaisesRegex(engine.EngineError, "payload_cleanup_unverified"):self.engine._cleanup_payloads(journal)
+            self.assertEqual((directory / "bundle.tar").read_bytes(), before)
+
+    def test_cleanup_rejects_symlinked_journal_parent_without_deleting_payloads(self):
+        fixture = self.cleanup_fixture();directory = fixture["directory"]
+        operations = self.engine.state / "operations";kept = self.engine.state / "kept-operations"
+        operations.rename(kept);operations.symlink_to(kept, target_is_directory=True)
+        with self.cleanup_native(fixture), self.engine.lock():
+            with self.assertRaisesRegex(engine.EngineError, "payload_cleanup_unverified"):self.engine._cleanup_payloads(fixture["journal"])
+        self.assertTrue((directory / "bundle.tar").exists());self.assertTrue((directory / "images.tar").exists())
+        self.assertNotIn("payloadCleanup", read(kept / (fixture["journal"]["id"] + ".json")))
+
+    def test_cleanup_parent_sync_failure_keeps_pending_intent_and_retry_is_idempotent(self):
+        fixture = self.cleanup_fixture();journal = fixture["journal"];real = engine.os.fsync;calls = []
+        def sync(fd):
+            calls.append(fd)
+            if len(calls) == 3:raise OSError("payload parent sync")
+            return real(fd)
+        with self.cleanup_native(fixture), self.engine.lock(), mock.patch.object(engine.os, "fsync", side_effect=sync):
+            with self.assertRaisesRegex(engine.EngineError, "payload_cleanup_unverified"):self.engine._cleanup_payloads(journal)
+        saved = read(self.engine._journal_path(journal["id"]));self.assertFalse(saved["payloadCleanup"]["complete"])
+        with self.cleanup_native(fixture):result = self.engine.reconcile({"id": journal["id"]})
+        self.assertEqual(result["status"], "succeeded");self.assertTrue(read(self.engine._journal_path(journal["id"]))["payloadCleanup"]["complete"])
 
     def test_oci_or_legacy_secondary_tags_cannot_overwrite_other_images(self):
         for name, document in (("index.json", {"manifests": [{"annotations": {"io.containerd.image.name": "production:latest", "org.opencontainers.image.ref.name": "latest"}}]}), ("repositories", {"production": {"latest": "a" * 64}})):

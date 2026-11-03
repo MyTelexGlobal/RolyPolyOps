@@ -150,13 +150,18 @@ class ManagedEngine:
     @contextlib.contextmanager
     def lock(self):
         fd = os.open(self.state / "engine.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        acquired = False
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise EngineError("operation_busy") from None
+            acquired = True
+            self._local.engine_locked = True
             yield
         finally:
+            if acquired:
+                self._local.engine_locked = False
             os.close(fd)
 
     def _run(self, args, timeout=60, *, data=None, cwd=None, error="docker_operation_failed", allow_error=False):
@@ -1401,7 +1406,7 @@ class ManagedEngine:
                     if root.get("mediaType") != "application/vnd.oci.image.manifest.v1+json":
                         raise ValueError()
                     annotations = root.get("annotations", {})
-                    if set(annotations) - {"vnd.docker.reference.type", "vnd.docker.reference.digest"}:
+                    if set(annotations) - {"vnd.docker.reference.type", "vnd.docker.reference.digest", "io.containerd.manifest.subject"}:
                         raise ValueError()
                     platform = root.get("platform")
                     if platform is not None and (not isinstance(platform, dict) or platform.get("os") != "unknown" or platform.get("architecture") != "unknown" or platform.get("variant") not in {None, ""}):
@@ -1445,7 +1450,8 @@ class ManagedEngine:
                             or len(targets) != 1 or not targets <= runtime_targets):
                         raise ValueError()
                     if (annotations.get("vnd.docker.reference.type", "attestation-manifest") != "attestation-manifest"
-                            or annotations.get("vnd.docker.reference.digest", next(iter(targets))) != next(iter(targets))):
+                            or annotations.get("vnd.docker.reference.digest", next(iter(targets))) != next(iter(targets))
+                            or annotations.get("io.containerd.manifest.subject", next(iter(targets))) != next(iter(targets))):
                         raise ValueError()
                 index["manifests"] = runtime
                 replacement = canonical(index)
@@ -1530,6 +1536,203 @@ class ManagedEngine:
                 raise EngineError("capture_source_changed") from None
             result[container["Id"]] = {"startedAt": started, "restartCount": count, "running": running}
         return result
+
+    @staticmethod
+    def _cleanup_pending(journal):
+        if "payloadCleanup" not in journal:
+            return False
+        value = journal["payloadCleanup"]
+        try:
+            files = value["files"]
+            names = [item["path"] for item in files]
+            return (type(value.get("version")) is not int or value["version"] != 1 or value.get("complete") is not True
+                    or value.get("operationId") != journal.get("id") or value.get("serviceId") != journal["parameters"]["serviceId"]
+                    or value.get("action") != journal.get("action") or not HEX.fullmatch(value["manifestDigest"])
+                    or (value.get("action") == "compose-backup" and value["manifestDigest"] != journal.get("manifestDigest"))
+                    or not isinstance(files, list) or not 2 <= len(files) <= 202 or len(set(names)) != len(names)
+                    or not {"bundle.tar", "images.tar"} <= set(names)
+                    or any(not re.fullmatch(r"bundle\.tar|images\.tar|data-[0-9]{1,3}\.tar|mount-[0-9]{1,3}/archive\.tar", name) for name in names)
+                    or any(set(item) != {"path", "bytes", "sha256"} or type(item["bytes"]) is not int or not 0 <= item["bytes"] <= MAX_BYTES * 2
+                           or not HEX.fullmatch(item["sha256"]) for item in files))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return True
+
+    def _cleanup_payloads(self, journal):
+        """Remove only redundant, proven-success payload files; never application data."""
+        import stat
+        try:
+            def require(value):
+                if not value:
+                    raise EngineError("payload_cleanup_unverified", unknown=True)
+            require(getattr(self._local, "engine_locked", False))
+            identity, action, params = journal.get("id"), journal.get("action"), journal.get("parameters")
+            require(is_uuid(identity) and action in {"compose-backup", "compose-restore"} and isinstance(params, dict)
+                    and is_uuid(params.get("serviceId")) and is_uuid(params.get("storageId"))
+                    and journal.get("status") in {"running", "outcome_unknown", "succeeded"})
+            uid, directory = os.geteuid(), self.state / "stages" / identity
+            def trusted(path, *, folder=False):
+                value = path.lstat()
+                require((stat.S_ISDIR(value.st_mode) if folder else stat.S_ISREG(value.st_mode))
+                        and value.st_uid in ({0, uid} if folder else {uid}) and not value.st_mode & 0o022
+                        and (folder or value.st_nlink == 1))
+                return value
+            helpers = journal.get("helpers", [])
+            require(isinstance(helpers, list) and len(helpers) <= 200)
+            for helper in helpers:
+                purpose = helper.get("labels", {}).get(OWNER + ".purpose")
+                require(purpose in {"capture-helper", "restore-helper", "health-helper"}
+                        and helper.get("labels") == self._owned_labels(identity, params["serviceId"], purpose))
+            for parent in reversed(directory.parents):
+                trusted(parent, folder=True)
+            trusted(directory, folder=True)
+            trusted(self._journal_path(identity).parent, folder=True)
+            trusted(self._journal_path(identity))
+            require(self._inspection_journal(identity) == journal)
+            request_digest = journal.get("requestDigest")
+            if request_digest is None and "requestDigest" not in journal:
+                require(journal.get("origin") == "activation" and is_uuid(journal.get("parentId")))
+                trusted(self._journal_path(journal["parentId"]))
+                parent = self._inspection_journal(journal["parentId"])
+                require(parent.get("action") == "compose-activate" and parent.get("parameters", {}).get("serviceId") == params["serviceId"])
+            else:
+                require(isinstance(request_digest, str) and HEX.fullmatch(request_digest))
+            manifest_path = directory / "manifest.json"
+            require(trusted(manifest_path).st_size <= 16 * 1024 * 1024)
+            manifest = read(manifest_path)
+            manifest_digest = digest(manifest_path)
+            service_id = params["serviceId"]
+            require(manifest.get("format") == "rolypolyops-compose-v1" and manifest.get("serviceId") == service_id
+                    and is_uuid(manifest.get("operationId")))
+            self.storage.recover()
+            binding = self.storage.binding(params["storageId"])
+            require(binding["repositoryId"] == manifest.get("repositoryId"))
+            protected = set()
+            if action == "compose-backup":
+                require(set(params) == {"serviceId", "storageId"} and manifest["operationId"] == identity
+                        and journal.get("sourceResumed") is True and journal.get("manifestDigest") == manifest_digest
+                        and journal.get("repositoryId") == manifest["repositoryId"])
+                trusted(self._service_path(service_id).parent, folder=True)
+                trusted(self._service_path(service_id))
+                service = self._service(service_id)
+                latest = service.get("latestBackup", {})
+                require(service.get("sourceState") == "running" and service.get("storageId") == params["storageId"]
+                        and service.get("sourceNodeId") == self.node_id and service.get("fingerprint") == manifest.get("sourceFingerprint")
+                        and latest.get("serviceId") == service_id and latest.get("repositoryId") == manifest["repositoryId"]
+                        and latest.get("manifestDigest") == manifest_digest and latest.get("sourceResumed") is True
+                        and latest.get("sourceFingerprint") == manifest["sourceFingerprint"])
+                points = self._snapshots(binding, service_id, operation=identity)
+                require(len([point for point in points if point.get("id") == latest.get("snapshot") and point.get("operationId") == identity
+                             and point.get("manifestDigest") == manifest_digest and point.get("sourceFingerprint") == manifest["sourceFingerprint"]]) == 1)
+                protected = {Path(path) for path in service["project"]["inputs"]}
+            else:
+                require(set(params) == {"serviceId", "storageId", "snapshotId"} and journal.get("restoreId") == identity)
+                trusted(self._restore_path(identity).parent, folder=True)
+                trusted(self._restore_path(identity))
+                record = self._restore(identity, service_id)
+                require(record.get("id") == identity and record.get("state") == "isolated_ready" and record.get("directory") == str(directory)
+                        and record.get("manifestDigest") == manifest_digest and record.get("repositoryId") == manifest["repositoryId"]
+                        and record.get("storageId") == params["storageId"] and record.get("snapshot") == params["snapshotId"]
+                        and record.get("sourceFingerprint") == manifest.get("sourceFingerprint"))
+                trusted(directory / "runtime.json")
+                require(digest(directory / "runtime.json") == record.get("runtimeDigest"))
+                current = self._runtime_checks(record, manifest)
+                require({name: container["Id"] for name, container in current.items()} == record.get("containerIds"))
+                for mapping in record.get("mappings", {}).values():
+                    if mapping.get("kind") == "bind":
+                        path = Path(mapping["source"])
+                        relative = path.relative_to(directory)
+                        require(len(relative.parts) >= 3 and re.fullmatch(r"mount-[0-9]{1,3}", relative.parts[0])
+                                and relative.parts[1:3] == ("extracted", "payload") and ".." not in relative.parts)
+                        protected.add(path)
+            archives = manifest.get("archives")
+            require(isinstance(archives, list) and len(archives) <= 100 and isinstance(manifest.get("imagesSha256"), str) and HEX.fullmatch(manifest["imagesSha256"]))
+            hashes = {"bundle.tar": None, "images.tar": manifest["imagesSha256"]}
+            for index, item in enumerate(archives):
+                name = item.get("filename")
+                require(isinstance(name, str) and re.fullmatch(r"data-[0-9]{1,3}\.tar", name) and name not in hashes
+                        and isinstance(item.get("sha256"), str) and HEX.fullmatch(item["sha256"]))
+                hashes[name] = item["sha256"]
+                if action == "compose-restore":
+                    hashes["mount-" + str(index) + "/archive.tar"] = item["sha256"]
+            for name in hashes:
+                path = directory / name
+                trusted(path.parent, folder=True)
+                require(all(path != source and path not in source.parents for source in protected))
+            self.storage.recover()
+            self._terminate_helpers(journal)
+            self._check_other_writers({name: {"kind": "bind", "source": str(directory / name), "writerPath": str(directory / name)} for name in hashes}, set())
+            def fingerprint(path):
+                value = trusted(path)
+                require(value.st_size <= MAX_BYTES * 2)
+                descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    actual = os.fstat(descriptor)
+                    require((actual.st_dev, actual.st_ino, actual.st_size) == (value.st_dev, value.st_ino, value.st_size))
+                    h = hashlib.sha256()
+                    with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                        for block in iter(lambda: stream.read(1024 * 1024), b""):
+                            h.update(block)
+                    after = os.fstat(descriptor)
+                    require((after.st_size, after.st_mtime_ns) == (value.st_size, value.st_mtime_ns))
+                    return {"path": str(path.relative_to(directory)), "bytes": value.st_size, "sha256": h.hexdigest()}
+                finally:
+                    os.close(descriptor)
+            intent = journal.get("payloadCleanup")
+            if "payloadCleanup" in journal:
+                require(isinstance(intent, dict) and type(intent.get("version")) is int and intent["version"] == 1
+                        and intent.get("operationId") == identity and intent.get("serviceId") == service_id and intent.get("action") == action
+                        and intent.get("manifestDigest") == manifest_digest and type(intent.get("complete")) is bool
+                        and isinstance(intent.get("files"), list) and len(intent["files"]) == len(hashes))
+                files = {}
+                for item in intent["files"]:
+                    require(isinstance(item, dict) and set(item) == {"path", "bytes", "sha256"} and isinstance(item["path"], str)
+                            and item["path"] in hashes and item["path"] not in files and type(item["bytes"]) is int and 0 <= item["bytes"] <= MAX_BYTES * 2
+                            and isinstance(item["sha256"], str) and HEX.fullmatch(item["sha256"])
+                            and (hashes[item["path"]] is None or item["sha256"] == hashes[item["path"]]))
+                    files[item["path"]] = item
+                require(set(files) == set(hashes) and sum(item["bytes"] for item in files.values()) <= MAX_BYTES * 4)
+            else:
+                files = {name: fingerprint(directory / name) for name in hashes}
+                require(all(expected is None or files[name]["sha256"] == expected for name, expected in hashes.items()))
+            # Independently bind the remaining bundle to the kept manifest, without extraction.
+            bundle = directory / "bundle.tar"
+            if bundle.exists() or bundle.is_symlink():
+                trusted(bundle)
+                package = inspect_archive(bundle, data=False)
+                entries = {item["path"]: item for item in package["entries"]}
+                expected = {name: value for name, value in hashes.items() if "/" not in name and name != "bundle.tar"}
+                expected["manifest.json"] = manifest_digest
+                require(set(entries) == set(expected) and all(entries[name]["kind"] == "file" and entries[name]["sha256"] == value for name, value in expected.items()))
+            verified = []
+            for name, expected in files.items():
+                path = directory / name
+                try:
+                    actual = fingerprint(path)
+                except FileNotFoundError:
+                    require(intent is not None)
+                    continue
+                require(actual == expected and (intent is None or intent["complete"] is False))
+                verified.append(path)
+            if intent is None:
+                intent = {"version": 1, "operationId": identity, "serviceId": service_id, "action": action, "manifestDigest": manifest_digest,
+                          "files": [files[name] for name in sorted(files)], "complete": False, "createdAt": now()}
+                journal["payloadCleanup"] = intent
+                atomic(self._journal_path(identity), journal)
+            if intent["complete"]:
+                return
+            for path in verified:
+                require(fingerprint(path) == files[str(path.relative_to(directory))])
+                path.unlink()
+            for parent in sorted({(directory / name).parent for name in hashes}):
+                descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            intent.update(complete=True, completedAt=now())
+            atomic(self._journal_path(identity), journal)
+        except (EngineError, StorageError, ArchiveError, OSError, ValueError, KeyError, TypeError, AttributeError):
+            raise EngineError("payload_cleanup_unverified", unknown=True) from None
 
     def _backup(self, params):
         service = self._service(params["serviceId"])
@@ -1626,6 +1829,7 @@ class ManagedEngine:
         if service.get("setupState") == "active_unprotected":
             service["setupState"] = "restore_required"
         self._save_service(service)
+        self._cleanup_payloads(self.current)
         return result
 
     def _snapshots(self, binding, service_id, operation=None):
@@ -1983,6 +2187,7 @@ class ManagedEngine:
         record["containerIds"] = {c["Config"]["Labels"]["com.docker.compose.service"]: c["Id"] for c in self._restore_containers(record)}
         record.update(state="isolated_ready", checks=checks, applicationHealthVerified=verified, healthScope=scope)
         atomic(self._restore_path(identity), record)
+        self._cleanup_payloads(self.current)
         return self._safe_restore(record)
 
     @staticmethod
@@ -2439,6 +2644,8 @@ class ManagedEngine:
 
     @staticmethod
     def _safe_operation(value):
+        if ManagedEngine._cleanup_pending(value):
+            return {"status": "outcome_unknown", "error": "payload_cleanup_unverified"}
         status = value.get("status")
         result = {"status": status if status in {"succeeded", "failed", "outcome_unknown"} else "outcome_unknown"}
         for key in ("result", "error", "stage"):
@@ -2462,8 +2669,10 @@ class ManagedEngine:
             return {"status": "outcome_unknown", "error": error.code}
         if value is None:
             return None
-        if value.get("status") in {"succeeded", "failed"}:
+        if value.get("status") in {"succeeded", "failed"} and not self._cleanup_pending(value):
             return self._safe_operation(value)
+        if value.get("status") == "failed":
+            return {"status": "outcome_unknown", "error": "payload_cleanup_unverified"}
         action, params = value["action"], value.get("parameters", {})
         # Inspections may write only proof/state after positively observed prior effects; never repeat the action.
         settled = None
@@ -2485,9 +2694,11 @@ class ManagedEngine:
                     result = {"serviceId": service["id"], "repositoryId": binding["repositoryId"], "snapshot": points[0]["id"], "manifestDigest": value["manifestDigest"], "sourceFingerprint": points[0]["sourceFingerprint"], "sourceResumed": True, "at": points[0]["time"], "checks": ["source-stopped", "data-archived", "images-saved", "source-resumed", "repository-written"]}
                     service["latestBackup"] = result
                     self._save_service(service)
+                    self._cleanup_payloads(value)
                     settled = {"status": "succeeded", "result": result}
-            except (EngineError, StorageError):
-                pass
+            except (EngineError, StorageError) as error:
+                if error.code == "payload_cleanup_unverified":
+                    value["error"] = error.code
         elif action == "compose-stop":
             try:
                 service = self._service(params["serviceId"])
@@ -2503,14 +2714,16 @@ class ManagedEngine:
                 if record.get("state") == "isolated_ready":
                     manifest = read(Path(record["directory"]) / "manifest.json")
                     self._runtime_checks(record, manifest)
+                    self._cleanup_payloads(value)
                     settled = {"status": "succeeded", "result": self._safe_restore(record)}
                 else:
                     # Positive stopped absence can settle failed; an online partial restore remains held.
                     containers = self._restore_containers(record)
                     if containers and not any(c.get("State", {}).get("Running") for c in containers):
                         settled = {"status": "failed", "error": "restore_interrupted", "stage": "stopped"}
-            except (EngineError, StorageError):
-                pass
+            except (EngineError, StorageError) as error:
+                if error.code == "payload_cleanup_unverified":
+                    value["error"] = error.code
         elif action == "compose-activate":
             try:
                 record = self._restore(params["restoreId"], params["serviceId"])
