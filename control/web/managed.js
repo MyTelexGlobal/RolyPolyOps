@@ -38,6 +38,46 @@ export function canReuseStorage(storage, selectedNodes, isFresh) {
   });
 }
 
+// Completion waits only for authenticated observations; it never submits a command.
+export async function waitForCompletionObservation({readOverview,isFresh,service,point,restoreId,cancelled=()=>false,onWait=()=>{},now=()=>performance.now(),pause=ms=>new Promise(resolve=>setTimeout(resolve,ms)),timeoutMs=120000}) {
+  const fail=code=>{throw Object.assign(new Error(),{code});};
+  const hex=value=>typeof value==='string'&&/^[a-f0-9]{64}$/.test(value);
+  const scope=Object.fromEntries(['id','sourceNodeId','recoveryNodeId','storageId','fingerprint','projectId','backupInterval'].map(k=>[k,service?.[k]]));
+  const exact=Object.fromEntries(['snapshot','repositoryId','manifestDigest','sourceFingerprint'].map(k=>[k,point?.[k]]));
+  if(!restoreId || Object.values(scope).some(v=>typeof v!=='string'||!v) || scope.sourceNodeId===scope.recoveryNodeId || !Object.values(exact).every(hex) || exact.sourceFingerprint!==scope.fingerprint)fail('completion_proof_unavailable');
+  const deadline=now()+Math.min(120000,Math.max(1,timeoutMs));
+  const check=()=>{if(cancelled())fail('session_ended');if(now()>=deadline)fail('completion_observation_timeout');};
+  const single=(items,match)=>{const found=(items||[]).filter(match);return found.length===1?found[0]:undefined;};
+  const checks=['compose-model','data-hashes','metadata','image-identities','fresh-resources','runtime-isolation','application-health'];
+  const healthy=r=>r?.applicationHealthVerified===true&&['http','docker'].includes(r.healthScope)&&Array.isArray(r.checks)&&checks.every(k=>r.checks.includes(k));
+  const bound=r=>r&&r.serviceId===scope.id&&r.snapshotId===exact.snapshot&&r.repositoryId===exact.repositoryId&&r.manifestDigest===exact.manifestDigest&&r.sourceFingerprint===exact.sourceFingerprint;
+  for(;;){
+    check();let timer;
+    const overview=await Promise.race([Promise.resolve().then(readOverview),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Object.assign(new Error(),{code:'completion_observation_timeout'})),Math.max(1,deadline-now()));})]).finally(()=>clearTimeout(timer));
+    check();
+    if(!overview || typeof overview!=='object')fail('completion_proof_unavailable');
+    const current=single(overview.services,s=>s.id===scope.id);
+    if(!current || Object.keys(scope).some(k=>current[k]!==scope[k]))fail('completion_identity_changed');
+    const backup=current.latestBackup;
+    if(backup && Object.keys(exact).some(k=>backup[k]!==undefined&&backup[k]!==exact[k]))fail('completion_identity_changed');
+    const storage=single(overview.storages,s=>s.id===scope.storageId);
+    if(storage?.repositoryId && storage.repositoryId!==exact.repositoryId)fail('completion_identity_changed');
+    const source=single(overview.nodes,n=>n.id===scope.sourceNodeId),target=single(overview.nodes,n=>n.id===scope.recoveryNodeId);
+    const catalog=single(overview.restores,r=>r.id===restoreId);
+    const observed=single(target?.status?.compose?.restores,r=>(r.id||r.restoreId)===restoreId);
+    for(const restore of [catalog,observed])if(restore && ['serviceId','snapshotId','repositoryId','manifestDigest','sourceFingerprint'].some(k=>restore[k]!==undefined&&restore[k]!==({serviceId:scope.id,snapshotId:exact.snapshot,...exact})[k]))fail('completion_identity_changed');
+    if(catalog && catalog.nodeId!==scope.recoveryNodeId)fail('completion_identity_changed');
+    if(catalog?.applicationHealthVerified===false || catalog?.healthScope==='running-only')fail('application_health_unverified');
+    if(catalog && catalog.state!=='isolated_ready')fail('completion_proof_unavailable');
+    const seen=single(source?.status?.compose?.services,s=>(s.serviceId||s.id)===scope.id);
+    const fresh=source&&target&&isFresh(source)&&isFresh(target)&&source.status?.compose?.ready===true&&target.status?.compose?.ready===true;
+    if(fresh && seen && ['fingerprint','storageId','projectId'].some(k=>seen[k]!==undefined&&seen[k]!==scope[k]))fail('completion_identity_changed');
+    if(fresh && observed?.state==='isolated_ready' && Array.isArray(observed.ports) && observed.ports.length)fail('completion_proof_unavailable');
+    if(fresh && canReuseStorage(storage,[source,target],isFresh) && backup && Object.keys(exact).every(k=>backup[k]===exact[k]) && bound(catalog) && catalog.state==='isolated_ready' && healthy(catalog) && bound(observed) && observed.state==='isolated_ready' && healthy(observed) && Array.isArray(observed.ports) && observed.ports.length===0 && seen && seen.fingerprint===scope.fingerprint && seen.storageId===scope.storageId && seen.projectId===scope.projectId && (seen.state||seen.sourceState)==='running' && seen.schedule?.enabled===true && seen.schedule.interval===scope.backupInterval)return current;
+    onWait();check();await pause(Math.min(1500,deadline-now()));
+  }
+}
+
 export function createManagedUI(ctx) {
   const {h,button,field,select,notice,pill,head,state,api,render,fresh,date,bytes,showJob,refreshOverview} = ctx;
   const tr = (ru,en) => state.lang === 'ru' ? ru : en;
@@ -48,10 +88,10 @@ export function createManagedUI(ctx) {
   const ready = n => fresh(n) && n.status?.compose?.ready === true;
   const reuse = a => !a.storageOnly && canReuseStorage(list('storages').find(s=>s.id===a.storage),[node(a.source),node(a.target)],fresh);
   const rev = () => state.overview.revision;
-  let wizard, busy=false, error='', progress='', pending=new Map(), activations=new Map(), alive=0;
+  let wizard, busy=false, error='', progress='', pending=new Map(), activations=new Map(), alive=0, waitingCompletion=false;
   const init = () => ({id:crypto.randomUUID(),serviceId:crypto.randomUUID(),name:'',source:'',target:'',project:'',storage:'',storageName:'',kind:'rest',mode:'create',endpoint:'',bucket:'',prefix:'',region:'',username:'',password:'',accessKeyId:'',secretAccessKey:'',sessionToken:'',repoPassword:'',interval:'hourly',exclusive:false,http:false,healthService:'',port:'8080',path:'/',expectedStatus:'200',stage:'select',jobs:[]});
   const w = () => wizard ||= init();
-  function clear() { alive++; if(wizard)wipeSecrets(wizard);wizard=null; pending.clear(); activations.clear(); busy=false;error='';progress=''; }
+  function clear() { alive++;waitingCompletion=false; if(wizard)wipeSecrets(wizard);wizard=null; pending.clear(); activations.clear(); busy=false;error='';progress=''; }
   async function mutate(path,body) {
     // Keep the exact request identity after an uncertain HTTP response. No new effect on retry.
     const signature=path+'\n'+canonical(body);
@@ -89,12 +129,15 @@ export function createManagedUI(ctx) {
       repository_password_required:tr('Для нового или неподтвержденного подключения нужен пароль шифрования restic.','A new or unconfirmed binding requires the restic encryption password.'),
       choose_two_ready_nodes:tr('Выберите два разных сервера со свежим подтверждением готовности Compose.','Choose two different hosts with fresh confirmed Compose readiness.'),
       repository_auth_failed:tr('Хранилище отклонило учетные данные. Исправьте их перед новым подключением.','Storage rejected the credentials. Correct them before connecting again.'),
+      completion_observation_timeout:tr('Свежие данные не получены за две минуты. Настройку можно продолжить после обновления состояния серверов.','Fresh observations were not received within two minutes. Continue setup after the hosts update.'),
+      completion_identity_changed:tr('Сервис или точная копия изменились. Проверьте выбранное восстановление перед продолжением.','The service or exact backup changed. Review the selected restore before continuing.'),
+      completion_proof_unavailable:tr('Для завершения не хватает подтвержденных сведений о точной копии и восстановлении.','Confirmed proof of the exact backup and restore is required before completion.'),
       application_health_unverified:tr('Здоровье приложения не подтверждено. Настройте Docker healthcheck или проверку HTTP и повторите восстановление.','Application health is unverified. Configure Docker healthcheck or an HTTP check and repeat recovery.')
     };
     return (explanations[code] || tr('Служба сообщила условие, требующее проверки.','The service reported a condition that requires inspection.'))+' ['+String(code||'unknown_error').slice(0,100)+']';
   }
   const message = e => explain(e.code||'unknown_error');
-  async function run(fn) { if(busy)return;busy=true;error='';render();try{await fn();}catch(e){progress='';error=message(e);}finally{busy=false;render();} }
+  async function run(fn) { if(busy)return;const epoch=alive;busy=true;error='';render();try{await fn();}catch(e){if(epoch===alive){progress='';error=message(e);}}finally{if(epoch===alive){busy=false;render();}} }
   async function observeJobs(items) {
     const epoch=alive;
     if(wizard) wizard.jobs=items.map(j=>j.id);
@@ -160,6 +203,12 @@ export function createManagedUI(ctx) {
     if(a.storageOnly){wipeSecrets(a);progress=tr('Подключение подтверждено операциями серверов.','Connection confirmed by host jobs.');}
   }
   function wipeSecrets(a) { for(const k of ['password','secretAccessKey','sessionToken','repoPassword','accessKeyId','username'])a[k]=''; }
+  async function observedCompletion(service,point,restoreId) {
+    const epoch=alive;
+    return waitForCompletionObservation({service,point,restoreId,isFresh:fresh,cancelled:()=>epoch!==alive,
+      readOverview:async()=>{await refreshOverview(false);if(state.online!==true||!state.overview)throw Object.assign(new Error(),{code:'completion_proof_unavailable'});return state.overview;},
+      onWait:()=>{waitingCompletion=true;progress=tr('Ожидаем свежие данные о расписании и точном восстановлении.','Waiting for fresh schedule and exact restore observations.');render();const d=document.getElementById('dialog');if(d?.open){const text=d.querySelector('[data-completion-wait]'),cancel=d.querySelector('[data-completion-cancel]');if(text)text.textContent=progress;if(cancel)cancel.disabled=false;}}}).finally(()=>{waitingCompletion=false;});
+  }
   async function advance() {
     const a=w();let service=serviceById(a.serviceId);
     if(a.stage==='import') {
@@ -170,10 +219,11 @@ export function createManagedUI(ctx) {
       const result=a.registerResult||await mutate('/api/services',body);a.registerResult=result;service=result.service;try{await observeJobs([result.job]);}catch(e){if(result.job.status==='failed')a.registerResult=null;throw e;}a.registerResult=null;a.stage='backup';
     }
     service=serviceById(a.serviceId)||service;
-    if(a.stage==='backup'){const job=await operation(service,'compose-backup',service.sourceNodeId);a.snapshot=job.result?.snapshot;if(!a.snapshot)throw Object.assign(new Error(),{code:'backup_snapshot_missing'});a.stage='restore';}
+    a.completionService ||= {...service};
+    if(a.stage==='backup'){const job=await operation(service,'compose-backup',service.sourceNodeId);a.point=job.result;a.snapshot=job.result?.snapshot;if(!a.snapshot)throw Object.assign(new Error(),{code:'backup_snapshot_missing'});a.stage='restore';}
     if(a.stage==='restore'){const job=await operation(service,'compose-restore',service.recoveryNodeId,{},a.snapshot);a.restoreId=job.result?.restoreId||job.id;a.stage='schedule';}
     if(a.stage==='schedule'){await operation(service,'compose-schedule',service.sourceNodeId,{interval:a.interval});a.stage='complete';}
-    if(a.stage==='complete'){const completed=await api('/api/services/'+a.serviceId+'/complete',{restoreId:a.restoreId,expectedRevision:rev()});if(completed.completed!==true||completed.service?.setupState!=='complete')throw Object.assign(new Error(),{code:'completion_unconfirmed'});a.stage='done';wipeSecrets(a);await refreshOverview(false);}
+    if(a.stage==='complete'){await observedCompletion(a.completionService,a.point,a.restoreId);const completed=await api('/api/services/'+a.serviceId+'/complete',{restoreId:a.restoreId,expectedRevision:rev()});if(completed.completed!==true||completed.service?.setupState!=='complete')throw Object.assign(new Error(),{code:'completion_unconfirmed'});a.stage='done';wipeSecrets(a);await refreshOverview(false);}
   }
   function input(a,key,label,type='text',required=false) {return field(label,h('input',{type,value:a[key]||'',required,autocomplete:'off',maxlength:type==='password'?4096:1024,oninput:e=>{a[key]=e.target.value;}}));}
   function choice(a,key,label,options){const id='managed-choice-'+key;return field(label,select(options,a[key],value=>{a[key]=value;render();document.getElementById(id)?.focus();},{id}));}
@@ -229,18 +279,21 @@ export function createManagedUI(ctx) {
     }
     if(a.stage==='seal')form.append(h('h3',{},tr('Подтвердите точное место хранения','Confirm the exact repository namespace')),h('pre',{class:'managed-code'},JSON.stringify(a.challenge.metadata,null,2)),h('p',{},tr('Срок запроса: ','Challenge expires: ')+date(a.challenge.expiresAt)),h('p',{},a.challenge.bindings.map(b=>(node(b.nodeId)?.name||b.nodeId)+' · '+b.mode+' · '+b.bindingGeneration).join('; ')),notice(tr('Создание допускается только после подтверждения пустого выделенного места. Ошибка пароля, TLS или прав завершает подключение ошибкой.','Creation requires proof that the dedicated namespace is empty. Password, TLS or permission failure fails the connection.')),button(tr('Скачать закрытый комплект восстановления','Download private recovery kit'),kit));
     if(['import','backup','restore','schedule','complete'].includes(a.stage))form.append(h('p',{},tr('Следующий этап: ','Next step: ')+a.stage),notice(tr('Будут выполнены: регистрация, копия, восстановление точной копии на другом сервере, применение расписания и проверка готовности. При ошибке этап не считается завершенным.','The flow registers, captures, restores the exact snapshot on the other host, applies a schedule and checks readiness. Failed stages remain incomplete.')));
-    form.append(h('div',{class:'actions'},h('button',{class:'btn primary',type:'submit',disabled:busy||(!storageOnly&&!project?.supported&&['select','storage'].includes(a.stage))},tr(a.stage==='seal'?'Подтвердить подключение':['select','storage'].includes(a.stage)?reuse(a)?'Использовать подключение и продолжить':'Подготовить защищенное подключение':'Продолжить настройку',a.stage==='seal'?'Confirm connection':['select','storage'].includes(a.stage)?reuse(a)?'Use connected storage and continue':'Prepare secure connection':'Continue setup')),button(tr('Начать новый запрос','Start fresh challenge'),()=>{a.challenge=null;a.sealed=null;a.connectResult=null;pending.clear();a.stage='storage';error='';render();},'',{disabled:busy}),button(tr('Отменить и удалить секреты из формы','Cancel and clear credentials'),()=>{clear();render();},'',{disabled:busy})));
+    form.append(h('div',{class:'actions'},h('button',{class:'btn primary',type:'submit',disabled:busy||(!storageOnly&&!project?.supported&&['select','storage'].includes(a.stage))},tr(a.stage==='seal'?'Подтвердить подключение':['select','storage'].includes(a.stage)?reuse(a)?'Использовать подключение и продолжить':'Подготовить защищенное подключение':'Продолжить настройку',a.stage==='seal'?'Confirm connection':['select','storage'].includes(a.stage)?reuse(a)?'Use connected storage and continue':'Prepare secure connection':'Continue setup')),button(tr('Начать новый запрос','Start fresh challenge'),()=>{a.challenge=null;a.sealed=null;a.connectResult=null;pending.clear();a.stage='storage';error='';render();},'',{disabled:busy}),button(tr('Отменить и удалить секреты из формы','Cancel and clear credentials'),()=>{clear();render();},'',{'data-completion-cancel':'',disabled:busy})));
     if(a.jobs.length)form.append(h('p',{class:'mono'},a.jobs.join('\n')));
     if(busy)for(const control of form.querySelectorAll('input,select,button'))control.disabled=true;
+    if(waitingCompletion)form.querySelector('[data-completion-cancel]')?.removeAttribute('disabled');
     return form;
   }
   function confirm(title,content,fn) {
     const d=document.getElementById('dialog');d.replaceChildren();
     const err=h('p',{class:'form-error',role:'alert'});
-    const cancel=button(tr('Отмена','Cancel'),()=>d.close());
-    d.oncancel=e=>{if(busy)e.preventDefault();};
-    const yes=button(tr('Подтвердить','Confirm'),async()=>{yes.disabled=true;cancel.disabled=true;busy=true;try{await fn();d.close();await refreshOverview(true);}catch(e){progress='';err.textContent=message(e);}finally{busy=false;yes.disabled=false;cancel.disabled=false;}},'primary');
-    d.append(h('div',{class:'dialog-content'},h('h2',{id:'dialog-title'},title),content,err,h('div',{class:'actions'},cancel,yes)));if(!d.open)d.showModal();
+    const cancelAction=()=>{if(waitingCompletion){alive++;waitingCompletion=false;busy=false;progress='';render();}d.close();};
+    const cancel=button(tr('Отмена','Cancel'),cancelAction,'',{'data-completion-cancel':''});
+    const waiting=h('p',{'data-completion-wait':'',role:'status'});
+    d.oncancel=e=>{if(busy&&!waitingCompletion)e.preventDefault();else if(waitingCompletion)cancelAction();};
+    const yes=button(tr('Подтвердить','Confirm'),async()=>{const epoch=alive;yes.disabled=true;cancel.disabled=true;busy=true;try{await fn();if(epoch===alive){d.close();await refreshOverview(true);}}catch(e){if(epoch===alive){progress='';err.textContent=message(e);}}finally{if(epoch===alive){busy=false;yes.disabled=false;cancel.disabled=false;}}},'primary');
+    d.append(h('div',{class:'dialog-content'},h('h2',{id:'dialog-title'},title),content,waiting,err,h('div',{class:'actions'},cancel,yes)));if(!d.open)d.showModal();
   }
   function confirmOp(s,action,nodeId,extra={},snapshot) {
     const warning=action==='compose-backup'?tr('Вся группа Compose будет кратко остановлена. Ранее работавшие контейнеры должны быть возобновлены до успешного завершения.','The whole Compose project pauses briefly. The previously running containers must resume before success.'):action==='compose-remove'?tr('Будет удалена только эта отдельная проверочная копия.','Only this isolated owned restore will be removed.'):action==='compose-verify'?tr('Полная проверка restic с чтением данных проверяет репозиторий. Она не доказывает правильность приложения.','A full restic read-data check verifies the repository. It does not establish application correctness.'):tr('Восстановление создает отдельную копию без опубликованных портов.','Restore creates an isolated copy without published ports.');
@@ -274,16 +327,26 @@ export function createManagedUI(ctx) {
   }
   async function finishValidation(service,snapshot=service.latestBackup?.snapshot) {
     if(!snapshot)throw Object.assign(new Error(),{code:'new_source_backup_required'});
+    const key='finish/'+service.id;
+    let attempt=pending.get(key);
+    if(!attempt){attempt={service:{...service},point:{...service.latestBackup},snapshot};pending.set(key,attempt);}
+    if(attempt.snapshot!==snapshot || ['id','sourceNodeId','recoveryNodeId','storageId','fingerprint','projectId','backupInterval'].some(k=>attempt.service[k]!==service[k])){pending.delete(key);throw Object.assign(new Error(),{code:'completion_identity_changed'});}
     progress=tr('Проверка точной копии нового источника на выбранном сервере восстановления.','Checking the exact new-source backup on the selected recovery host.');render();
-    const existing=list('restores').find(r=>r.serviceId===service.id && r.nodeId===service.recoveryNodeId && r.snapshotId===snapshot && r.state==='isolated_ready');
-    const restore=existing || await operation(service,'compose-restore',service.recoveryNodeId,{},snapshot);
-    const restoreId=restore.result?.restoreId||restore.id;
+    if(!attempt.restoreId){
+      const existing=list('restores').find(r=>r.serviceId===service.id && r.nodeId===service.recoveryNodeId && r.snapshotId===snapshot && r.state==='isolated_ready');
+      const restore=existing || await operation(service,'compose-restore',service.recoveryNodeId,{},snapshot);
+      attempt.restoreId=restore.result?.restoreId||restore.id;
+    }
     await refreshOverview(false);
     const current=serviceById(service.id)||service;
-    if(!current.schedule?.enabled || current.schedule.interval!==current.backupInterval)await operation(current,'compose-schedule',current.sourceNodeId,{interval:current.backupInterval});
-    const completed=await api('/api/services/'+service.id+'/complete',{restoreId,expectedRevision:rev()});
+    if(!attempt.scheduled){
+      if(!current.schedule?.enabled || current.schedule.interval!==current.backupInterval)await operation(current,'compose-schedule',current.sourceNodeId,{interval:current.backupInterval});
+      attempt.scheduled=true;
+    }
+    try{await observedCompletion(attempt.service,attempt.point,attempt.restoreId);}catch(e){if(e.code==='completion_identity_changed')pending.delete(key);throw e;}
+    const completed=await api('/api/services/'+service.id+'/complete',{restoreId:attempt.restoreId,expectedRevision:rev()});
     if(completed.completed!==true||completed.service?.setupState!=='complete')throw Object.assign(new Error(),{code:'completion_unconfirmed'});
-    progress='';await refreshOverview(false);
+    pending.delete(key);progress='';await refreshOverview(false);
   }
   function serviceCard(s) {
     const source=node(s.sourceNodeId), target=node(s.recoveryNodeId),disabled=!ready(source)||busy;
