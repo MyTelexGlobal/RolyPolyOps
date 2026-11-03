@@ -1223,6 +1223,27 @@ class EngineTests(unittest.TestCase):
             self.assertEqual((foreign / "sentinel").read_bytes(), b"foreign protected")
             self.assertNotIn("payloadCleanup", read(self.engine._journal_path(journal["id"])))
 
+    def test_cleanup_boundary_failures_are_typed_unknown_before_any_deletion(self):
+        for restore in (False, True):
+            for exception in (IndexError, StopIteration, RecursionError):
+                for pending in (False, True):
+                    fixture = self.cleanup_fixture(restore=restore);journal = fixture["journal"];directory = fixture["directory"]
+                    if pending:
+                        with self.cleanup_native(fixture), self.engine.lock(), mock.patch.object(Path, "unlink", side_effect=OSError("not yet deleted")):
+                            with self.assertRaises(engine.EngineError):self.engine._cleanup_payloads(journal)
+                    intent = copy.deepcopy(journal.get("payloadCleanup"))
+                    before = {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()}
+                    boundary = "_runtime_checks" if restore else "_terminate_helpers"
+                    with self.cleanup_native(fixture), self.engine.lock(), mock.patch.object(self.engine, boundary, side_effect=exception("injected boundary")):
+                        with self.assertRaises(engine.EngineError) as caught:self.engine._cleanup_payloads(journal)
+                    self.assertEqual(caught.exception.code, "payload_cleanup_unverified");self.assertTrue(caught.exception.unknown)
+                    with self.cleanup_native(fixture), mock.patch.object(self.engine, boundary, side_effect=exception("injected boundary")), mock.patch.object(self.engine, "_backup") as backup, mock.patch.object(self.engine, "_restore_snapshot") as restore_action:
+                        result = self.engine.reconcile({"id": journal["id"]})
+                    self.assertEqual(result["status"], "outcome_unknown");self.assertEqual(result["error"], "payload_cleanup_unverified")
+                    backup.assert_not_called();restore_action.assert_not_called()
+                    self.assertEqual(before, {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()})
+                    saved = read(self.engine._journal_path(journal["id"]));self.assertEqual(saved.get("payloadCleanup"), intent);self.assertEqual(saved["status"], "outcome_unknown")
+
     def test_cleanup_parent_sync_failure_keeps_pending_intent_and_retry_is_idempotent(self):
         fixture = self.cleanup_fixture();journal = fixture["journal"];real = engine.os.fsync;calls = []
         def sync(fd):
