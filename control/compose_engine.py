@@ -932,30 +932,130 @@ class ManagedEngine:
         self._save_service(service)
         return {"serviceId": service["id"], "registered": True, "projectId": service["projectId"], "fingerprint": service["fingerprint"]}
 
-    def _resume_capture(self, service, journal):
-        if service.get("sourceState") != "capture_stopped" or service.get("captureOperation") != journal["id"]:
+    @staticmethod
+    def _capture_mounts(signature):
+        # Docker's Mounts array is unordered. Keep every typed identity and its multiplicity.
+        if not isinstance(signature, list) or len(signature) > 100:
+            raise EngineError("capture_source_changed", unknown=True)
+        result = []
+        for item in signature:
+            if (not isinstance(item, list) or len(item) != 4 or not isinstance(item[0], str) or item[0] not in {"bind", "volume"}
+                    or any(not isinstance(v, str) or not v or len(v) > 4096 or "\x00" in v for v in item[1:3])
+                    or not item[2].startswith("/") or type(item[3]) is not bool
+                    or (item[0] == "bind" and not item[1].startswith("/"))
+                    or (item[0] == "volume" and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", item[1]))):
+                raise EngineError("capture_source_changed", unknown=True)
+            result.append(tuple(item))
+        if len({item[2] for item in result}) != len(result):
+            raise EngineError("capture_source_changed", unknown=True)
+        return sorted(result)
+
+    @classmethod
+    def _capture_container_mounts(cls, container):
+        mounts = container.get("Mounts")
+        if not isinstance(mounts, list) or any(not isinstance(m, dict) for m in mounts):
+            raise EngineError("capture_source_changed", unknown=True)
+        return cls._capture_mounts([[m.get("Type"), m.get("Name") if m.get("Type") == "volume" else m.get("Source"), m.get("Destination"), m.get("RW")] for m in mounts])
+
+    def _capture_compensation_authority(self, service, journal):
+        identity = journal.get("id")
+        params, obligation = journal.get("parameters"), journal.get("resume")
+        project = service.get("project")
+        if (not is_uuid(identity) or service.get("captureOperation") != identity or not is_uuid(service.get("id"))
+                or service.get("sourceState") not in {"capture_stopped", "unknown"} or service.get("fence")
+                or journal.get("action") != "compose-backup" or journal.get("status") not in {"running", "outcome_unknown"}
+                or journal.get("stage") not in {"capture-intent", "source-stopped", "data-archived"}
+                or journal.get("sourceResumed") is not False or (journal.get("resumeComplete") is not None and journal.get("resumeComplete") is not False)
+                or any(key in journal for key in ("manifestDigest", "repositoryId", "result", "activationResult", "resumeFence"))
+                or not isinstance(journal.get("requestDigest"), str) or not HEX.fullmatch(journal["requestDigest"])
+                or not isinstance(params, dict) or set(params) != {"serviceId", "storageId"}
+                or params["serviceId"] != service["id"] or params["storageId"] != service.get("storageId") or not is_uuid(params["storageId"])
+                or not isinstance(obligation, dict) or set(obligation) != {"serviceId", "containers"} or obligation["serviceId"] != service["id"]
+                or service.get("exclusiveWriters") is not True or service.get("sourceNodeId") != self.node_id
+                or not isinstance(service.get("projectId"), str) or not service["projectId"] or not isinstance(project, dict)):
+            raise EngineError("capture_resume_ownership_unverified", unknown=True)
+        originals, prior = project.get("containers"), obligation["containers"]
+        inputs, mounts = project.get("inputs"), project.get("mounts")
+        if (not isinstance(originals, list) or not 1 <= len(originals) <= 100 or not isinstance(prior, list) or len(prior) > 100
+                or not isinstance(inputs, dict) or not 1 <= len(inputs) <= 100 or not isinstance(mounts, dict) or len(mounts) > 100
+                or any(not isinstance(path, str) or len(path) > 4096 or "\x00" in path or not Path(path).is_absolute() or not isinstance(value, str) or not HEX.fullmatch(value) for path, value in inputs.items())):
+            raise EngineError("capture_resume_ownership_unverified", unknown=True)
+        by_id = {}
+        for item in originals:
+            if (not isinstance(item, dict) or not isinstance(item.get("id"), str) or not HEX.fullmatch(item["id"]) or item["id"] in by_id
+                    or not isinstance(item.get("dockerImageRef"), str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", item["dockerImageRef"])
+                    or not isinstance(item.get("mounts"), list) or len(item["mounts"]) > 100):
+                raise EngineError("capture_resume_ownership_unverified", unknown=True)
+            signature = []
+            for reference in item["mounts"]:
+                if not isinstance(reference, dict) or type(reference.get("readOnly")) is not bool:
+                    raise EngineError("capture_resume_ownership_unverified", unknown=True)
+                mount = mounts.get(reference.get("key"))
+                if not isinstance(mount, dict):
+                    raise EngineError("capture_resume_ownership_unverified", unknown=True)
+                signature.append([mount.get("kind"), mount.get("source"), reference.get("target"), not reference["readOnly"]])
+            by_id[item["id"]] = (item["dockerImageRef"], self._capture_mounts(signature))
+        seen = set()
+        for item in prior:
+            if not isinstance(item, dict) or set(item) != {"id", "imageId", "mountSignature"} or not isinstance(item.get("id"), str) or item["id"] not in by_id or item["id"] in seen:
+                raise EngineError("capture_resume_ownership_unverified", unknown=True)
+            seen.add(item["id"])
+            if (item["imageId"], self._capture_mounts(item["mountSignature"])) != by_id[item["id"]]:
+                raise EngineError("capture_source_changed", unknown=True)
+        helpers = journal.get("helpers", [])
+        if not isinstance(helpers, list) or len(helpers) > 200:
+            raise EngineError("capture_resume_ownership_unverified", unknown=True)
+        for item in helpers:
+            if (not isinstance(item, dict) or not isinstance(item.get("name"), str)
+                    or not re.fullmatch("rpo-helper-" + identity.replace("-", "")[:24] + r"-[a-f0-9]{8}", item["name"])
+                    or item.get("labels") != self._owned_labels(identity, service["id"], "capture-helper")):
+                raise EngineError("capture_resume_ownership_unverified", unknown=True)
+        return by_id
+
+    def _compensate_capture(self, service, journal):
+        try:
+            originals = self._capture_compensation_authority(service, journal)
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+            raise EngineError("capture_resume_ownership_unverified", unknown=True) from None
+        # Cleanup is repeated here because inspection must be safe independently of its caller.
+        self.storage.recover()
+        prior = {key: journal.get(key) for key in ("status", "stage", "error", "completedAt")}
+        self._resume_capture(service, journal, originals=originals)
+        journal["captureCompensation"] = {"prior": prior, "at": now()}
+        journal.update(status="failed", error="capture_interrupted", stage="source-resumed", completedAt=now())
+        atomic(self._journal_path(journal["id"]), journal)
+        return {"status": "failed", "error": "capture_interrupted", "stage": "source-resumed"}
+
+    def _resume_capture(self, service, journal, *, originals=None):
+        if service.get("sourceState") not in ({"capture_stopped", "unknown"} if originals is not None else {"capture_stopped"}) or service.get("captureOperation") != journal["id"]:
             raise EngineError("capture_resume_ownership_unverified", unknown=True)
         self._terminate_helpers(journal)
-        obligation = journal.get("resume", {})
-        expected = obligation.get("containers", [])
-        actual = self._inspect([c["id"] for c in expected])
-        if {c["Id"] for c in actual} != {c["id"] for c in expected}:
+        expected = journal.get("resume", {}).get("containers", [])
+        if not isinstance(expected, list) or len(expected) > 100 or any(not isinstance(c, dict) or not isinstance(c.get("id"), str) for c in expected):
+            raise EngineError("capture_source_changed", unknown=True)
+        ids = [c["id"] for c in expected]
+        if len(set(ids)) != len(ids):
+            raise EngineError("capture_source_changed", unknown=True)
+        actual = ([c for c in self._containers() if c.get("Config", {}).get("Labels", {}).get("com.docker.compose.project") == service["projectId"]]
+                  if originals is not None else self._inspect(ids))
+        if len(actual) != len(originals if originals is not None else ids) or {c["Id"] for c in actual} != set(originals if originals is not None else ids):
             raise EngineError("capture_source_changed", unknown=True)
         for container in actual:
-            identity = next(c for c in expected if c["id"] == container["Id"])
+            identity = next((c for c in expected if c["id"] == container["Id"]), None)
+            baseline = originals[container["Id"]] if originals is not None else (identity.get("imageId"), self._capture_mounts(identity.get("mountSignature")))
             if (container.get("Config", {}).get("Labels", {}).get("com.docker.compose.project") != service["projectId"]
-                    or container.get("Image") != identity["imageId"]
-                    or [[m.get("Type"), m.get("Name") if m.get("Type") == "volume" else m.get("Source"), m.get("Destination"), m.get("RW")] for m in container.get("Mounts", [])] != identity["mountSignature"]):
+                    or container.get("Image") != baseline[0] or self._capture_container_mounts(container) != baseline[1]
+                    or type(container.get("State", {}).get("Running")) is not bool):
                 raise EngineError("capture_source_changed", unknown=True)
-        # Verify immutable configuration/input bytes before restarting containers by exact id.
         for path, expected_hash in service["project"]["inputs"].items():
-            if not Path(path).is_file() or digest(path) != expected_hash:
+            if not Path(path).is_file() or Path(path).is_symlink() or digest(path) != expected_hash:
                 raise EngineError("capture_source_changed", unknown=True)
+        self._check_other_writers(service["project"].get("mounts", {}), {c["Id"] for c in actual})
         for container in actual:
-            if not container.get("State", {}).get("Running"):
+            if container["Id"] in ids and not container["State"]["Running"]:
                 self.docker("start", container["Id"])
-        check = self._inspect([c["id"] for c in expected])
-        if not all(c.get("State", {}).get("Running") for c in check):
+        check = self._inspect(ids)
+        if len(check) != len(ids) or {c["Id"] for c in check} != set(ids) or not all(c.get("State", {}).get("Running") is True for c in check):
             raise EngineError("source_resume_failed", unknown=True)
         service.update(sourceState="running")
         service.pop("captureOperation", None)
@@ -1289,7 +1389,7 @@ class ManagedEngine:
         stage.mkdir(mode=0o700)
         actual = self._inspect([c["id"] for c in project["containers"]])
         quiescence = self._capture_observations(actual, {c["id"] for c in project["containers"]})
-        stopped = [{"id": c["Id"], "imageId": c["Image"], "mountSignature": [[m.get("Type"), m.get("Name") if m.get("Type") == "volume" else m.get("Source"), m.get("Destination"), m.get("RW")] for m in c.get("Mounts", [])]} for c in actual if c.get("State", {}).get("Running")]
+        stopped = [{"id": c["Id"], "imageId": c["Image"], "mountSignature": [list(item) for item in self._capture_container_mounts(c)]} for c in actual if c.get("State", {}).get("Running")]
         self._journal(stage="capture-intent", reserve=reserve, resume={"serviceId": service["id"], "containers": stopped}, sourceResumed=False)
         service.update(sourceState="capture_stopped", captureOperation=op)
         self._save_service(service)
@@ -2062,10 +2162,8 @@ class ManagedEngine:
                 results.append({"id": identity, "status": "outcome_unknown", "error": "capture_journal_missing"})
                 continue
             try:
-                self._resume_capture(service, journal)
-                journal.update(status="failed", error="capture_interrupted", stage="source-resumed")
-                atomic(self._journal_path(identity), journal)
-                results.append({"id": identity, "status": "failed", "error": "capture_interrupted"})
+                settled = self._compensate_capture(service, journal)
+                results.append({"id": identity, **settled})
             except (EngineError, StorageError, OSError) as error:
                 service["sourceState"] = "unknown"
                 self._save_service(service)
@@ -2199,6 +2297,12 @@ class ManagedEngine:
         settled = None
         if action == "storage-configure":
             settled = self.storage.reconcile(identity)
+        elif action == "compose-backup" and not value.get("sourceResumed"):
+            try:
+                service = self._service(params["serviceId"])
+                settled = self._compensate_capture(service, value)
+            except (EngineError, StorageError, OSError, ValueError, KeyError, TypeError, IndexError) as error:
+                value["error"] = getattr(error, "code", "capture_resume_ownership_unverified")
         elif action == "compose-backup" and value.get("sourceResumed") and value.get("manifestDigest"):
             try:
                 service = self._service(params["serviceId"])
