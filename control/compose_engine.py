@@ -1720,6 +1720,9 @@ class ManagedEngine:
                 atomic(self._journal_path(identity), journal)
             if intent["complete"]:
                 return
+            if action == "compose-restore":
+                # Hashing can outlive the initial runtime observation; recheck before unlinking.
+                self._runtime_checks(record, manifest)
             for path in verified:
                 require(fingerprint(path) == files[str(path.relative_to(directory))])
                 path.unlink()
@@ -2187,7 +2190,12 @@ class ManagedEngine:
         record["containerIds"] = {c["Config"]["Labels"]["com.docker.compose.service"]: c["Id"] for c in self._restore_containers(record)}
         record.update(state="isolated_ready", checks=checks, applicationHealthVerified=verified, healthScope=scope)
         atomic(self._restore_path(identity), record)
-        self._cleanup_payloads(self.current)
+        try:
+            self._cleanup_payloads(self.current)
+            self._runtime_checks(record, manifest)
+        except (EngineError, StorageError):
+            self._settle_stopped_restore(self.current, record)
+            raise EngineError("restore_interrupted") from None
         return self._safe_restore(record)
 
     @staticmethod
@@ -2468,10 +2476,163 @@ class ManagedEngine:
         for network in networks:
             self.docker("network", "rm", network)
 
+    def _stopped_restore_proof(self, journal, record):
+        """Prove an owned isolated runtime stopped or absent, without claiming readiness."""
+        import stat
+        try:
+            def require(value):
+                if not value:
+                    raise EngineError("restore_stopped_unverified", unknown=True)
+            require(getattr(self._local, "engine_locked", False))
+            identity, service_id = record.get("id"), record.get("serviceId")
+            require(is_uuid(identity) and is_uuid(service_id) and journal.get("id") == identity and journal.get("action") == "compose-restore"
+                    and record.get("state") in {"isolated_ready", "stopped"} and record.get("projectId") == "rpo-" + identity.replace("-", ""))
+            directory = self.state / "stages" / identity
+            require(record.get("directory") == str(directory))
+            uid = os.geteuid()
+            def trusted(path, folder=False):
+                value = path.lstat()
+                require((stat.S_ISDIR(value.st_mode) if folder else stat.S_ISREG(value.st_mode))
+                        and value.st_uid in ({0, uid} if folder else {uid}) and not value.st_mode & 0o022
+                        and (folder or value.st_nlink == 1))
+                return value
+            for parent in reversed(directory.parents):
+                trusted(parent, True)
+            for folder in (directory, self._journal_path(identity).parent, self._restore_path(identity).parent, self.state / "services"):
+                trusted(folder, True)
+            trusted(self._journal_path(identity));trusted(self._restore_path(identity))
+            require(self._inspection_journal(identity) == journal and self._restore(identity, service_id) == record)
+            params = journal.get("parameters")
+            require(isinstance(params, dict) and set(params) == {"serviceId", "storageId", "snapshotId"}
+                    and params["serviceId"] == service_id and params["storageId"] == record.get("storageId") and is_uuid(params["storageId"])
+                    and params["snapshotId"] == record.get("snapshot") and isinstance(params["snapshotId"], str) and HEX.fullmatch(params["snapshotId"]))
+            for path in (directory / "manifest.json", directory / "runtime.json"):
+                require(trusted(path).st_size <= 16 * 1024 * 1024)
+            manifest, runtime = read(directory / "manifest.json"), read(directory / "runtime.json")
+            require(digest(directory / "manifest.json") == record.get("manifestDigest") and digest(directory / "runtime.json") == record.get("runtimeDigest")
+                    and manifest.get("format") == "rolypolyops-compose-v1" and manifest.get("serviceId") == service_id
+                    and manifest.get("repositoryId") == record.get("repositoryId") and manifest.get("sourceFingerprint") == record.get("sourceFingerprint")
+                    and isinstance(record.get("sourceFingerprint"), str) and HEX.fullmatch(record["sourceFingerprint"]) and is_uuid(manifest.get("operationId")))
+            require(canonical(runtime) == canonical(self._runtime(manifest, record, record["mappings"])))
+            for path in (self.state / "services").glob("*.json"):
+                trusted(path);service = read(path)
+                require(service.get("activeRestoreId") != identity and service.get("projectId") != record["projectId"])
+            expected_ids = record.get("containerIds")
+            require(isinstance(expected_ids, dict) and 1 <= len(expected_ids) <= 100 and set(expected_ids) == set(manifest["runtime"]["services"])
+                    and len(set(expected_ids.values())) == len(expected_ids) and all(isinstance(value, str) and HEX.fullmatch(value) for value in expected_ids.values()))
+            labels = self._owned_labels(identity, service_id, "restore") | {OWNER + ".restore": identity}
+            helpers = journal.get("helpers", [])
+            require(isinstance(helpers, list) and len(helpers) <= 200)
+            for helper in helpers:
+                purpose = helper.get("labels", {}).get(OWNER + ".purpose")
+                require(purpose in {"restore-helper", "health-helper"} and helper.get("labels") == self._owned_labels(identity, service_id, purpose))
+            self.storage.recover()
+            require(isinstance(record.get("repositoryId"), str) and HEX.fullmatch(record["repositoryId"]))
+            self._terminate_helpers(journal)
+            def inventory(*args, hex_ids=False):
+                values = self.docker(*args).decode().split()
+                require(len(values) <= 1000 and len(set(values)) == len(values)
+                        and all(isinstance(v, str) and (HEX.fullmatch(v) if hex_ids else re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}", v)) for v in values))
+                return set(values)
+            ids = inventory("ps", "--all", "--quiet", "--no-trunc", hex_ids=True)
+            containers = self._inspect(sorted(ids))
+            require(len(containers) == len(ids) and {c["Id"] for c in containers} == ids)
+            resources = record.get("resources")
+            require(isinstance(resources, list) and len(resources) <= 200)
+            names = {"volume": set(), "network": set()}
+            for resource in resources:
+                kind, name = resource.get("kind"), resource.get("name")
+                require(kind in names and isinstance(name, str) and name.startswith(record["projectId"] + "-")
+                        and resource.get("created") is True and resource.get("labels") == labels and name not in names[kind])
+                names[kind].add(name)
+            present, network_ids = {}, {}
+            owned_present = ids & set(expected_ids.values())
+            for kind in names:
+                all_names = inventory(kind, "ls", "--format", "{{.Name}}")
+                own_names = inventory(kind, "ls", "--filter", "label=" + OWNER + ".operation=" + identity, "--format", "{{.Name}}")
+                require(own_names <= names[kind] and own_names <= all_names and names[kind] & all_names == own_names)
+                present[kind] = own_names
+                for name in sorted(own_names):
+                    details = self._json(kind, "inspect", name)
+                    require(isinstance(details, list) and len(details) == 1)
+                    actual = details[0]
+                    require(actual.get("Name") == name and self._labels_match(actual.get("Labels", {}), labels)
+                            and actual.get("Driver") == ("local" if kind == "volume" else "bridge"))
+                    if kind == "volume":
+                        require(not actual.get("Options"))
+                    else:
+                        require(actual.get("Internal") is True and set(actual.get("Containers", {})) <= owned_present)
+                        network_ids[name] = actual.get("Id")
+            source_containers = {item["service"]: item for item in manifest["containers"]}
+            by_id = {value: name for name, value in expected_ids.items()}
+            for container in containers:
+                current_labels = container.get("Config", {}).get("Labels", {})
+                relevant = (container["Id"] in by_id or current_labels.get("com.docker.compose.project") == record["projectId"]
+                            or current_labels.get(OWNER + ".restore") == identity or current_labels.get(OWNER + ".operation") == identity)
+                if not relevant:
+                    for mount in container.get("Mounts", []):
+                        require(not (mount.get("Type") == "volume" and mount.get("Name") in names["volume"]))
+                        if mount.get("Type") == "bind":
+                            path = Path(mount["Source"])
+                            require(path.is_absolute() and path != directory and directory not in path.parents and path not in directory.parents)
+                    continue
+                require(container["Id"] in by_id and self._labels_match(current_labels, labels)
+                        and current_labels.get("com.docker.compose.project") == record["projectId"]
+                        and current_labels.get("com.docker.compose.service") == by_id[container["Id"]])
+                state, host, network = container.get("State", {}), container.get("HostConfig", {}), container.get("NetworkSettings", {})
+                require(state.get("Running") is False and type(state.get("Pid")) is int and state["Pid"] == 0
+                        and state.get("Paused") is False and state.get("Restarting") is False and state.get("Dead") is False
+                        and state.get("Status") in {"exited", "created"} and host.get("PublishAllPorts") is False)
+                for bindings in (host.get("PortBindings"), network.get("Ports")):
+                    require(isinstance(bindings, dict) and all(value is None or value == [] for value in bindings.values()))
+                original = source_containers[by_id[container["Id"]]]
+                require(self._container_image_info(container, manifest["platform"])["id"] == original["imageId"])
+                mounts = []
+                for mount in original["mounts"]:
+                    mapping = record["mappings"][mount["key"]]
+                    mounts.append([mapping["kind"], mapping["source"], mount["target"], not mount["readOnly"]])
+                require(self._capture_container_mounts(container) == self._capture_mounts(mounts))
+                expected_networks = {value["name"] for value in runtime["networks"].values()}
+                require(set(network.get("Networks", {})) == expected_networks and expected_networks <= present["network"])
+                for name, attachment in network["Networks"].items():
+                    require(attachment.get("NetworkID") == network_ids[name])
+            return {"presentResources": {kind: sorted(value) for kind, value in present.items()}, "presentContainers": sorted(owned_present),
+                    "manifestDigest": record["manifestDigest"], "runtimeDigest": record["runtimeDigest"]}
+        except (EngineError, StorageError, ArchiveError, OSError, ValueError, KeyError, TypeError, AttributeError, IndexError, StopIteration, RecursionError):
+            raise EngineError("restore_stopped_unverified", unknown=True) from None
+
+    def _settle_stopped_restore(self, journal, record):
+        try:
+            proof = self._stopped_restore_proof(journal, record)
+            record.update(state="stopped", applicationHealthVerified=False, healthScope="stopped", ports=[],
+                          checks=["runtime-stopped", "no-published-ports", "owned-resources"], stoppedProof=proof)
+            atomic(self._restore_path(record["id"]), record)
+            audit = journal.get("deferredPayloadCleanup", {"reason": "runtime-stopped", "at": now()})
+            if not isinstance(audit, dict) or audit.get("reason") != "runtime-stopped":
+                raise EngineError("restore_stopped_unverified", unknown=True)
+            if "payloadCleanup" in journal:
+                if "intent" in audit and audit["intent"] != journal["payloadCleanup"]:
+                    raise EngineError("restore_stopped_unverified", unknown=True)
+                audit["intent"] = journal.pop("payloadCleanup")
+            journal["deferredPayloadCleanup"] = audit
+            journal.update(status="failed", error="restore_interrupted", stage="stopped", completedAt=now())
+            atomic(self._journal_path(journal["id"]), journal)
+            return {"status": "failed", "error": "restore_interrupted", "stage": "stopped"}
+
+        except (EngineError, StorageError, ArchiveError, OSError, ValueError, KeyError, TypeError, AttributeError, IndexError, StopIteration, RecursionError):
+            raise EngineError("restore_stopped_unverified", unknown=True) from None
+
     def _remove(self, params):
         record = self._restore(params["restoreId"], params["serviceId"])
-        if record["state"] != "isolated_ready":
+        if record["state"] not in {"isolated_ready", "stopped"}:
             raise EngineError("restore_not_removable")
+        stopped = record["state"] == "stopped"
+        proof = None
+        if stopped:
+            journal = self._inspection_journal(record["id"])
+            if not journal or journal.get("status") != "failed" or journal.get("error") != "restore_interrupted":
+                raise EngineError("restore_not_removable")
+            proof = self._stopped_restore_proof(journal, record)
         # Every current source is protected independently from possibly missing/corrupt preview records.
         for path in (self.state / "services").glob("*.json"):
             service = read(path)
@@ -2486,6 +2647,8 @@ class ManagedEngine:
         for resource in record["resources"]:
             if resource["kind"] not in {"volume", "network"} or not resource.get("created") or resource.get("labels") != expected:
                 raise EngineError("restore_ownership_unverified")
+            if stopped and resource["name"] not in proof["presentResources"][resource["kind"]]:
+                continue
             volume = self._json(resource["kind"], "inspect", resource["name"])[0]
             if not self._labels_match(volume.get("Labels", {}), expected):
                 raise EngineError("restore_ownership_unverified")
@@ -2497,10 +2660,18 @@ class ManagedEngine:
             if c["Id"] not in own_ids and any(m.get("Name") in volumes or m.get("Type") == "bind" and (Path(m["Source"]) == directory or directory in Path(m["Source"]).parents) for m in c.get("Mounts", [])):
                 raise EngineError("restore_in_use")
         self._journal(stage="remove-intent", restoreId=record["id"])
-        self._remove_runtime_only(record)
+        self._remove_runtime_only(record, require_stopped=True) if stopped else self._remove_runtime_only(record)
         for resource in record["resources"]:
-            if resource["kind"] == "volume":
+            if resource["kind"] == "volume" and (not stopped or resource["name"] in proof["presentResources"]["volume"]):
                 self.docker("volume", "rm", resource["name"])
+        if stopped:
+            remaining = set(self.docker("network", "ls", "--format", "{{.Name}}").decode().split())
+            for resource in record["resources"]:
+                if resource["kind"] == "network" and resource["name"] in remaining:
+                    actual = self._json("network", "inspect", resource["name"])[0]
+                    if not self._labels_match(actual.get("Labels", {}), expected) or actual.get("Containers"):
+                        raise EngineError("restore_in_use")
+                    self.docker("network", "rm", resource["name"])
         shutil.rmtree(directory)
         record["state"] = "removed"
         atomic(self._restore_path(record["id"]), record)
@@ -2711,16 +2882,20 @@ class ManagedEngine:
         elif action == "compose-restore":
             try:
                 record = self._restore(identity, params["serviceId"])
-                if record.get("state") == "isolated_ready":
-                    self._cleanup_payloads(value)
-                    settled = {"status": "succeeded", "result": self._safe_restore(record)}
-                else:
-                    # Positive stopped absence can settle failed; an online partial restore remains held.
-                    containers = self._restore_containers(record)
-                    if containers and not any(c.get("State", {}).get("Running") for c in containers):
-                        settled = {"status": "failed", "error": "restore_interrupted", "stage": "stopped"}
+                if record.get("state") == "stopped":
+                    settled = self._settle_stopped_restore(value, record)
+                elif record.get("state") == "isolated_ready":
+                    try:
+                        self._cleanup_payloads(value)
+                        self._runtime_checks(record, read(self.state / "stages" / identity / "manifest.json"))
+                        settled = {"status": "succeeded", "result": self._safe_restore(record)}
+                    except (EngineError, StorageError) as error:
+                        try:
+                            settled = self._settle_stopped_restore(value, record)
+                        except (EngineError, StorageError):
+                            value["error"] = error.code
             except (EngineError, StorageError) as error:
-                if error.code == "payload_cleanup_unverified":
+                if error.code == "payload_cleanup_unverified" or "error" not in value:
                     value["error"] = error.code
         elif action == "compose-activate":
             try:

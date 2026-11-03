@@ -1063,6 +1063,7 @@ class EngineTests(unittest.TestCase):
                     (self.engine, "_snapshots", [fixture["point"]]), (self.engine, "_terminate_helpers", None),
                     (self.engine, "_check_other_writers", None), (self.engine, "_runtime_checks", {"app": {"Id": "f" * 64}})):
                 stack.enter_context(mock.patch.object(obj, name, return_value=value))
+            stack.enter_context(mock.patch.object(self.engine, "_stopped_restore_proof", side_effect=engine.EngineError("restore_stopped_unverified", True)))
             yield
 
     def test_successful_backup_payload_cleanup_preserves_manifest_history_and_foreign_file(self):
@@ -1243,6 +1244,164 @@ class EngineTests(unittest.TestCase):
                     backup.assert_not_called();restore_action.assert_not_called()
                     self.assertEqual(before, {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()})
                     saved = read(self.engine._journal_path(journal["id"]));self.assertEqual(saved.get("payloadCleanup"), intent);self.assertEqual(saved["status"], "outcome_unknown")
+
+    def stopped_fixture(self):
+        fixture = self.cleanup_fixture(restore=True);record = fixture["record"];journal = fixture["journal"];directory = fixture["directory"]
+        manifest = read(directory / "manifest.json");image_id = next(iter(manifest["images"]))
+        record["projectId"] = "rpo-" + record["id"].replace("-", "")
+        volume, network = record["projectId"] + "-v1", record["projectId"] + "-n0"
+        record["mappings"]["volume:fixture"] = {"kind": "volume", "source": volume, "logical": "data1"}
+        manifest["runtime"].update(name="fixture", networks={"default": {}}, volumes={"fixture": {}})
+        manifest["runtime"]["services"]["app"].update(environment={}, networks={"default": {}})
+        manifest["containers"] = [{"service": "app", "imageId": image_id, "mounts": [{"key": "bind:fixture", "target": "/data", "readOnly": False}, {"key": "volume:fixture", "target": "/volume", "readOnly": False}]}]
+        manifest["archives"].append(manifest["archives"][0] | {"filename": "data-1.tar", "kind": "volume", "key": "volume:fixture"})
+        (directory / "data-1.tar").write_bytes((directory / "data-0.tar").read_bytes())
+        mount = directory / "mount-1";mount.mkdir(mode=0o700);(mount / "archive.tar").write_bytes((directory / "data-1.tar").read_bytes())
+        labels = self.engine._owned_labels(record["id"], self.sid, "restore") | {helper.OWNER + ".restore": record["id"]}
+        record["resources"] = [{"kind": kind, "name": name, "created": True, "labels": labels} for kind, name in (("volume", volume), ("network", network))]
+        atomic(directory / "manifest.json", manifest);record["manifestDigest"] = helper.digest(directory / "manifest.json")
+        runtime = self.engine._runtime(manifest, record, record["mappings"]);atomic(directory / "runtime.json", runtime);record["runtimeDigest"] = helper.digest(directory / "runtime.json")
+        atomic(self.engine._restore_path(record["id"]), record)
+        with tarfile.open(directory / "bundle.tar", "w") as out:
+            for name in ("manifest.json", "images.tar", "data-0.tar", "data-1.tar"):tar_entry(out, name, (directory / name).read_bytes())
+        fixture["manifest"] = manifest
+        fixture["containers"] = [{"Id": "f" * 64, "Image": image_id, "Config": {"Labels": labels | {"com.docker.compose.project": record["projectId"], "com.docker.compose.service": "app"}},
+            "State": {"Running": False, "Pid": 0, "Paused": False, "Restarting": False, "Dead": False, "Status": "exited"},
+            "HostConfig": {"PublishAllPorts": False, "PortBindings": {}}, "NetworkSettings": {"Ports": {"80/tcp": None}, "Networks": {network: {"NetworkID": "e" * 64}}},
+            "Mounts": [{"Type": "bind", "Source": record["mappings"]["bind:fixture"]["source"], "Destination": "/data", "RW": True}, {"Type": "volume", "Name": volume, "Destination": "/volume", "RW": True}]}]
+        fixture["resources"] = {"volume": {volume: {"Name": volume, "Driver": "local", "Options": {}, "Labels": labels}}, "network": {network: {"Name": network, "Id": "e" * 64, "Driver": "bridge", "Internal": True, "Containers": {}, "Labels": labels}}}
+        fixture["effects"] = [];return fixture
+
+    @contextlib.contextmanager
+    def stopped_native(self, fixture):
+        def command(*args, **kwargs):
+            if args[0] == "ps":
+                values = fixture["containers"]
+                if "--filter" in args:
+                    project = args[args.index("--filter") + 1].removeprefix("label=com.docker.compose.project=")
+                    values = [c for c in values if c.get("Config", {}).get("Labels", {}).get("com.docker.compose.project") == project]
+                return "\n".join(c["Id"] for c in values).encode()
+            if args[0] in {"volume", "network"} and args[1] == "ls":
+                values = fixture["resources"][args[0]]
+                if "--filter" in args:values = {name:v for name,v in values.items() if v.get("Labels", {}).get(helper.OWNER + ".operation") == fixture["record"]["id"]}
+                return "\n".join(values).encode()
+            fixture["effects"].append(args)
+            if args[0] == "rm":fixture["containers"][:] = [c for c in fixture["containers"] if c["Id"] != args[-1]];return b""
+            if args[0] in {"volume", "network"} and args[1] == "rm":
+                for name, value in list(fixture["resources"][args[0]].items()):
+                    if args[-1] in {name, value.get("Id")}:del fixture["resources"][args[0]][name]
+                return b""
+            raise AssertionError(args)
+        def native(kind, action, name):
+            self.assertEqual(action, "inspect")
+            for value in fixture["resources"][kind].values():
+                if name in {value["Name"], value.get("Id")}:return [value]
+            raise engine.EngineError("docker_operation_failed")
+        with mock.patch.object(self.engine.storage, "recover"), mock.patch.object(self.engine, "_terminate_helpers"), mock.patch.object(self.engine, "docker", side_effect=command), mock.patch.object(self.engine, "_json", side_effect=native), mock.patch.object(self.engine, "_inspect", side_effect=lambda ids: [c for c in fixture["containers"] if c["Id"] in ids]), mock.patch.object(self.engine, "_container_image_info", side_effect=lambda c,p:{"id": c["Image"]}):
+            yield
+
+    def test_stopped_restore_before_or_partial_cleanup_settles_failed_keeps_data_and_unblocks_remove(self):
+        for partial in (False, True):
+            fixture = self.stopped_fixture();journal = fixture["journal"];directory = fixture["directory"]
+            if partial:
+                real = Path.unlink
+                def unlink(path, *a, **kw):
+                    if path.name == "images.tar":raise OSError("partial cleanup")
+                    return real(path, *a, **kw)
+                with self.cleanup_native(fixture), self.engine.lock(), mock.patch.object(Path, "unlink", new=unlink):
+                    with self.assertRaises(engine.EngineError):self.engine._cleanup_payloads(journal)
+            intent = copy.deepcopy(journal.get("payloadCleanup"))
+            before = {str(p.relative_to(directory)): (p.read_bytes(), p.stat().st_mode, p.stat().st_uid, p.stat().st_gid, p.stat().st_mtime_ns) for p in directory.rglob("*") if p.is_file()}
+            with self.stopped_native(fixture), mock.patch.object(self.engine, "_runtime_checks", side_effect=engine.EngineError("restore_runtime_unverified")), mock.patch.object(self.engine, "_backup") as backup, mock.patch.object(self.engine, "_restore_snapshot") as replay:
+                result = self.engine.reconcile({"id": journal["id"]})
+                again = self.engine.reconcile({"id": journal["id"]})
+            self.assertEqual(result, again);self.assertEqual(result["status"], "failed");self.assertEqual(result["error"], "restore_interrupted")
+            backup.assert_not_called();replay.assert_not_called();self.assertEqual(fixture["effects"], [])
+            self.assertEqual(before, {str(p.relative_to(directory)): (p.read_bytes(), p.stat().st_mode, p.stat().st_uid, p.stat().st_gid, p.stat().st_mtime_ns) for p in directory.rglob("*") if p.is_file()})
+            saved = read(self.engine._journal_path(journal["id"]));self.assertNotIn("payloadCleanup", saved);self.assertEqual(saved["deferredPayloadCleanup"].get("intent"), intent)
+            record = self.engine._restore(journal["id"], self.sid);self.assertEqual(record["state"], "stopped");self.assertFalse(record["applicationHealthVerified"]);self.assertEqual(record["ports"], [])
+            self.assertEqual(set(record["checks"]), {"runtime-stopped", "no-published-ports", "owned-resources"});self.assertEqual(record["healthScope"], "stopped")
+            with self.stopped_native(fixture), mock.patch.object(self.engine, "_register", return_value={"registered": True}):
+                other = self.job("compose-register", {"serviceId": uid(), "projectId": "unrelated", "fingerprint": "a" * 64, "storageId": self.storage, "backupInterval": "hourly", "exclusiveWriters": True})
+                self.assertTrue(self.engine.execute(other)["registered"])
+                removed = self.engine.execute(self.job("compose-remove", {"serviceId": self.sid, "restoreId": journal["id"]}))
+            self.assertTrue(removed["removed"]);self.assertFalse(directory.exists())
+
+    def test_complete_native_absence_can_fail_stopped_restore_then_remove_without_storage_binding(self):
+        fixture = self.stopped_fixture();journal = fixture["journal"];fixture["containers"] = [];fixture["resources"] = {"volume": {}, "network": {}}
+        with self.stopped_native(fixture), mock.patch.object(self.engine, "_runtime_checks", side_effect=engine.EngineError("restore_service_set_unverified")), mock.patch.object(self.engine.storage, "binding", side_effect=engine.StorageError("storage_not_connected")):
+            result = self.engine.reconcile({"id": journal["id"]})
+            self.assertEqual(result["status"], "failed")
+            removed = self.engine.execute(self.job("compose-remove", {"serviceId": self.sid, "restoreId": journal["id"]}))
+        self.assertTrue(removed["removed"])
+
+    def test_stopped_copy_restarted_after_observation_cannot_be_removed(self):
+        fixture = self.stopped_fixture();journal = fixture["journal"]
+        with self.stopped_native(fixture), mock.patch.object(self.engine, "_runtime_checks", side_effect=engine.EngineError("restore_runtime_unverified")):
+            self.assertEqual(self.engine.reconcile({"id": journal["id"]})["status"], "failed")
+        stored = self.engine._restore(journal["id"], self.sid);self.assertEqual(self.engine._safe_restore(stored)["state"], "stopped")
+        fixture["containers"][0]["State"].update(Running=True, Pid=77, Status="running")
+        before = {str(p): p.read_bytes() for p in fixture["directory"].rglob("*") if p.is_file()}
+        with self.stopped_native(fixture), self.engine.lock():
+            with self.assertRaisesRegex(engine.EngineError, "restore_stopped_unverified"):self.engine._remove({"serviceId": self.sid, "restoreId": journal["id"]})
+        self.assertEqual(fixture["effects"], []);self.assertEqual(before, {str(p): p.read_bytes() for p in fixture["directory"].rglob("*") if p.is_file()})
+
+    def test_stop_during_hash_window_defers_intent_before_unlink_and_historical_storage_can_be_removed(self):
+        fixture = self.stopped_fixture();journal = fixture["journal"];directory = fixture["directory"];calls = []
+        fixture["containers"][0]["State"].update(Running=True, Pid=77, Status="running")
+        before = {str(p): p.read_bytes() for p in directory.rglob("*") if p.is_file()}
+        def runtime(record, manifest):
+            calls.append(True)
+            if len(calls) == 2:
+                fixture["containers"][0]["State"].update(Running=False, Pid=0, Status="exited")
+                raise engine.EngineError("restore_runtime_unverified")
+            return {"app": fixture["containers"][0]}
+        with self.stopped_native(fixture), mock.patch.object(self.engine.storage, "binding", return_value=fixture["binding"]), mock.patch.object(self.engine, "_runtime_checks", side_effect=runtime):
+            result = self.engine.reconcile({"id": journal["id"]})
+        self.assertEqual(result["status"], "failed");self.assertEqual(before, {str(p): p.read_bytes() for p in directory.rglob("*") if p.is_file()})
+        saved = read(self.engine._journal_path(journal["id"]));self.assertFalse(saved["deferredPayloadCleanup"]["intent"]["complete"])
+        self.engine._save_service({"id": self.sid, "activeRestoreId": uid(), "projectId": "unrelated-current-source", "storageId": uid(), "fingerprint": "9" * 64})
+        fixture["containers"].append({"Id": "b" * 64, "Config": {"Labels": {"com.docker.compose.project": "unrelated-current-source"}}, "Mounts": [{"Type": "bind", "Source": "/unrelated-source", "Destination": "/data", "RW": True}]})
+        with self.stopped_native(fixture), mock.patch.object(self.engine.storage, "binding", side_effect=engine.StorageError("storage_not_connected")):
+            removed = self.engine.execute(self.job("compose-remove", {"serviceId": self.sid, "restoreId": journal["id"]}))
+        self.assertTrue(removed["removed"]);self.assertEqual([c["Id"] for c in fixture["containers"]], ["b" * 64])
+
+    def test_stopped_restore_ambiguity_does_not_settle_or_delete(self):
+        for bad in ("running", "paused", "pid", "unknown", "ports", "publish-all", "extra", "foreign-label", "image", "mount", "resource-label", "extra-resource", "resource-writer", "foreign-writer", "source", "active", "directory", "manifest", "runtime", "inventory", "helper", "storage"):
+            fixture = self.stopped_fixture();record = fixture["record"];journal = fixture["journal"];container = fixture["containers"][0];directory = fixture["directory"]
+            if bad == "running":container["State"].update(Running=True, Pid=77, Status="running")
+            elif bad == "paused":container["State"]["Paused"] = True
+            elif bad == "pid":container["State"]["Pid"] = 77
+            elif bad == "unknown":container["State"].pop("Running")
+            elif bad == "ports":container["HostConfig"]["PortBindings"] = {"80/tcp": [{"HostPort": "18080"}]}
+            elif bad == "publish-all":container["HostConfig"]["PublishAllPorts"] = True
+            elif bad == "extra":fixture["containers"].append(copy.deepcopy(container) | {"Id": "a" * 64})
+            elif bad == "foreign-label":container["Config"]["Labels"][helper.OWNER + ".node"] = uid()
+            elif bad == "image":container["Image"] = "sha256:" + "0" * 64
+            elif bad == "mount":container["Mounts"][0]["Source"] = "/foreign"
+            elif bad == "resource-label":next(iter(fixture["resources"]["volume"].values()))["Labels"] = {"foreign": "true"}
+            elif bad == "extra-resource":fixture["resources"]["volume"]["extra-owned"] = {"Labels": next(iter(fixture["resources"]["volume"].values()))["Labels"]}
+            elif bad == "resource-writer":next(iter(fixture["resources"]["network"].values()))["Containers"] = {"a" * 64: {}}
+            elif bad == "foreign-writer":fixture["containers"].append({"Id": "a" * 64, "Config": {"Labels": {}}, "Mounts": [{"Type": "volume", "Name": next(iter(fixture["resources"]["volume"]))}]})
+            elif bad == "source":self.engine._save_service({"id": uid(), "activeRestoreId": record["id"]})
+            elif bad == "active":record["state"] = "active";atomic(self.engine._restore_path(record["id"]), record)
+            elif bad == "directory":record["directory"] = str(self.root);atomic(self.engine._restore_path(record["id"]), record)
+            elif bad == "manifest":(directory / "manifest.json").write_bytes(b'{}')
+            elif bad == "runtime":(directory / "runtime.json").write_bytes(b'{}')
+            before = {str(p.relative_to(directory)): p.read_bytes() for p in directory.rglob("*") if p.is_file()}
+            with self.subTest(bad=bad), self.stopped_native(fixture), mock.patch.object(self.engine, "_runtime_checks", side_effect=engine.EngineError("restore_runtime_unverified")), contextlib.ExitStack() as stack:
+                if bad == "inventory":stack.enter_context(mock.patch.object(self.engine, "_inspect", return_value=[]))
+                elif bad == "helper":stack.enter_context(mock.patch.object(self.engine, "_terminate_helpers", side_effect=engine.EngineError("helper_termination_unverified", True)))
+                elif bad == "storage":stack.enter_context(mock.patch.object(self.engine.storage, "recover", side_effect=engine.StorageError("transport_cleanup_unverified", True)))
+                if bad == "storage":
+                    with self.assertRaises(engine.EngineError):self.engine.reconcile({"id": journal["id"]})
+                    result = {"status": "outcome_unknown"}
+                else:result = self.engine.reconcile({"id": journal["id"]})
+            self.assertEqual(result["status"], "outcome_unknown", bad);self.assertEqual(fixture["effects"], [], bad)
+            self.assertEqual(before, {str(p.relative_to(directory)): p.read_bytes() for p in directory.rglob("*") if p.is_file()})
+            self.assertNotEqual(self.engine._restore(journal["id"], self.sid)["state"], "stopped")
+            # Each loop has its own logical copy; remove synthetic current-source guard before the next case.
+            for path in (self.engine.state / "services").glob("*.json"):path.unlink()
 
     def test_cleanup_parent_sync_failure_keeps_pending_intent_and_retry_is_idempotent(self):
         fixture = self.cleanup_fixture();journal = fixture["journal"];real = engine.os.fsync;calls = []
