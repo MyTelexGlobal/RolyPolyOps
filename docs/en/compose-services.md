@@ -18,7 +18,7 @@ Open **Own services**, then **Connect your service**. Select the source, its dis
 
 Confirm that only this project's containers write its data. The host detects overlapping running-container mounts, but cannot reliably discover native host writers. Capture briefly stops all project containers, stages their persistent data and exact local images, resumes the previously running set, then uploads the encrypted stage. This is a cold capture, without a zero-downtime guarantee.
 
-Ordinary named volumes, local data/configuration binds, file configs/secrets and resolved environment are included. Privileged containers, host namespaces, host control sockets, remote/external/shared resources, unsupported executable fields and unsafe archive metadata are refused. External routing and automation attached to application labels are not reproduced.
+Ordinary named volumes, local data/configuration binds, file configs/secrets and resolved environment are included. Persistent application state must be in these mounts. Changes made only in a container writable layer are not captured. Privileged containers, host namespaces, host control sockets, remote/external/shared resources, unsupported executable fields and unsafe archive metadata are refused. External routing and automation attached to application labels are not reproduced.
 
 ## 3 Connect storage securely
 
