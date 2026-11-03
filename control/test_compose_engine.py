@@ -1199,6 +1199,30 @@ class EngineTests(unittest.TestCase):
         self.assertTrue((directory / "bundle.tar").exists());self.assertTrue((directory / "images.tar").exists())
         self.assertNotIn("payloadCleanup", read(kept / (fixture["journal"]["id"] + ".json")))
 
+    def test_restore_reconcile_validates_canonical_directory_before_any_foreign_read_or_native_check(self):
+        for bad in ("foreign", "integer", "null", "object", "symlink"):
+            fixture = self.cleanup_fixture(restore=True);journal = fixture["journal"];directory = fixture["directory"]
+            foreign = self.root / uid();foreign.mkdir();(foreign / "sentinel").write_bytes(b"foreign protected")
+            if bad == "foreign":value = str(foreign)
+            elif bad == "integer":value = 42
+            elif bad == "null":value = None
+            elif bad == "object":value = {"path": str(foreign)}
+            else:
+                link = self.root / uid();link.symlink_to(foreign, target_is_directory=True);value = str(link)
+            record = fixture["record"] | {"directory": value};atomic(self.engine._restore_path(journal["id"]), record)
+            before = {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()};original_read = engine.read
+            def guarded_read(path, *args, **kwargs):
+                target = Path(path)
+                if target.parent == foreign or (bad == "symlink" and target.parent == link):raise AssertionError("foreign manifest read")
+                return original_read(path, *args, **kwargs)
+            with self.cleanup_native(fixture), mock.patch.object(engine, "read", side_effect=guarded_read), mock.patch.object(self.engine, "_runtime_checks") as runtime, mock.patch.object(self.engine, "_terminate_helpers") as helpers, mock.patch.object(self.engine, "_check_other_writers") as writers, mock.patch.object(self.engine, "_compose") as start, mock.patch.object(self.engine.storage, "run") as backend:
+                result = self.engine.reconcile({"id": journal["id"]})
+            self.assertEqual(result["status"], "outcome_unknown");self.assertEqual(result["error"], "payload_cleanup_unverified")
+            for effect in (runtime, helpers, writers, start, backend):effect.assert_not_called()
+            self.assertEqual(before, {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()})
+            self.assertEqual((foreign / "sentinel").read_bytes(), b"foreign protected")
+            self.assertNotIn("payloadCleanup", read(self.engine._journal_path(journal["id"])))
+
     def test_cleanup_parent_sync_failure_keeps_pending_intent_and_retry_is_idempotent(self):
         fixture = self.cleanup_fixture();journal = fixture["journal"];real = engine.os.fsync;calls = []
         def sync(fd):
