@@ -40,7 +40,7 @@ The enrolled hosts retain decrypted credentials and locally staged application d
 
 After storage connects, continue setup. The panel imports the selected project, creates a backup, restores that exact point on the other host, applies the service's actual timer and asks the controller to confirm readiness with the restore operation ID. Each job must succeed. A failed or unknown job cannot complete this sequence.
 
-An optional HTTP health rule identifies a Compose service, internal port, relative path and expected status. Docker healthchecks are also supported. Without an application health check the service remains unverified; container startup alone does not give full readiness. These checks do not certify arbitrary database business correctness.
+An optional HTTP health rule identifies a Compose service, internal port, relative path and expected status. For full readiness, configure this HTTP rule or provide a passing Docker healthcheck on every service container. All configured Docker healthchecks must pass. Without application health proof the service remains unverified; container startup alone does not give full readiness. These checks do not certify arbitrary database business correctness.
 
 ## 5 Daily operations and controlled move
 
