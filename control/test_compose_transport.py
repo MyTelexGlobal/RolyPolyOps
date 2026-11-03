@@ -564,5 +564,247 @@ raise SystemExit(w.run(request,Control(),pathlib.Path('/credentials')))
                 worker.descriptor_kind(0)
 
 
+class MarkerAuthorityTests(unittest.TestCase):
+    setUp = LifecycleTests.setUp
+    intent = LifecycleTests.intent
+    unit = LifecycleTests.unit
+
+    @contextlib.contextmanager
+    def account_boundary(self, *, marker=None, uid=1001, gid=1001, faults=None, default_inaccessible=False):
+        name = self.identity["user"]
+        value = marker if marker is not None else {"user": name, "uid": uid, "gid": gid}
+        user = types.SimpleNamespace(pw_name=name, pw_uid=uid, pw_gid=gid, pw_shell="/usr/sbin/nologin")
+        group = types.SimpleNamespace(gr_name=name, gr_gid=gid, gr_mem=[])
+        seen = []
+        def lstat(path):
+            raw = str(path)
+            seen.append(raw)
+            if default_inaccessible and raw in {str(transport.ACCOUNT_MARKER), str(transport.ACCOUNT_MARKER.parent)}:
+                raise PermissionError()
+            if faults and raw in faults:
+                fault = faults[raw]
+                if isinstance(fault, BaseException):
+                    raise fault
+                return fault
+            return types.SimpleNamespace(st_uid=0, st_mode=(stat.S_IFREG | 0o600) if raw.endswith(".json") else (stat.S_IFDIR | 0o755))
+        with mock.patch.object(transport.Path, "lstat", lstat), mock.patch.object(transport, "read_json", return_value=value) as read, mock.patch.object(transport.pwd, "getpwnam", return_value=user), mock.patch.object(transport.pwd, "getpwall", return_value=[user]), mock.patch.object(transport.grp, "getgrgid", return_value=group), mock.patch.object(transport.grp, "getgrall", return_value=[group]):
+            yield seen, read
+
+    def put_pin(self, value):
+        path = self.root / "transport-settings.json"
+        path.write_text(json.dumps(value))
+        return path
+
+    @staticmethod
+    def read_state(path):
+        return json.loads(Path(path).read_bytes())
+
+    def test_marker_path_syntax_and_types_fail_before_probe_effects(self):
+        valid = "/etc/isolated-instance/storage-worker.json"
+        self.assertEqual(transport.validate_marker_path(valid), valid)
+        self.assertEqual(transport.validate_marker_path(), str(transport.ACCOUNT_MARKER))
+        for path in (True, 0, [], {}, Path(valid), "", "relative.json", "https://host/marker.json", "file:///etc/marker.json", "$MARKER", "/etc/../marker.json", "/etc/./marker.json", "/etc//marker.json", "//etc/marker.json", "/etc/marker.json/", "/etc/a\x00.json", "/etc/a\n.json", "/etc/a\x85.json", "/etc/" + "x" * 4096):
+            with self.subTest(path=repr(path)), mock.patch.object(transport, "prerequisites") as prerequisites, mock.patch.object(transport, "account") as account, mock.patch.object(transport.subprocess, "Popen") as launch:
+                with self.assertRaisesRegex(transport.TransportError, "network_isolation_unavailable"):
+                    transport.probe_runtime(marker_path=path)
+                prerequisites.assert_not_called(); account.assert_not_called(); launch.assert_not_called()
+
+    def test_default_marker_compatibility_and_all_parents_verified(self):
+        with self.account_boundary() as (seen, read):
+            self.assertEqual(transport.account(self.identity["user"]), self.identity)
+        self.assertEqual(seen, [str(path) for path in reversed(transport.ACCOUNT_MARKER.parents)] + [str(transport.ACCOUNT_MARKER)])
+        read.assert_called_once_with(transport.ACCOUNT_MARKER)
+
+    def test_custom_authority_never_reads_inaccessible_default(self):
+        for marker in ("/etc/isolated-one/storage-worker.json", "/etc/isolated-two/storage-worker.json"):
+            with self.account_boundary(default_inaccessible=True) as (seen, read):
+                self.assertEqual(transport.account(self.identity["user"], marker_path=marker), self.identity)
+            self.assertNotIn(str(transport.ACCOUNT_MARKER), seen)
+            self.assertNotIn(str(transport.ACCOUNT_MARKER.parent), seen)
+            read.assert_called_once_with(Path(marker))
+        with self.account_boundary(default_inaccessible=True):
+            with self.assertRaises(transport.TransportError):
+                transport.account(self.identity["user"])
+
+    def test_marker_missing_foreign_writable_and_symlink_chain_fail_closed(self):
+        marker = "/etc/isolated/storage-worker.json"
+        faults = [
+            {marker: FileNotFoundError()},
+            {marker: types.SimpleNamespace(st_uid=1001, st_mode=stat.S_IFREG | 0o600)},
+            {marker: types.SimpleNamespace(st_uid=0, st_mode=stat.S_IFREG | 0o640)},
+            {marker: types.SimpleNamespace(st_uid=0, st_mode=stat.S_IFLNK | 0o600)},
+            {"/etc/isolated": types.SimpleNamespace(st_uid=0, st_mode=stat.S_IFDIR | 0o777)},
+            {"/etc/isolated": types.SimpleNamespace(st_uid=1001, st_mode=stat.S_IFDIR | 0o755)},
+            {"/etc/isolated": types.SimpleNamespace(st_uid=0, st_mode=stat.S_IFLNK | 0o755)},
+            {"/etc": types.SimpleNamespace(st_uid=0, st_mode=stat.S_IFDIR | 0o775)},
+        ]
+        for fault in faults:
+            with self.subTest(fault=fault), self.account_boundary(faults=fault) as (_, read), mock.patch.object(transport.subprocess, "Popen") as launch:
+                with self.assertRaisesRegex(transport.TransportError, "network_isolation_unavailable"):
+                    transport.account(self.identity["user"], marker_path=marker)
+                read.assert_not_called(); launch.assert_not_called()
+
+    def test_marker_identity_rejects_boolean_ids_even_for_native_uid_gid_one(self):
+        exact = {"user": self.identity["user"], "uid": 1, "gid": 1}
+        with self.account_boundary(marker=exact, uid=1, gid=1):
+            self.assertEqual(transport.account(self.identity["user"]), exact)
+        for changed in (exact | {"uid": True}, exact | {"gid": True}, exact | {"uid": "1"}, exact | {"gid": 1.0}, exact | {"user": True}, exact | {"extra": 1}, [exact]):
+            with self.subTest(marker=changed), self.account_boundary(marker=changed, uid=1, gid=1), self.assertRaises(transport.TransportError):
+                transport.account(self.identity["user"])
+
+    def test_custom_pin_persists_for_timer_and_rejects_caller_authority_change(self):
+        marker = "/etc/isolated/storage-worker.json"
+        runner = transport.StorageTransport(self.root, self.identity["user"], marker_path=marker)
+        with mock.patch.object(transport, "trusted"), mock.patch.object(transport, "read_json", side_effect=self.read_state), mock.patch.object(transport, "account", return_value=self.identity) as account:
+            self.assertEqual(runner.settings(), self.identity)
+            saved = self.read_state(self.root / "transport-settings.json")
+            self.assertEqual(saved, self.identity | {"markerPath": marker})
+            timer = transport.StorageTransport(self.root)
+            self.assertEqual(timer.settings(), self.identity)
+            self.assertEqual(timer._selected_marker, marker)
+            account.assert_called_with(self.identity["user"], marker_path=marker)
+            account.reset_mock()
+            for changed in (transport.StorageTransport(self.root, marker_path="/etc/another/storage-worker.json"), transport.StorageTransport(self.root, "another", marker_path=marker)):
+                with self.assertRaises(transport.TransportError):
+                    changed.settings()
+            account.assert_not_called()
+            self.assertEqual(self.read_state(self.root / "transport-settings.json"), saved)
+
+    def test_two_instances_keep_distinct_users_and_markers_without_default_fallback(self):
+        second = self.root / "second"
+        second.mkdir()
+        identities = {"first": {"user": "worker-one", "uid": 1001, "gid": 1001}, "second": {"user": "worker-two", "uid": 2001, "gid": 2001}}
+        roots = [(self.root, identities["first"], "/etc/isolated-one/storage-worker.json"), (second, identities["second"], "/etc/isolated-two/storage-worker.json")]
+        def account(name, marker_path=None):
+            self.assertIsNotNone(marker_path)
+            matches = [identity for _, identity, marker in roots if identity["user"] == name and marker_path == marker]
+            self.assertEqual(len(matches), 1)
+            return matches[0]
+        with mock.patch.object(transport, "trusted"), mock.patch.object(transport, "read_json", side_effect=self.read_state), mock.patch.object(transport, "account", side_effect=account):
+            for state, identity, marker in roots:
+                self.assertEqual(transport.StorageTransport(state, identity["user"], marker_path=marker).settings(), identity)
+                self.assertEqual(transport.StorageTransport(state).settings(), identity)
+                self.assertEqual(self.read_state(state / "transport-settings.json")["markerPath"], marker)
+
+    def test_legacy_pin_upgrade_requires_identical_verified_default_and_never_custom(self):
+        self.put_pin(self.identity)
+        with mock.patch.object(transport, "trusted"), mock.patch.object(transport, "read_json", side_effect=self.read_state), mock.patch.object(transport, "account", return_value=self.identity) as account:
+            self.assertEqual(self.runner.settings(), self.identity)
+            account.assert_called_once_with(self.identity["user"])
+        self.assertEqual(self.read_state(self.root / "transport-settings.json"), self.identity | {"markerPath": str(transport.ACCOUNT_MARKER)})
+        self.put_pin(self.identity)
+        alternate = transport.StorageTransport(self.root, marker_path="/etc/isolated/storage-worker.json")
+        with mock.patch.object(transport, "read_json", side_effect=self.read_state), mock.patch.object(transport, "account") as account, mock.patch.object(transport, "atomic") as write:
+            with self.assertRaises(transport.TransportError):
+                alternate.settings()
+            account.assert_not_called(); write.assert_not_called()
+        self.assertEqual(self.read_state(self.root / "transport-settings.json"), self.identity)
+        for failure in (transport.TransportError("network_isolation_unavailable"), self.identity | {"uid": 2001}):
+            kwargs = {"side_effect": failure} if isinstance(failure, BaseException) else {"return_value": failure}
+            with mock.patch.object(transport, "read_json", side_effect=self.read_state), mock.patch.object(transport, "account", **kwargs), mock.patch.object(transport, "atomic") as write:
+                with self.assertRaises(transport.TransportError):
+                    self.runner.settings()
+                write.assert_not_called()
+
+    def test_corrupt_pin_types_and_lost_authority_do_not_adopt_or_launch(self):
+        exact = {"user": self.identity["user"], "uid": 1, "gid": 1}
+        for saved in (exact | {"uid": True}, exact | {"gid": True}, exact | {"markerPath": None}, exact | {"markerPath": False}, exact | {"markerPath": "/etc/../marker.json"}):
+            self.put_pin(saved)
+            with mock.patch.object(transport, "read_json", side_effect=self.read_state), mock.patch.object(transport, "account") as account, mock.patch.object(transport, "atomic") as write, mock.patch.object(transport.subprocess, "Popen") as launch:
+                with self.assertRaises(transport.TransportError):
+                    self.runner.settings()
+                account.assert_not_called(); write.assert_not_called(); launch.assert_not_called()
+        (self.root / "transport-settings.json").unlink()
+        self.runner.directory.mkdir()
+        with mock.patch.object(transport, "account") as account, mock.patch.object(transport, "atomic") as write:
+            with self.assertRaises(transport.TransportError) as caught:
+                self.runner.settings()
+            self.assertTrue(caught.exception.unknown)
+            account.assert_not_called(); write.assert_not_called()
+
+    def test_recovery_uses_persisted_authority_not_changed_caller_configuration(self):
+        marker = "/etc/isolated/storage-worker.json"
+        self.put_pin(self.identity | {"markerPath": marker})
+        calls = self.runner.directory / "calls"
+        calls.mkdir(parents=True)
+        owner = "12345678-1234-4234-8234-123456789abc"
+        (self.runner.directory / "owner.json").write_text(json.dumps({"id": owner}))
+        intent = self.intent() | {"owner": owner, "nodeId": None, "state": str(self.root.resolve()), "markerPath": marker}
+        intent["marker"] = "RolyPolyOps storage " + owner + " " + intent["id"]
+        run_root = self.root / "runs"
+        intent["directory"] = str(run_root / intent["id"])
+        intent["argv"] = ["/usr/bin/python3", str(Path(intent["directory"]) / "code" / "compose_storage_worker.py")]
+        path = calls / (intent["id"] + ".json")
+        path.write_text(json.dumps(intent))
+        changed = transport.StorageTransport(self.root, "new-worker", marker_path="/etc/new-authority/storage-worker.json")
+        with mock.patch.object(transport, "RUN_ROOT", run_root), mock.patch.object(transport, "trusted"), mock.patch.object(transport, "read_json", side_effect=self.read_state), mock.patch.object(transport, "account", return_value=self.identity) as account, mock.patch.object(transport.Path, "read_text", return_value="boot"), mock.patch.object(transport, "systemctl", side_effect=[self.unit(intent), None]), mock.patch.object(transport.subprocess, "run", return_value=mock.Mock(returncode=0)) as stop, mock.patch.object(transport, "cgroup_empty", return_value=True):
+            self.assertEqual(changed.recover(), [intent["id"]])
+            account.assert_called_with(self.identity["user"], marker_path=marker)
+            stop.assert_called_once()
+            account.reset_mock()
+            with self.assertRaises(transport.TransportError):
+                changed.settings()
+            account.assert_not_called()
+        self.assertFalse(path.exists())
+
+    def test_marker_loss_or_tamper_during_recovery_does_not_kill_or_create_writer(self):
+        marker = "/etc/isolated/storage-worker.json"
+        self.put_pin(self.identity | {"markerPath": marker})
+        (self.runner.directory / "calls").mkdir(parents=True)
+        for cause in ("missing", "symlink", "writable", "changed-identity"):
+            with self.subTest(cause=cause), mock.patch.object(transport, "read_json", side_effect=self.read_state), mock.patch.object(transport, "account", side_effect=transport.TransportError("network_isolation_unavailable")), mock.patch.object(transport, "systemctl") as inspect, mock.patch.object(transport.subprocess, "run") as stop, mock.patch.object(transport.subprocess, "Popen") as launch:
+                with self.assertRaisesRegex(transport.TransportError, "transport_cleanup_unverified") as caught:
+                    self.runner.recover()
+                self.assertTrue(caught.exception.unknown)
+                inspect.assert_not_called(); stop.assert_not_called(); launch.assert_not_called()
+
+    def test_new_intent_records_the_persisted_marker_for_timer_recovery(self):
+        marker = "/etc/isolated/storage-worker.json"
+        self.put_pin(self.identity | {"markerPath": marker})
+        run_root = self.root / "runs"
+        with mock.patch.object(transport, "RUN_ROOT", run_root), mock.patch.object(transport, "trusted"), mock.patch.object(transport, "read_json", side_effect=self.read_state), mock.patch.object(transport, "account", return_value=self.identity), mock.patch.object(transport, "read_owned", side_effect=lambda path, maximum: Path(path).read_bytes()), mock.patch.object(transport.os, "chown"), mock.patch.object(transport, "pid_birth", return_value="born"), mock.patch.object(transport.Path, "read_text", return_value="boot"), mock.patch.object(transport.subprocess, "Popen") as launch:
+            self.assertEqual(self.runner.settings(), self.identity)
+            intent, path = self.runner._prepare(timeout=3, parent=None, identity=self.identity, action="probe")
+            self.assertEqual(intent["markerPath"], marker)
+            self.assertEqual(self.read_state(path)["markerPath"], marker)
+            self.assertEqual(intent["account"], self.identity)
+            launch.assert_not_called()
+
+    def test_changed_persisted_marker_cannot_authorize_an_old_intent_kill(self):
+        old_marker, new_marker = "/etc/old/storage-worker.json", "/etc/new/storage-worker.json"
+        self.put_pin(self.identity | {"markerPath": new_marker})
+        calls = self.runner.directory / "calls"
+        calls.mkdir(parents=True)
+        owner = "12345678-1234-4234-8234-123456789abc"
+        (self.runner.directory / "owner.json").write_text(json.dumps({"id": owner}))
+        intent = self.intent() | {"owner": owner, "nodeId": None, "state": str(self.root.resolve()), "markerPath": old_marker}
+        intent["marker"] = "RolyPolyOps storage " + owner + " " + intent["id"]
+        run_root = self.root / "runs"
+        intent["directory"] = str(run_root / intent["id"])
+        intent["argv"] = ["/usr/bin/python3", str(Path(intent["directory"]) / "code" / "compose_storage_worker.py")]
+        path = calls / (intent["id"] + ".json")
+        path.write_text(json.dumps(intent))
+        with mock.patch.object(transport, "RUN_ROOT", run_root), mock.patch.object(transport, "trusted"), mock.patch.object(transport, "read_json", side_effect=self.read_state), mock.patch.object(transport, "account", return_value=self.identity), mock.patch.object(transport, "systemctl") as inspect, mock.patch.object(transport.subprocess, "run") as stop, mock.patch.object(transport.subprocess, "Popen") as launch:
+            with self.assertRaisesRegex(transport.TransportError, "transport_cleanup_unverified") as caught:
+                self.runner.recover()
+            self.assertTrue(caught.exception.unknown)
+            inspect.assert_not_called(); stop.assert_not_called(); launch.assert_not_called()
+        self.assertTrue(path.exists())
+        self.assertEqual(self.read_state(path)["markerPath"], old_marker)
+
+    def test_probe_extension_keeps_default_call_and_passes_only_explicit_marker(self):
+        for marker in (None, "/etc/isolated/storage-worker.json"):
+            run_root = self.root / ("run-default" if marker is None else "run-custom")
+            with mock.patch.object(transport, "RUN_ROOT", run_root), mock.patch.object(transport, "trusted"), mock.patch.object(transport, "prerequisites"), mock.patch.object(transport, "account", return_value=self.identity) as account, mock.patch.object(transport, "StorageTransport") as runner:
+                self.assertTrue(transport.probe_runtime(timeout=3, marker_path=marker)["ready"])
+                if marker is None:
+                    account.assert_called_once_with(transport.DEFAULT_WORKER_USER)
+                else:
+                    account.assert_called_once_with(transport.DEFAULT_WORKER_USER, marker_path=marker)
+                self.assertEqual(runner.call_args.kwargs["marker_path"], marker or str(transport.ACCOUNT_MARKER))
+                runner.return_value._execute.assert_called_once_with({}, ["version"], timeout=3, probe=True, standalone=True)
+                self.assertEqual(list(run_root.iterdir()), [])
+
+
 if __name__ == "__main__":
     unittest.main()

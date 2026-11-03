@@ -143,7 +143,7 @@ class ManagedEngine:
         for name in ("operations", "services", "restores", "stages"):
             (self.state / name).mkdir(mode=0o700, exist_ok=True)
         self.sealer = Sealer(self.state, self.node_id)
-        self.storage = StorageManager(self.state, self.sealer, worker_user=config.get("storageWorkerUser"))
+        self.storage = StorageManager(self.state, self.sealer, worker_user=config.get("storageWorkerUser"), marker_path=config.get("storageWorkerMarker"))
         self.current = None
         self._local = threading.local()
 
