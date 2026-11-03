@@ -11,3 +11,4 @@
 | References | [References](en/references.md) | [Источники](ru/references.md) |
 | Recovery lab | [Lab](../demo/README.md) | [Стенд](../demo/README.ru.md) |
 | Control panel | [Control](../control/README.md) | [Управление](../control/README.ru.md) |
+| Own Compose services | [Setup and operations](en/compose-services.md) | [Подключение и работа](ru/compose-services.md) |

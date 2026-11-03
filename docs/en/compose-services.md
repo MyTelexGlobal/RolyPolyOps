@@ -6,7 +6,7 @@ This guide describes the 0.2 implementation candidate. A completed browser wizar
 
 ## 1 Prepare hosts
 
-Enroll two different Linux Docker hosts through **Servers** using the existing one-time installation command. That is the privileged installation step. Afterwards the own-service wizard uses the panel and enrolled host services; it does not require application-specific shell commands or hand-edited configuration files.
+Install the panel and prepare the complete root-owned release directory on each host using the [installation guide](../../control/README.md). Enroll two different Linux Docker hosts through **Servers** using the one-time commands. Wait until both report fresh **Compose ready** status before opening service setup. Afterwards the own-service wizard uses the panel and enrolled host services; it does not require application-specific shell commands or hand-edited configuration files.
 
 The baseline is rootful Linux Docker 29+, Compose 2.24+ with canonical JSON, Python 3.11+, native restic 0.16+, systemd 252+, cgroup v2, cryptography 41+ and PyYAML 6+ on hosts. The controller uses the Python standard library. The installer creates the exclusive nonlogin account `rolypolyops-storage` and runs an isolation probe before consuming enrollment or replacing installed code. A missing prerequisite stops installation. Storage work has no host-network fallback; its worker uses system Python and the standard library. Read the [behavior contract](../../control/contracts/compose-v2.md) for the exact supported model.
 
@@ -26,11 +26,15 @@ When an existing repository has fresh matching connected bindings on both select
 
 Choose a new or existing repository. Supported kinds are certificate-validated public HTTPS REST and S3-compatible storage. Supply the REST login/password or S3 access key/secret and optional session token. Enter a separate restic encryption password, or generate a random one. Attach requires the existing repository's exact endpoint, namespace and password.
 
+For REST, enter the HTTPS repository URL without a `rest:` prefix. Create treats that URL as the base for the new dedicated namespace; attach uses the exact existing repository URL. For S3, enter the HTTPS origin without a bucket path or `s3:` prefix, then provide the bucket, relative prefix and region in their separate fields. The bucket must already exist. Both hosts must reach the same endpoint using public addresses and valid TLS. Private endpoints and provider redirects to another hostname or region are unsupported.
+
 Create reserves a namespace containing the storage UUID beneath the supplied REST base URL or S3 prefix. The panel displays the finalized metadata before confirmation. Check that exact destination. Creation requires positive proof that this dedicated namespace is empty. Authentication, TLS, bucket or listing errors cannot authorize initialization. No existing objects are reset, forgotten or pruned.
 
 The browser receives a short-lived request, node public keys and binding generations. WebCrypto encrypts credentials and the repository password separately for each recipient using RSA-3072/OAEP-SHA256 and AES-256-GCM. Only sealed envelopes and public metadata are sent to the controller. The source binding completes before the recipient attaches to its verified repository identity.
 
 Download the private recovery kit after the final namespace is displayed. It contains plaintext secrets for your local custody: store it securely and do not send it to the panel or post it publicly. Form secrets stay in memory, are cleared on completion/sign-out, and are not put in browser persistent storage. Closing or reloading the page loses the form secrets; durable jobs and service observations remain in the catalog.
+
+The enrolled hosts retain decrypted credentials and locally staged application data under root-only access. Repository encryption does not encrypt all host state. Protect those directories and their backups; see [secret storage](security.md#2-current-secret-storage). The kit contains repository credentials, not the control administrator password or catalog.
 
 ## 4 Complete the first recovery
 

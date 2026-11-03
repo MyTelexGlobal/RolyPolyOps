@@ -4,7 +4,11 @@
 
 ## 1 Current availability
 
-No installable backup or recovery service is available in this repository yet. The following sequences define intended operating behavior. They are not commands to execute against live servers.
+The 0.2.0 candidate includes an installable control panel and host services for supported Compose projects. Follow the [installation guide](../../control/README.md), then the [Compose service guide](compose-services.md) for backup, exact isolated restore and controlled move.
+
+A controlled move requires the source to be reachable and stopped before target activation. Public routing and DNS are configured separately. Automatic failover from an offline source, zero downtime and automatic controller replacement are unavailable. The previous source data remains stopped and retained.
+
+The sequences below describe operating requirements for the wider target profiles. Database replication, Patroni/etcd and automatic rejoin are planned integrations; their behavior must not be inferred from the current Compose workflow.
 
 ## 2 Recovery sequence
 
