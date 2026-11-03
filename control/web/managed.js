@@ -56,7 +56,7 @@ export function createManagedUI(ctx) {
     // Keep the exact request identity after an uncertain HTTP response. No new effect on retry.
     const signature=path+'\n'+canonical(body);
     let request=pending.get(signature);
-    if (!request) {request={...body,expectedRevision:rev(),idempotencyKey:crypto.randomUUID()};pending.set(signature,request);}
+    if (!request) {request={...body,...(path==='/api/jobs'?{}:{expectedRevision:rev()}),idempotencyKey:crypto.randomUUID()};pending.set(signature,request);}
     try {
       const result=await api(path,request);pending.delete(signature);
       if (result.revision !== undefined) state.overview.revision=result.revision;
