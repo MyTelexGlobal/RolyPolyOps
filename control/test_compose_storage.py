@@ -28,6 +28,10 @@ class StorageTests(unittest.TestCase):
         self.sid, self.node = uid(), uid()
         self.metadata = {"id": self.sid, "name": "Dedicated storage", "kind": "rest", "endpoint": "https://storage.example/" + self.sid}
         self.manager = storage.StorageManager(self.temp.name, Sealer(self.temp.name, self.node))
+        # Domain regressions replace only the independently tested runtime prerequisite boundary.
+        self.preflight = mock.patch.object(self.manager, "preflight", return_value=None)
+        self.preflight.start()
+        self.addCleanup(self.preflight.stop)
 
     def sealed(self, **kwargs):
         try:
@@ -201,9 +205,61 @@ class StorageTests(unittest.TestCase):
             with self.assertRaisesRegex(storage.StorageError, "repository_identity_mismatch"):
                 self.manager.configure(uid(), {"storageId": self.sid, "metadata": self.metadata, "mode": "attach", "envelope": sealed, "expectedRepositoryId": "a" * 64})
         empty.assert_not_called()
-        with mock.patch.object(storage.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=b"{}")) as run:
+        with mock.patch.object(self.manager.transport, "execute", return_value=b"{}") as run:
             self.manager._run({"RESTIC_PASSWORD_FILE": "private-file"}, ["cat", "config"])
         self.assertNotIn("sentinel", repr(run.call_args.args))
+        self.assertEqual(run.call_args.args[1], ["cat", "config"])
+
+    def test_prerequisite_failure_precedes_password_and_generation_acceptance(self):
+        self.preflight.stop()
+        params = {"storageId": self.sid, "metadata": self.metadata, "mode": "create", "envelope": self.sealed()}
+        with mock.patch.object(self.manager.transport, "preflight", side_effect=storage.TransportError("network_isolation_unavailable")), mock.patch.object(self.manager, "_password") as password, mock.patch.object(self.manager, "session") as session:
+            with self.assertRaisesRegex(storage.StorageError, "network_isolation_unavailable"):
+                self.manager.configure(uid(), params)
+        password.assert_not_called(); session.assert_not_called()
+        self.assertFalse((self.manager.directory / (self.sid + ".json")).exists())
+
+    def test_all_native_verbs_use_isolated_adapter_and_propagate_cleanup_hold(self):
+        binding = {"metadata": self.metadata, "credentials": {"username": "u", "password": "synthetic"}}
+        calls = [["init", "--repository-version", "2"], ["cat", "config"], ["backup", "--stdin"], ["snapshots", "--json"], ["dump", "a" * 64, "/bundle.tar"], ["check", "--read-data"]]
+        with mock.patch.object(self.manager.transport, "execute", return_value=b"{}") as execute:
+            for args in calls:
+                self.assertEqual(self.manager.run(binding, args), b"{}")
+        self.assertEqual([value.args[1] for value in execute.call_args_list], calls)
+        for call in execute.call_args_list:
+            self.assertNotIn("HTTPS_PROXY", call.args[0])
+            self.assertNotIn("NO_PROXY", call.args[0])
+        with mock.patch.object(self.manager.transport, "execute", side_effect=storage.TransportError("transport_cleanup_unverified", True)):
+            with self.assertRaises(storage.StorageError) as caught:
+                self.manager.run(binding, ["cat", "config"])
+            self.assertTrue(caught.exception.unknown)
+
+    def test_python_listing_uses_explicit_unix_connection_and_never_redirects(self):
+        proxy = mock.Mock()
+        connection = proxy.connection.return_value
+        connection.getresponse.return_value = mock.Mock(status=302)
+        with self.assertRaisesRegex(storage.StorageError, "storage_listing_failed"):
+            storage._request("https://storage.example/path", {}, proxy)
+        proxy.connection.assert_called_once_with("storage.example", 443)
+        connection.request.assert_called_once_with("GET", "/path", headers={})
+        connection.close.assert_called_once()
+
+    def test_xml_declarations_are_rejected_before_parser_including_hidden_encoding(self):
+        metadata = {"id": self.sid, "name": "S3", "kind": "s3", "endpoint": "https://storage.example", "bucket": "bucket", "prefix": "prefix"}
+        for raw in (b'<!DOCTYPE x [<!ENTITY y "expanded">]><ListBucketResult/>', b'<!doctype x><ListBucketResult/>', b'<!ENTITY x "y"><ListBucketResult/>', '<!DOCTYPE x><ListBucketResult/>'.encode("utf-16")):
+            with self.subTest(raw=raw), mock.patch.object(storage, "_request", return_value=raw), mock.patch.object(storage.ET, "fromstring") as parse:
+                with self.assertRaisesRegex(storage.StorageError, "storage_listing_incomplete"):
+                    storage.prove_empty(metadata, {"accessKeyId": "key", "secretAccessKey": "secret"}, "proxy")
+                parse.assert_not_called()
+
+    def test_s3_signing_plus_space_percent_known_canonical_vectors(self):
+        moment = storage.dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=storage.dt.timezone.utc)
+        vectors = [("list-type=2&prefix=space%20value%2F&continuation-token=a%2Bb", "a9bd7a163057f7fae7e5a9db44502ec76fd3d9c120ce5e84843100462840ce82"),
+                   ("prefix=percent%25value%2F&list-type=2&continuation-token=a+b", "09d513dbb5b4e31f1a3931249bffa62fcddb0f1a66be453e5dcb1c12dafd0772")]
+        for query, signature in vectors:
+            headers = storage._s3_headers("https://storage.example/bucket?" + query, {"accessKeyId": "key", "secretAccessKey": "secret"}, "us-east-1", moment)
+            self.assertTrue(headers["authorization"].endswith("Signature=" + signature))
+
 
 
 if __name__ == "__main__":
