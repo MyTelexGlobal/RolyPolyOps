@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import tarfile
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 import uuid
@@ -268,12 +270,105 @@ class EngineTests(unittest.TestCase):
         docker.assert_not_called()
 
     def test_shared_flock_busy_has_no_effect_and_is_not_unknown(self):
-        with self.engine.lock():
+        with self.engine.lock(), mock.patch.object(engine, "COMMAND_LOCK_WAIT_SECONDS", 0.05):
             with self.assertRaises(engine.EngineError) as caught:
                 self.engine.execute(self.job())
         self.assertEqual(caught.exception.code, "operation_busy")
         self.assertFalse(caught.exception.unknown)
         self.assertEqual(list((self.engine.state / "operations").glob("*.json")), [])
+
+    def command_job(self):
+        return self.job("compose-register", {"serviceId": self.sid, "projectId": "ordinary", "fingerprint": "a" * 64, "storageId": self.storage, "backupInterval": "hourly", "exclusiveWriters": True})
+
+    def command_thread(self, job):
+        entered, done = threading.Event(), threading.Event();outcome = {}
+        def execute():
+            entered.set()
+            try:outcome["result"] = self.engine.execute(job)
+            except BaseException as error:outcome["error"] = error
+            finally:outcome["lockedAfter"] = getattr(self.engine._local, "engine_locked", False);done.set()
+        thread = threading.Thread(target=execute, daemon=True);thread.start()
+        self.assertTrue(entered.wait(1));self.addCleanup(thread.join, 2)
+        return thread, done, outcome
+
+    def test_new_command_waits_for_real_flock_without_preaccept_effects(self):
+        job = self.command_job();result = {"registered": True}
+        with mock.patch.object(self.engine.storage, "recover") as recovery, mock.patch.object(self.engine, "_register", return_value=result) as action:
+            with self.engine.lock():
+                thread, done, outcome = self.command_thread(job)
+                self.assertFalse(done.wait(.08));recovery.assert_not_called();action.assert_not_called()
+                self.assertEqual(list((self.engine.state / "operations").glob("*.json")), []);self.assertIsNone(self.engine.current)
+            self.assertTrue(done.wait(2));thread.join(1)
+        self.assertEqual(outcome["result"], result);self.assertFalse(outcome["lockedAfter"]);self.assertEqual(action.call_count, 1)
+        self.assertEqual(read(self.engine._journal_path(job["id"]))["status"], "succeeded")
+
+    def test_command_wait_timeout_has_no_journal_native_or_delayed_action(self):
+        job = self.command_job()
+        with mock.patch.object(engine, "COMMAND_LOCK_WAIT_SECONDS", .1), mock.patch.object(self.engine.storage, "recover") as recovery, mock.patch.object(self.engine, "_register") as action, mock.patch.object(self.engine, "docker") as docker:
+            with self.engine.lock():
+                thread, done, outcome = self.command_thread(job)
+                self.assertTrue(done.wait(2));thread.join(1)
+                self.assertEqual(outcome["error"].code, "operation_busy");self.assertFalse(outcome["error"].unknown);self.assertFalse(outcome["lockedAfter"])
+                self.assertEqual(list((self.engine.state / "operations").glob("*.json")), [])
+            time.sleep(.08)
+            for effect in (recovery, action, docker):effect.assert_not_called()
+        self.assertIsNone(self.engine.current)
+
+    def test_command_cannot_be_accepted_when_release_occurs_after_wait_deadline(self):
+        sleeping, resume = threading.Event(), threading.Event();self.addCleanup(resume.set)
+        def delay(value):
+            self.assertLessEqual(value, .05);sleeping.set();self.assertTrue(resume.wait(2))
+        with mock.patch.object(engine, "COMMAND_LOCK_WAIT_SECONDS", .05), mock.patch.object(engine.time, "sleep", side_effect=delay), mock.patch.object(self.engine.storage, "recover") as recovery, mock.patch.object(self.engine, "_register") as action:
+            with self.engine.lock():
+                thread, done, outcome = self.command_thread(self.command_job());self.assertTrue(sleeping.wait(1))
+                threading.Event().wait(.08)
+            resume.set();self.assertTrue(done.wait(2));thread.join(1)
+        self.assertEqual(outcome["error"].code, "operation_busy");self.assertFalse(outcome["error"].unknown)
+        recovery.assert_not_called();action.assert_not_called();self.assertEqual(list((self.engine.state / "operations").glob("*.json")), [])
+
+    def test_existing_journal_timer_inspection_and_observation_remain_nonblocking(self):
+        self.engine._local.addresses_partial = False
+        job = self.command_job();atomic(self.engine._journal_path(job["id"]), {"id": job["id"], "action": job["action"], "status": "succeeded", "requestDigest": hashlib.sha256(helper.canonical(job)).hexdigest(), "result": {"registered": True}})
+        with self.engine.lock(), mock.patch.object(engine.time, "sleep", side_effect=AssertionError("nonblocking caller waited")), mock.patch.object(self.engine.storage, "recover") as recovery, mock.patch.object(self.engine, "_register") as action, mock.patch.object(self.engine, "_observe_addresses", return_value=[]), mock.patch.object(self.engine.sealer, "public", return_value={"id": "fixture"}), mock.patch.object(self.engine, "_containers", return_value=[]), mock.patch.object(self.engine.storage, "preflight") as probe:
+            with self.assertRaisesRegex(engine.EngineError, "operation_busy"):self.engine.execute(job)
+            self.engine.config["origin"] = "timer"
+            with self.assertRaisesRegex(engine.EngineError, "operation_busy"):self.engine.execute(self.command_job())
+            with self.assertRaisesRegex(engine.EngineError, "operation_busy"):self.engine.inspect_operation(job["id"])
+            self.assertEqual(self.engine.recover(), []);self.engine.observe()
+            for effect in (recovery, action, probe):effect.assert_not_called()
+
+    def test_journal_appearing_during_wait_is_authoritative_without_action_replay(self):
+        job = self.command_job();result = {"registered": True}
+        with mock.patch.object(self.engine.storage, "recover"), mock.patch.object(self.engine, "_register") as action:
+            with self.engine.lock():
+                thread, done, outcome = self.command_thread(job);self.assertFalse(done.wait(.08))
+                atomic(self.engine._journal_path(job["id"]), {"id": job["id"], "action": job["action"], "parameters": job["parameters"], "requestDigest": hashlib.sha256(helper.canonical(job)).hexdigest(), "status": "succeeded", "result": result})
+            self.assertTrue(done.wait(2));thread.join(1)
+        self.assertEqual(outcome["result"], result);action.assert_not_called()
+
+    def test_two_waiting_commands_accept_one_operation_and_reuse_its_journal(self):
+        job = self.command_job();result = {"registered": True};started = threading.Event();release = threading.Event()
+        self.addCleanup(release.set)
+        def action(params):started.set();self.assertTrue(release.wait(2));return result
+        with mock.patch.object(self.engine.storage, "recover"), mock.patch.object(self.engine, "_register", side_effect=action) as execute:
+            with self.engine.lock():
+                first, done1, out1 = self.command_thread(job);second, done2, out2 = self.command_thread(job)
+                self.assertFalse(done1.wait(.08));self.assertFalse(done2.is_set())
+            self.assertTrue(started.wait(1));release.set()
+            self.assertTrue(done1.wait(2));self.assertTrue(done2.wait(2));first.join(1);second.join(1)
+        self.assertEqual(out1["result"], result);self.assertEqual(out2["result"], result);self.assertEqual(execute.call_count, 1)
+        self.assertFalse(out1["lockedAfter"]);self.assertFalse(out2["lockedAfter"])
+
+    def test_private_lock_wait_is_finite_bounded_and_timeout_preserves_another_current_operation(self):
+        for value in (True, -1, 31, float("nan"), float("inf"), "30"):
+            with self.assertRaisesRegex(engine.EngineError, "invalid_lock_wait"):
+                with self.engine.lock(wait_seconds=value):self.fail("invalid wait accepted")
+        marker = {"id": uid(), "status": "running"};self.engine.current = marker
+        with self.engine.lock(), mock.patch.object(engine, "COMMAND_LOCK_WAIT_SECONDS", .05):
+            thread, done, outcome = self.command_thread(self.command_job());self.assertTrue(done.wait(2));thread.join(1)
+        self.assertEqual(outcome["error"].code, "operation_busy");self.assertIs(self.engine.current, marker)
+        self.assertEqual(list((self.engine.state / "operations").glob("*.json")), [])
+        self.engine.current = None
 
     def test_duplicate_execution_and_reconciliation_never_replay(self):
         job = self.job("compose-register", {"serviceId": self.sid, "projectId": "ordinary", "fingerprint": "a" * 64, "storageId": self.storage, "backupInterval": "hourly", "exclusiveWriters": True})

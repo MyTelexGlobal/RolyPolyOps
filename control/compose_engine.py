@@ -36,6 +36,7 @@ HEX = re.compile(r"^[a-f0-9]{64}$")
 NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
 INTERVALS = {"15min": "*-*-* *:00/15:00 UTC", "hourly": "hourly", "daily": "daily"}
 DOCKER = ["docker", "--host", "unix:///var/run/docker.sock"]
+COMMAND_LOCK_WAIT_SECONDS = 30
 SERVICE_KEYS = {"build", "cap_drop", "command", "configs", "container_name", "depends_on", "entrypoint", "environment", "env_file", "expose", "healthcheck", "image", "init", "labels", "logging", "networks", "ports", "read_only", "restart", "secrets", "security_opt", "stdin_open", "stop_grace_period", "stop_signal", "tty", "user", "group_add", "volumes", "working_dir", "cpu_shares", "cpus", "mem_limit", "mem_reservation", "pids_limit", "ulimits", "deploy", "profiles", "pull_policy", "attach"}
 
 
@@ -148,14 +149,28 @@ class ManagedEngine:
         self._local = threading.local()
 
     @contextlib.contextmanager
-    def lock(self):
+    def lock(self, *, wait_seconds=0):
+        if type(wait_seconds) not in {int, float} or not 0 <= wait_seconds <= COMMAND_LOCK_WAIT_SECONDS:
+            raise EngineError("invalid_lock_wait")
         fd = os.open(self.state / "engine.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         acquired = False
         try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise EngineError("operation_busy") from None
+            deadline = time.monotonic() + wait_seconds
+            first = True
+            while True:
+                if not first and time.monotonic() >= deadline:
+                    raise EngineError("operation_busy")
+                first = False
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise EngineError("operation_busy") from None
+                    time.sleep(min(0.05, remaining))
+            if wait_seconds and time.monotonic() > deadline:
+                raise EngineError("operation_busy")
             acquired = True
             self._local.engine_locked = True
             yield
@@ -2741,8 +2756,10 @@ class ManagedEngine:
         validate_job(job)
         identity = job["id"]
         request_digest = hashlib.sha256(canonical(job)).hexdigest()
+        # This unlocked check selects admission policy only. Journal authority is reread under flock.
+        wait = COMMAND_LOCK_WAIT_SECONDS if self.config.get("origin") != "timer" and not os.path.lexists(self._journal_path(identity)) else 0
         try:
-            with self.lock():
+            with self.lock(wait_seconds=wait):
                 self.storage.recover()
                 previous = read(self._journal_path(identity))
                 if previous:
