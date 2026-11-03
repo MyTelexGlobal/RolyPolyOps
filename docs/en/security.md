@@ -6,7 +6,13 @@
 
 Protected assets include service data, backup history, encryption keys, provider credentials, DNS rights, and primary-role authority. The application, host service, privileged helper, control service, repository, and owner account are distinct trust boundaries.
 
-## 2 Required controls
+## 2 Current secret storage
+
+The 0.2.0 browser seals storage credentials and the repository encryption password separately to each host. The controller receives sealed envelopes and public repository metadata. Each enrolled host keeps the decrypted credentials, repository password and its own identity in root-only persistent local files. The storage worker receives the credentials needed for each operation. Resolved application configuration and staged data can also contain plaintext secrets on the host before repository encryption. These files rely on host access controls; the product does not encrypt all local state at rest.
+
+Protect the host state, staging directories and their backups as secret-bearing material. The downloaded recovery kit is plaintext and contains repository access and encryption credentials. Keep it in protected offline storage or a password manager. It does not contain the control catalog or administrator password. Repository encryption does not protect data from root on an enrolled host.
+
+## 3 Required controls
 
 | Threat | Required protection |
 |---|---|
@@ -18,9 +24,9 @@ Protected assets include service data, backup history, encryption keys, provider
 | Arbitrary command execution | Trusted service packages and restricted privileged actions |
 | Restore side effects | Isolated credentials and outbound restrictions |
 
-Secrets are referenced separately, encrypted at rest where stored, and excluded from logs and reports. External connections are authenticated and encrypted.
+The wider target profiles require separate secret references, encryption at rest and exclusion from logs and reports. External connections require authentication and encryption. These requirements do not replace the current local-storage limits above.
 
-## 3 Limits and reporting
+## 4 Limits and reporting
 
 These are security requirements, not a statement of completed implementation or audit. Full administrative compromise remains a serious residual risk. Provider fencing, retention protection, and package trust must be checked for each supported deployment.
 
