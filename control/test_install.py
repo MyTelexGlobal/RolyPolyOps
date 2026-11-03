@@ -198,6 +198,7 @@ class WorkerAccountTests(unittest.TestCase):
         def owned(value,uid=0):
             fields=list(value);fields[4]=uid;return os.stat_result(fields)
         self.stack.enter_context(patch.object(install,'CONFIG_DIR',self.config))
+        self.stack.enter_context(patch.object(install,'validate_storage_marker_parents'))
         self.stack.enter_context(patch.object(Path,'lstat',lambda path:owned(real_lstat(path)) if path==self.config else real_lstat(path)))
         self.stack.enter_context(patch.object(install.os,'fstat',side_effect=lambda fd:owned(real_fstat(fd))))
         self.stack.enter_context(patch.object(install.pwd,'getpwnam',side_effect=lambda user:self.lookup(self.accounts,user)))
@@ -221,7 +222,8 @@ class WorkerAccountTests(unittest.TestCase):
     def command(self,args):
         self.commands.append(args)
         self.assertEqual(args[0],'useradd')
-        self.add(args[-1])
+        index=len(self.accounts)
+        self.add(args[-1],uid=991+2*index,gid=992+2*index)
 
     def test_account_and_pin_creation_are_idempotent_without_other_config_changes(self):
         (self.config/'control-installation.json').write_text('control sentinel')
@@ -268,6 +270,46 @@ class WorkerAccountTests(unittest.TestCase):
             install.ensure_storage_worker('rolypolyops-storage')
         self.assertEqual(len(self.commands),1)
 
+    def test_two_scoped_markers_do_not_access_default_authority(self):
+        default=self.config/'storage-worker.json';default.write_text('default sentinel')
+        first=self.base/'instance-a'/'storage-worker.json';first.parent.mkdir()
+        second=self.base/'instance-b'/'storage-worker.json';second.parent.mkdir()
+        original=install.trusted_json;seen=[]
+        def selected(path):
+            seen.append(path)
+            if path==default:raise AssertionError('default marker accessed')
+            return original(path)
+        with patch.object(install,'trusted_json',side_effect=selected),patch.object(install,'trusted_config_directory',side_effect=AssertionError('default directory accessed')):
+            a=install.ensure_storage_worker('storage-a',marker_path=str(first))
+            b=install.ensure_storage_worker('storage-b',marker_path=str(second))
+            self.assertEqual(install.ensure_storage_worker('storage-a',marker_path=str(first)),a)
+        self.assertNotEqual(a['uid'],b['uid'])
+        self.assertEqual(json.loads(first.read_text()),a)
+        self.assertEqual(json.loads(second.read_text()),b)
+        self.assertEqual(default.read_text(),'default sentinel')
+        self.assertNotIn(default,seen)
+        self.assertEqual(len(self.commands),2)
+
+    def test_missing_scoped_marker_never_falls_back_or_adopts_account(self):
+        self.add('storage-a')
+        alternate=self.base/'instance-a'/'storage-worker.json';alternate.parent.mkdir()
+        install.atomic(self.config/'storage-worker.json',{'user':'storage-a','uid':991,'gid':992})
+        with self.assertRaisesRegex(ValueError,'collision'):
+            install.ensure_storage_worker('storage-a',marker_path=str(alternate))
+        self.assertFalse(alternate.exists())
+        self.assertEqual(self.commands,[])
+
+    def test_boolean_uid_or_gid_is_not_a_numeric_identity(self):
+        self.add('storage-a',uid=1,gid=1)
+        alternate=self.base/'instance-a'/'storage-worker.json';alternate.parent.mkdir()
+        for key in ('uid','gid'):
+            pin={'user':'storage-a','uid':1,'gid':1};pin[key]=True
+            install.atomic(alternate,pin)
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError,'marker mismatch'):
+                    install.ensure_storage_worker('storage-a',marker_path=str(alternate))
+        self.assertEqual(self.commands,[])
+
     def test_marker_permissions_owner_and_symlinks_fail_closed(self):
         install.ensure_storage_worker('rolypolyops-storage')
         marker=self.config/'storage-worker.json'
@@ -306,11 +348,13 @@ class IsolatedAgentInstallationTests(unittest.TestCase):
         self.stack.enter_context(patch.object(install,'UNIT_DIR',self.units))
         self.stack.enter_context(patch.object(install,'validate_source',side_effect=lambda:self.source))
         self.stack.enter_context(patch.object(install,'trusted_config_directory'))
+        self.stack.enter_context(patch.object(install,'validate_storage_marker_parents'))
+        self.stack.enter_context(patch.object(install,'validate_storage_worker_marker',side_effect=lambda value:Path(value)))
         actual_json=install.read_json
         self.stack.enter_context(patch.object(install,'trusted_json',side_effect=lambda path:actual_json(path)))
         self.stack.enter_context(patch.object(install,'agent_prerequisites',return_value='/root/agent-venv/bin/python3'))
         self.stack.enter_context(patch.object(install,'transport_module',return_value=self.module))
-        self.worker=self.stack.enter_context(patch.object(install,'ensure_storage_worker',side_effect=lambda user:self.events.append(('account',user))))
+        self.worker=self.stack.enter_context(patch.object(install,'ensure_storage_worker',side_effect=lambda user,**kwargs:self.events.append(('account',user,kwargs))))
         self.copy=self.stack.enter_context(patch.object(install,'copy_source',side_effect=lambda:self.events.append(('copy',))))
         self.stack.enter_context(patch.object(install,'install_package_policy'))
         self.stack.enter_context(patch.object(install,'command',side_effect=lambda args:self.events.append(('command',args))))
@@ -323,7 +367,7 @@ class IsolatedAgentInstallationTests(unittest.TestCase):
 
     def enroll(self,*args,**kwargs):
         self.events.append(('enroll',))
-        return io.BytesIO(json.dumps({'nodeId':'00000000-0000-4000-8000-000000000001','token':'enrollment-result','role':'primary','storageWorkerUser':'root'}).encode())
+        return io.BytesIO(json.dumps({'nodeId':'00000000-0000-4000-8000-000000000001','token':'enrollment-result','role':'primary','storageWorkerUser':'root','storageWorkerMarker':'/remote/untrusted-worker.json'}).encode())
 
     def test_probe_precedes_enrollment_and_installed_source_replacement(self):
         install.agent('https://control.example.test/ops','code')
@@ -333,6 +377,7 @@ class IsolatedAgentInstallationTests(unittest.TestCase):
         self.assertLess(names.index('probe'),names.index('copy'))
         self.module.probe_runtime.assert_called_once_with(worker_user='rolypolyops-storage',source_dir=self.source,timeout=30)
         self.assertEqual(json.loads(self.agent_config.read_text())['storageWorkerUser'],'rolypolyops-storage')
+        self.assertNotIn('storageWorkerMarker',json.loads(self.agent_config.read_text()))
         unit=(self.units/'rolypolyops-agent.service').read_text()
         self.assertIn('Type=simple',unit)
         self.assertIn('ExecStart=/root/agent-venv/bin/python3',unit)
@@ -371,6 +416,33 @@ class IsolatedAgentInstallationTests(unittest.TestCase):
         self.assertNotEqual(current['token'],existing['token'])
         self.assertEqual(current['storageWorkerUser'],'own-test-storage')
         self.module.probe_runtime.assert_called_once_with(worker_user='own-test-storage',source_dir=self.source,timeout=30)
+
+    def test_root_scoped_marker_survives_reinstall_and_reenrollment(self):
+        marker=str(self.base/'scoped'/'storage-worker.json')
+        original={'controller':'https://control.example.test/ops','nodeId':'old-node','token':'old-token','role':'recovery','storageWorkerUser':'own-test-storage','storageWorkerMarker':marker,'operatorNote':'keep'}
+        self.agent_config.write_text(json.dumps(original));self.agent_config.chmod(0o600)
+        install.agent('https://control.example.test/ops',None)
+        self.assertEqual(json.loads(self.agent_config.read_text()),original)
+        self.module.probe_runtime.assert_called_once_with(worker_user='own-test-storage',source_dir=self.source,timeout=30,marker_path=marker)
+        self.worker.assert_called_once_with('own-test-storage',marker_path=marker)
+        self.module.probe_runtime.reset_mock();self.worker.reset_mock()
+        install.agent('https://control.example.test/ops','replacement',replace=True)
+        current=json.loads(self.agent_config.read_text())
+        self.assertEqual(current['storageWorkerMarker'],marker)
+        self.assertEqual(current['storageWorkerUser'],'own-test-storage')
+        self.assertEqual(current['operatorNote'],'keep')
+        self.assertNotEqual(current['token'],original['token'])
+        self.module.probe_runtime.assert_called_once_with(worker_user='own-test-storage',source_dir=self.source,timeout=30,marker_path=marker)
+
+    def test_bad_root_marker_is_rejected_before_prerequisites_or_account(self):
+        for marker in (None,False,[],{},'relative','/etc/../marker','/etc/marker\n'):
+            self.agent_config.write_text(json.dumps({'controller':'https://control.example.test/ops','storageWorkerMarker':marker}))
+            with self.subTest(marker=marker):
+                with self.assertRaisesRegex(ValueError,'invalid_storage_worker_marker'):
+                    install.agent('https://control.example.test/ops','code')
+        self.worker.assert_not_called()
+        self.module.probe_runtime.assert_not_called()
+        self.copy.assert_not_called()
 
     def test_wrong_controller_or_missing_code_fails_before_probe(self):
         with self.assertRaisesRegex(ValueError,'enrollment code'):
