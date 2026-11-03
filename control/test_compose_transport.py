@@ -876,5 +876,61 @@ class InterfaceProofTests(unittest.TestCase):
                     worker.isolation_proof(request)
 
 
+class SystemctlObservationTests(unittest.TestCase):
+    setUp = LifecycleTests.setUp
+    intent = LifecycleTests.intent
+    unit = LifecycleTests.unit
+
+    @staticmethod
+    def stdout(value):
+        return "".join(key + "=" + item + "\n" for key, item in value.items()).encode("utf-8")
+
+    def test_all_properties_are_requested_and_real_format_empty_caps_retained(self):
+        intent = self.intent()
+        fields = self.unit(intent) | {"LoadState": "loaded"}
+        fields["ExecStart"] = fields["ExecStart"].replace(" ; }", " ; start_time=[Tue 2026-11-03 00:00:00 UTC] ; stop_time=[n/a] ; pid=123 ; code=(null) ; status=0/0 }")
+        raw = self.stdout(fields)
+        self.assertIn(b"CapabilityBoundingSet=\n", raw)
+        self.assertIn(b"AmbientCapabilities=\n", raw)
+        with mock.patch.object(transport.subprocess, "run", return_value=mock.Mock(stdout=raw, returncode=0)) as show:
+            observed = transport.systemctl(intent["unit"], timeout=1.25)
+        show.assert_called_once_with(["systemctl", "show", "--all", "--no-pager", intent["unit"]], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=transport.CLEAN_ENV, timeout=1.25, check=False)
+        self.assertEqual(observed, fields)
+        self.assertEqual(observed["CapabilityBoundingSet"], "")
+        self.assertEqual(observed["AmbientCapabilities"], "")
+        self.assertTrue(transport.owned_unit(observed, intent))
+
+    def test_omitted_or_nonempty_capabilities_remain_rejected_without_fallback(self):
+        intent = self.intent()
+        for missing in (("CapabilityBoundingSet",), ("AmbientCapabilities",), ("CapabilityBoundingSet", "AmbientCapabilities")):
+            fields = {key: value for key, value in self.unit(intent).items() if key not in missing}
+            with self.subTest(missing=missing), mock.patch.object(transport.subprocess, "run", return_value=mock.Mock(stdout=self.stdout(fields), returncode=0)):
+                observed = transport.systemctl(intent["unit"])
+            self.assertTrue(all(key not in observed for key in missing))
+            self.assertFalse(transport.owned_unit(observed, intent))
+        for field in ("CapabilityBoundingSet", "AmbientCapabilities"):
+            self.assertFalse(transport.owned_unit(self.unit(intent) | {field: "CAP_NET_ADMIN"}, intent))
+
+    def test_not_found_semantics_and_error_or_wrong_identity_are_unchanged(self):
+        name = self.intent()["unit"]
+        with mock.patch.object(transport.subprocess, "run", return_value=mock.Mock(stdout=b"LoadState=not-found\nCapabilityBoundingSet=\nAmbientCapabilities=\n", returncode=4)):
+            self.assertIsNone(transport.systemctl(name))
+        for raw, code in ((b"Id=foreign.service\nLoadState=loaded\n", 0), (("Id=" + name + "\n").encode(), 1)):
+            with mock.patch.object(transport.subprocess, "run", return_value=mock.Mock(stdout=raw, returncode=code)), self.assertRaisesRegex(transport.TransportError, "transport_cleanup_unverified") as caught:
+                transport.systemctl(name)
+            self.assertTrue(caught.exception.unknown)
+
+    def test_output_bound_timeout_io_and_decode_errors_still_fail_closed(self):
+        name = self.intent()["unit"]
+        for raw in (b"x" * (256 * 1024 + 1), b"Id=\xff\n"):
+            with mock.patch.object(transport.subprocess, "run", return_value=mock.Mock(stdout=raw, returncode=0)), self.assertRaisesRegex(transport.TransportError, "transport_cleanup_unverified") as caught:
+                transport.systemctl(name)
+            self.assertTrue(caught.exception.unknown)
+        for failure in (OSError("unavailable"), subprocess.TimeoutExpired(["systemctl"], 5)):
+            with mock.patch.object(transport.subprocess, "run", side_effect=failure), self.assertRaisesRegex(transport.TransportError, "transport_cleanup_unverified") as caught:
+                transport.systemctl(name)
+            self.assertTrue(caught.exception.unknown)
+
+
 if __name__ == "__main__":
     unittest.main()

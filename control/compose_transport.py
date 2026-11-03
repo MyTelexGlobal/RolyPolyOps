@@ -119,7 +119,7 @@ def process_cgroup(pid):
 
 
 def systemctl(unit, timeout=5):
-    command = ["systemctl", "show", "--no-pager", unit]
+    command = ["systemctl", "show", "--all", "--no-pager", unit]
     try:
         result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 env=CLEAN_ENV, timeout=timeout, check=False)
