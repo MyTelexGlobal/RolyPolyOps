@@ -131,6 +131,142 @@ class ComposeCatalogTests(unittest.TestCase):
         self.sync(self.target)
         return sid,storage,wire['id'],proof
 
+    def stopped_restore(self):
+        sid,storage,ready,proof=self.backup_restore()
+        plan=self.call(self.c.plan,{'nodeId':self.target['nodeId'],'action':'compose-restore','snapshotId':SNAP,'parameters':{'serviceId':sid,'storageId':storage,'snapshotId':SNAP}})
+        self.call(self.c.enqueue,{'planId':plan['id'],'idempotencyKey':uid()})
+        wire=self.sync(self.target)['job']
+        stopped=dict(proof,id=wire['id'],restoreId=wire['id'],state='stopped',ports=[],applicationHealthVerified=False,healthScope='stopped',checks=sorted(cc.STOPPED_CHECKS),sourceFingerprint=FINGER,projectId='rpo-'+wire['id'].replace('-',''))
+        self.target['compose']['restores'].append(stopped)
+        self.sync(self.target,[{'id':wire['id'],'nonce':wire['nonce'],'status':'failed','error':'restore_interrupted'}])
+        return sid,storage,wire['id'],stopped,ready
+
+    def stopped_public(self,rid):
+        return next(r for r in self.call(self.c.overview)['restores'] if r['id']==rid)
+
+    def remove_plan(self,sid,rid):
+        return self.call(self.c.plan,{'nodeId':self.target['nodeId'],'action':'compose-remove','parameters':{'serviceId':sid,'restoreId':rid}})
+
+    def test_stopped_failed_restore_real_removal_flow_keeps_ready_copy(self):
+        sid,storage,rid,proof,ready=self.stopped_restore()
+        self.assertIs(self.stopped_public(rid)['canRemoveStopped'],True)
+        self.assertEqual(self.stopped_public(rid)['state'],'failed')
+        unrelated=self.call(self.c.plan,{'nodeId':self.source['nodeId'],'action':'compose-verify','parameters':{'serviceId':sid,'storageId':storage}})
+        self.call(self.c.enqueue,{'planId':unrelated['id'],'idempotencyKey':uid()})
+        verify=self.sync(self.source)['job']
+        self.success(self.source,verify,{'serviceId':sid,'storageId':storage,'repositoryId':REPO,'verified':True,'checks':['repository-data']})
+        plan=self.remove_plan(sid,rid)
+        queued=self.call(self.c.enqueue,{'planId':plan['id'],'idempotencyKey':uid()})['job']
+        wire=self.sync(self.target)['job'];self.assertEqual(wire['id'],queued['id'])
+        self.assertEqual(wire['parameters'],{'serviceId':sid,'restoreId':rid})
+        with self.c.connect() as db:
+            intent=json.loads(db.execute('SELECT intent FROM compose_jobs WHERE job_id=?',(wire['id'],)).fetchone()['intent'])
+            self.assertEqual(intent['stoppedRemoval']['manifestDigest'],MANIFEST)
+            self.assertEqual(intent['stoppedRemoval']['sourceFingerprint'],FINGER)
+        self.target['compose']['restores']=[r for r in self.target['compose']['restores'] if r['id']!=rid]
+        self.success(self.target,wire,{'serviceId':sid,'restoreId':rid,'removed':True})
+        records=self.call(self.c.overview)['restores'];self.assertNotIn(rid,[r['id'] for r in records]);self.assertIn(ready,[r['id'] for r in records])
+        self.call(self.c.plan,{'nodeId':self.source['nodeId'],'action':'compose-verify','parameters':{'serviceId':sid,'storageId':storage}})
+
+    def test_stopped_observation_requires_complete_exact_unready_proof(self):
+        sid,storage,rid,proof,_=self.stopped_restore();original=copy.deepcopy(proof)
+        changes=[('state','running'),('state','outcome_unknown'),('id',uid()),('restoreId',uid()),('serviceId',uid()),('repositoryId','e'*64),('snapshot','e'*64),('manifestDigest','e'*64),('sourceFingerprint','e'*64),('ports',[{'service':'web','target':8080,'published':18080,'hostIp':'0.0.0.0','protocol':'tcp'}]),('applicationHealthVerified',True),('applicationHealthVerified',0),('healthScope','http'),('checks',list(cc.STOPPED_CHECKS-{'owned-resources'}))]
+        for field,value in changes:
+            with self.subTest(field=field,value=value):
+                candidate=copy.deepcopy(original);candidate[field]=value
+                self.target['compose']['restores']=[candidate];self.sync(self.target)
+                self.assertNotIn('canRemoveStopped',self.stopped_public(rid))
+                self.error('restore_not_removable',self.c.plan,{'nodeId':self.target['nodeId'],'action':'compose-remove','parameters':{'serviceId':sid,'restoreId':rid}})
+        for field in ('ports','applicationHealthVerified','healthScope','checks','projectId'):
+            with self.subTest(missing=field):
+                candidate=copy.deepcopy(original);candidate.pop(field);self.target['compose']['restores']=[candidate];self.sync(self.target)
+                self.assertNotIn('canRemoveStopped',self.stopped_public(rid))
+        self.target['compose']['restores']=[original,copy.deepcopy(original)];self.sync(self.target)
+        self.assertNotIn('canRemoveStopped',self.stopped_public(rid))
+
+    def test_stopped_removal_rejects_stale_foreign_job_point_and_current_source(self):
+        sid,storage,rid,proof,_=self.stopped_restore()
+        with self.c.connect() as db:
+            job=dict(db.execute('SELECT * FROM jobs WHERE id=?',(rid,)).fetchone())
+            point=db.execute('SELECT point FROM compose_points WHERE service_id=? AND repository_id=? AND snapshot_id=?',(sid,REPO,SNAP)).fetchone()['point']
+            config=db.execute('SELECT config FROM compose_services WHERE id=?',(sid,)).fetchone()['config']
+        for field,value in [('error','other_failure'),('status','outcome_unknown'),('action','compose-backup'),('node_id',self.source['nodeId']),('snapshot','e'*64),('dispatch_instance',None),('nonce','')]:
+            with self.subTest(jobField=field):
+                with self.c.connect() as db:db.execute('UPDATE jobs SET '+field+'=? WHERE id=?',(value,rid))
+                self.assertNotIn('canRemoveStopped',self.stopped_public(rid))
+                with self.c.connect() as db:
+                    db.execute('UPDATE jobs SET '+field+'=? WHERE id=?',(job[field],rid))
+                    db.execute("UPDATE compose_restores SET state='failed' WHERE id=?",(rid,))
+                self.assertIs(self.stopped_public(rid).get('canRemoveStopped'),True)
+        for field in ('manifestDigest','sourceFingerprint'):
+            with self.subTest(pointField=field):
+                changed=json.loads(point);changed[field]='e'*64
+                with self.c.connect() as db:db.execute('UPDATE compose_points SET point=? WHERE service_id=? AND repository_id=? AND snapshot_id=?',(json.dumps(changed),sid,REPO,SNAP))
+                self.assertNotIn('canRemoveStopped',self.stopped_public(rid))
+                with self.c.connect() as db:db.execute('UPDATE compose_points SET point=? WHERE service_id=? AND repository_id=? AND snapshot_id=?',(point,sid,REPO,SNAP))
+                self.assertIs(self.stopped_public(rid).get('canRemoveStopped'),True)
+        with self.c.connect() as db:
+            changed=json.loads(config);changed['sourceNodeId']=self.target['nodeId'];db.execute('UPDATE compose_services SET config=? WHERE id=?',(json.dumps(changed),sid))
+        self.assertIs(self.stopped_public(rid).get('canRemoveStopped'),True)
+        with self.c.connect() as db:
+            changed['projectId']=proof['projectId'];db.execute('UPDATE compose_services SET config=? WHERE id=?',(json.dumps(changed),sid))
+        self.assertNotIn('canRemoveStopped',self.stopped_public(rid))
+        with self.c.connect() as db:db.execute('UPDATE compose_services SET config=? WHERE id=?',(config,sid))
+        with self.c.connect() as db:
+            row=self.c.node(db,self.target['nodeId']);status=json.loads(row['status']);status['observedAt']='2000-01-01T00:00:00Z';db.execute('UPDATE nodes SET status=? WHERE id=?',(json.dumps(status),row['id']))
+        self.assertNotIn('canRemoveStopped',self.stopped_public(rid))
+
+    def test_stopped_removal_binds_historical_repository_after_reregistration(self):
+        sid,storage,rid,proof,_=self.stopped_restore()
+        other,_=self.metadata()
+        with self.c.connect() as db:
+            row,config=self.c.compose.service(db,sid);config['storageId']=other;config['fingerprint']='e'*64
+            db.execute('UPDATE compose_services SET config=? WHERE id=?',(json.dumps(config),sid))
+            db.execute('UPDATE compose_storages SET repository_id=? WHERE id=?',('f'*64,storage))
+        self.assertIs(self.stopped_public(rid).get('canRemoveStopped'),True)
+        plan=self.remove_plan(sid,rid);self.call(self.c.enqueue,{'planId':plan['id'],'idempotencyKey':uid()})
+        wire=self.sync(self.target)['job']
+        self.target['compose']['restores']=[r for r in self.target['compose']['restores'] if r['id']!=rid]
+        self.success(self.target,wire,{'serviceId':sid,'restoreId':rid,'removed':True})
+        self.assertNotIn(rid,[r['id'] for r in self.call(self.c.overview)['restores']])
+
+    def test_stopped_removal_denies_exact_active_restore_reference(self):
+        sid,storage,rid,proof,_=self.stopped_restore()
+        self.target['compose']['services']=[{'serviceId':sid,'projectId':'another-project','activeRestoreId':rid}]
+        self.sync(self.target)
+        self.assertNotIn('canRemoveStopped',self.stopped_public(rid))
+        self.error('restore_not_removable',self.c.plan,{'nodeId':self.target['nodeId'],'action':'compose-remove','parameters':{'serviceId':sid,'restoreId':rid}})
+        self.target['compose']['services'][0]['activeRestoreId']=uid();self.sync(self.target)
+        self.assertIs(self.stopped_public(rid).get('canRemoveStopped'),True)
+
+    def test_stopped_plan_is_revalidated_before_first_dispatch(self):
+        sid,storage,rid,proof,_=self.stopped_restore();plan=self.remove_plan(sid,rid)
+        queued=self.call(self.c.enqueue,{'planId':plan['id'],'idempotencyKey':uid()})['job']
+        self.target['compose']['restores'][1]['sourceFingerprint']='e'*64
+        response=self.sync(self.target);self.assertNotIn('job',response)
+        with self.c.connect() as db:
+            row=db.execute('SELECT * FROM jobs WHERE id=?',(queued['id'],)).fetchone()
+            self.assertEqual((row['status'],row['error']),('failed','restore_not_removable'))
+            self.assertEqual(db.execute('SELECT state FROM compose_restores WHERE id=?',(rid,)).fetchone()['state'],'failed')
+
+    def test_stopped_removal_settlement_never_deletes_changed_catalog_scope(self):
+        sid,storage,rid,proof,ready=self.stopped_restore();plan=self.remove_plan(sid,rid)
+        self.call(self.c.enqueue,{'planId':plan['id'],'idempotencyKey':uid()});wire=self.sync(self.target)['job']
+        with self.c.connect() as db:
+            row=db.execute('SELECT point FROM compose_points WHERE service_id=? AND repository_id=? AND snapshot_id=?',(sid,REPO,SNAP)).fetchone()
+            point=json.loads(row['point']);point['manifestDigest']='e'*64
+            db.execute('UPDATE compose_points SET point=? WHERE service_id=? AND repository_id=? AND snapshot_id=?',(json.dumps(point),sid,REPO,SNAP))
+        self.target['compose']['restores']=[r for r in self.target['compose']['restores'] if r['id']!=rid]
+        self.success(self.target,wire,{'serviceId':sid,'restoreId':rid,'removed':True})
+        self.assertIn(rid,[r['id'] for r in self.call(self.c.overview)['restores']])
+        self.assertIn(ready,[r['id'] for r in self.call(self.c.overview)['restores']])
+
+    def test_stopped_failed_cannot_complete_activate_or_forge_ui_flag(self):
+        sid,storage,rid,proof,_=self.stopped_restore()
+        self.error('recovery_restore_required',self.c.compose.complete,sid,{'restoreId':rid,'expectedRevision':self.rev()})
+        self.error('recovery_restore_required',self.c.compose.activate,sid,self.mutate(restoreId=rid,ports=[],allowEgress=True,acceptSnapshotLoss=True))
+        self.error('invalid_request',self.c.plan,{'nodeId':self.target['nodeId'],'action':'compose-remove','parameters':{'serviceId':sid,'restoreId':rid,'canRemoveStopped':True}})
+
     def test_historical_preview_does_not_rewrite_protection_progress(self):
         sid,storage,rid,proof=self.backup_restore()
         with self.c.connect() as db:
