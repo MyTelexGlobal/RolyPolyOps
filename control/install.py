@@ -189,8 +189,15 @@ def trusted_config_directory():
 
 
 def trusted_json(path):
+    path=Path(path)
     try:
-        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+        before=path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or stat.S_IMODE(before.st_mode) != 0o600:
+        raise ValueError("Untrusted root configuration file")
+    try:
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
     except FileNotFoundError:
         return None
     try:

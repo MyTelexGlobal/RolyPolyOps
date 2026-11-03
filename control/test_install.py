@@ -2,6 +2,9 @@
 import os
 import io
 import json
+import stat
+import subprocess
+import sys
 from contextlib import ExitStack
 from pathlib import Path
 import tempfile
@@ -199,7 +202,7 @@ class WorkerAccountTests(unittest.TestCase):
             fields=list(value);fields[4]=uid;return os.stat_result(fields)
         self.stack.enter_context(patch.object(install,'CONFIG_DIR',self.config))
         self.stack.enter_context(patch.object(install,'validate_storage_marker_parents'))
-        self.stack.enter_context(patch.object(Path,'lstat',lambda path:owned(real_lstat(path)) if path==self.config else real_lstat(path)))
+        self.stack.enter_context(patch.object(Path,'lstat',lambda path:owned(real_lstat(path)) if path==self.config or self.base in path.parents else real_lstat(path)))
         self.stack.enter_context(patch.object(install.os,'fstat',side_effect=lambda fd:owned(real_fstat(fd))))
         self.stack.enter_context(patch.object(install.pwd,'getpwnam',side_effect=lambda user:self.lookup(self.accounts,user)))
         self.stack.enter_context(patch.object(install.pwd,'getpwall',side_effect=lambda:list(self.accounts.values())))
@@ -452,6 +455,99 @@ class IsolatedAgentInstallationTests(unittest.TestCase):
             install.agent('https://control.example.test/ops','code')
         self.module.probe_runtime.assert_not_called()
         self.worker.assert_not_called()
+
+
+class TrustedJsonFileTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory()
+        self.base=Path(self.temp.name)
+        self.addCleanup(self.temp.cleanup)
+
+    @staticmethod
+    def owned(value):
+        fields=list(value);fields[4]=0
+        return os.stat_result(fields)
+
+    def test_fifo_and_fifo_substitution_are_bounded_with_real_open(self):
+        # The child is explicitly time-bounded so a regression cannot hang the
+        # suite. It uses a real FIFO with no writer; only root ownership is
+        # simulated, allowing the test to run without privileged setup.
+        program='''
+import os, sys
+from pathlib import Path
+from unittest.mock import patch
+from control import install
+marker=Path(sys.argv[1]);replacement=sys.argv[2]=='replace'
+actual_lstat=Path.lstat;actual_open=os.open
+def root_lstat(path):
+    value=actual_lstat(path)
+    if path==marker:
+        fields=list(value);fields[4]=0;return os.stat_result(fields)
+    return value
+def replace_open(path,flags,*args,**kwargs):
+    if Path(path)==marker and replacement:
+        marker.unlink();os.mkfifo(marker,0o600)
+    return actual_open(path,flags,*args,**kwargs)
+with patch.object(Path,'lstat',root_lstat),patch.object(install.os,'open',side_effect=replace_open):
+    try:
+        install.trusted_json(marker)
+    except ValueError as error:
+        if str(error)!='Untrusted root configuration file':raise
+        print('rejected')
+    else:
+        raise SystemExit('FIFO was accepted')
+'''
+        for replacement in (False,True):
+            marker=self.base/('replacement' if replacement else 'fifo')
+            if replacement:
+                marker.write_text('{}');marker.chmod(0o600)
+            else:
+                os.mkfifo(marker,0o600)
+            with self.subTest(replacement=replacement):
+                try:
+                    result=subprocess.run([sys.executable,'-c',program,str(marker),'replace' if replacement else 'fifo'],cwd=Path(__file__).resolve().parent.parent,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.fail('FIFO validation blocked beyond the two-second child limit')
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(result.stdout.strip(),'rejected')
+
+    def test_untrusted_type_owner_or_mode_is_rejected_before_open(self):
+        for mode,uid in ((stat.S_IFIFO|0o600,0),(stat.S_IFDIR|0o600,0),(stat.S_IFLNK|0o600,0),(stat.S_IFREG|0o600,1),(stat.S_IFREG|0o644,0)):
+            with self.subTest(mode=mode,uid=uid),patch.object(Path,'lstat',return_value=SimpleNamespace(st_mode=mode,st_uid=uid)),patch.object(install.os,'open') as opened:
+                with self.assertRaisesRegex(ValueError,'Untrusted root configuration file'):
+                    install.trusted_json(self.base/'marker')
+                opened.assert_not_called()
+
+    def test_valid_regular_default_and_custom_markers_keep_content_and_bounded_flags(self):
+        original_lstat=Path.lstat;original_fstat=os.fstat;original_open=os.open
+        for directory in ('default','scoped'):
+            parent=self.base/directory;parent.mkdir()
+            marker=parent/'storage-worker.json'
+            raw=b'{"user":"storage-worker","uid":991,"gid":992}\n'
+            marker.write_bytes(raw);marker.chmod(0o600)
+            with self.subTest(directory=directory),patch.object(Path,'lstat',lambda path:self.owned(original_lstat(path))),patch.object(install.os,'fstat',side_effect=lambda fd:self.owned(original_fstat(fd))),patch.object(install.os,'open',wraps=original_open) as opened:
+                self.assertEqual(install.trusted_json(marker),{'user':'storage-worker','uid':991,'gid':992})
+                self.assertEqual(opened.call_args.args[1],os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+            self.assertEqual(marker.read_bytes(),raw)
+
+    def test_post_open_descriptor_checks_and_read_bound_are_retained(self):
+        marker=self.base/'marker';marker.write_text('{}');marker.chmod(0o600)
+        original_lstat=Path.lstat;original_fstat=os.fstat
+        with patch.object(Path,'lstat',lambda path:self.owned(original_lstat(path))):
+            for mode,uid in ((stat.S_IFIFO|0o600,0),(stat.S_IFREG|0o600,1),(stat.S_IFREG|0o644,0)):
+                with self.subTest(mode=mode,uid=uid),patch.object(install.os,'fstat',return_value=SimpleNamespace(st_mode=mode,st_uid=uid)),patch.object(install.os,'read') as read:
+                    with self.assertRaisesRegex(ValueError,'Untrusted root configuration file'):
+                        install.trusted_json(marker)
+                    read.assert_not_called()
+            marker.write_bytes(b' '*65537)
+            with patch.object(install.os,'fstat',side_effect=lambda fd:self.owned(original_fstat(fd))):
+                with self.assertRaisesRegex(ValueError,'Invalid root configuration file'):
+                    install.trusted_json(marker)
+
+    def test_missing_marker_preserves_none_without_open(self):
+        with patch.object(install.os,'open') as opened:
+            self.assertIsNone(install.trusted_json(self.base/'missing'))
+        opened.assert_not_called()
 
 
 class StorageModulePackagingTests(unittest.TestCase):
